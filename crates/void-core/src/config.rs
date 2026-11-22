@@ -272,8 +272,11 @@ pub fn load_config(path: &Path) -> (Config, Option<String>) {
 }
 
 pub fn save_config(path: &Path, config: &Config) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let text = toml::to_string_pretty(config).map_err(io::Error::other)?;
-    fsutil::atomic_write(path, text.as_bytes())
+    fsutil::atomic_write(path, text.as_bytes())?;
+    // The config can hold API keys: owner-only.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[derive(Debug, thiserror::Error)]

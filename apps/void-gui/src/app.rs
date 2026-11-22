@@ -597,7 +597,7 @@ mod e2e {
         match std::env::var_os("VOID_AI_E2E_DIR") {
             Some(d) => {
                 let root = PathBuf::from(d);
-                let _ = std::fs::remove_dir_all(&root);
+                void_core::fsutil::remove_tree(&root).expect("clean the e2e dir");
                 std::fs::create_dir_all(&root).unwrap();
                 Paths { _tmp: None, root }
             }

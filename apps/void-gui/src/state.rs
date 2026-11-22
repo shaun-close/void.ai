@@ -50,6 +50,10 @@ pub struct UiState {
     pub diffs: HashMap<(ConversationId, std::path::PathBuf), Vec<void_core::overlay::Hunk>>,
     /// Bumped whenever diffs are dropped (so panels know to ask again).
     pub diffs_epoch: u64,
+    /// For conflicted files: what changed on disk since void first changed them.
+    pub disk_diffs: HashMap<(ConversationId, std::path::PathBuf), Vec<void_core::overlay::Hunk>>,
+    /// Chats with an agent turn in progress.
+    pub active_turns: std::collections::HashSet<ConversationId>,
     /// The first pending changes of a chat ask the app to show Review.
     review_request: bool,
     reviewed: std::collections::HashSet<ConversationId>,
@@ -80,6 +84,8 @@ impl Default for UiState {
             changes: HashMap::new(),
             diffs: HashMap::new(),
             diffs_epoch: 0,
+            disk_diffs: HashMap::new(),
+            active_turns: Default::default(),
             review_request: false,
             reviewed: Default::default(),
             layout: None,
@@ -223,14 +229,27 @@ impl UiState {
                 }
                 self.changes.insert(conversation, changes);
                 self.diffs.retain(|(c, _), _| *c != conversation);
+                self.disk_diffs.retain(|(c, _), _| *c != conversation);
                 self.diffs_epoch += 1;
             }
             Event::Diff {
                 conversation,
                 path,
                 hunks,
+                disk,
             } => {
+                self.disk_diffs.insert((conversation, path.clone()), disk);
                 self.diffs.insert((conversation, path), hunks);
+            }
+            Event::TurnState {
+                conversation,
+                active,
+            } => {
+                if active {
+                    self.active_turns.insert(conversation);
+                } else {
+                    self.active_turns.remove(&conversation);
+                }
             }
             Event::ReviewError { error, .. } => self.error(error),
             Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
@@ -253,6 +272,11 @@ impl UiState {
 
     pub fn take_layout(&mut self) -> Option<Option<String>> {
         self.layout.take()
+    }
+
+    /// Replying or running tools: the chat shows Stop.
+    pub fn busy(&self, id: ConversationId) -> bool {
+        self.streams.contains_key(&id) || self.active_turns.contains(&id)
     }
 
     pub fn take_review_request(&mut self) -> bool {
@@ -462,6 +486,7 @@ mod tests {
             kind: void_core::overlay::ChangeKind::Added,
             ignored: false,
             conflict: false,
+            link: None,
         };
         s.apply(Event::Changes {
             conversation: id,
@@ -489,6 +514,7 @@ mod tests {
             conversation: id,
             path: "a".into(),
             hunks: vec![],
+            disk: vec![],
         });
         let epoch = s.diffs_epoch;
         s.apply(Event::Changes {
@@ -497,5 +523,45 @@ mod tests {
         });
         assert!(s.diffs.is_empty());
         assert!(s.diffs_epoch > epoch);
+    }
+
+    #[test]
+    fn turn_state_marks_chat_busy() {
+        let mut s = UiState::default();
+        let id = void_core::model::ConversationId::new();
+        assert!(!s.busy(id));
+        s.apply(Event::TurnState {
+            conversation: id,
+            active: true,
+        });
+        assert!(s.busy(id));
+        s.apply(Event::TurnState {
+            conversation: id,
+            active: false,
+        });
+        assert!(!s.busy(id));
+        s.apply(Event::StreamStarted(id));
+        assert!(s.busy(id));
+    }
+
+    #[test]
+    fn diff_keeps_disk_hunks_for_conflicts() {
+        let mut s = UiState::default();
+        let id = void_core::model::ConversationId::new();
+        let h = void_core::overlay::Hunk {
+            index: 0,
+            old_start: 1,
+            old_len: 1,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![('+', "x".into())],
+        };
+        s.apply(Event::Diff {
+            conversation: id,
+            path: "a".into(),
+            hunks: vec![],
+            disk: vec![h.clone()],
+        });
+        assert_eq!(s.disk_diffs[&(id, "a".into())], vec![h]);
     }
 }

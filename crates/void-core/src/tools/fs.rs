@@ -54,7 +54,14 @@ fn is_binary(bytes: &[u8]) -> bool {
 }
 
 /// Files under `start` in the merged view, skipping `.git` and ignored paths.
-fn walk(ov: &Overlay, start: &Path) -> Vec<PathBuf> {
+fn hidden_rel(ov: &Overlay, hidden: &[PathBuf], rel: &Path) -> bool {
+    let abs = ov.workspace().join(rel);
+    hidden
+        .iter()
+        .any(|h| abs.starts_with(h) || h.canonicalize().is_ok_and(|hc| abs.starts_with(hc)))
+}
+
+fn walk(ov: &Overlay, start: &Path, hidden: &[PathBuf]) -> Vec<PathBuf> {
     let gi = ov.ignore_matcher();
     let mut files = Vec::new();
     let mut stack = vec![start.to_path_buf()];
@@ -67,7 +74,7 @@ fn walk(ov: &Overlay, start: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let rel = dir.join(&item.name);
-            if ov.ignored(&gi, &rel, item.is_dir) {
+            if item.is_link || ov.ignored(&gi, &rel, item.is_dir) || hidden_rel(ov, hidden, &rel) {
                 continue;
             }
             if item.is_dir {
@@ -242,7 +249,7 @@ impl Tool for Glob {
                 Ok(g) => g.compile_matcher(),
                 Err(e) => return ToolOutput::err(format!("bad pattern: {e}")),
             };
-            let hits: Vec<String> = walk(&ctx.overlay, &root)
+            let hits: Vec<String> = walk(&ctx.overlay, &root, &ctx.hidden)
                 .into_iter()
                 .filter(|p| matcher.is_match(p.strip_prefix(&root).unwrap_or(p)))
                 .map(|p| p.to_string_lossy().into_owned())
@@ -311,7 +318,7 @@ impl Tool for Grep {
             };
             let mut out = Vec::new();
             let mut more = false;
-            'files: for f in walk(&ctx.overlay, &root) {
+            'files: for f in walk(&ctx.overlay, &root, &ctx.hidden) {
                 if filter.as_ref().is_some_and(|m| !m.is_match(&f)) {
                     continue;
                 }
@@ -699,5 +706,58 @@ mod tests {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn grep_and_glob_never_follow_symlinks_out() {
+        let t = setup();
+        let outside = t.tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("id_key"), "PRIVATE-KEY-MATERIAL").unwrap();
+        std::os::unix::fs::symlink(&outside, t.ws.join("keys")).unwrap();
+        std::os::unix::fs::symlink(outside.join("id_key"), t.ws.join("k1")).unwrap();
+        fs::write(t.ws.join("ok.txt"), "nothing here").unwrap();
+        let g = run(&t, "grep", json!({"pattern": "PRIVATE"})).await;
+        assert!(!g.content.contains("PRIVATE-KEY-MATERIAL"), "{}", g.content);
+        let gl = run(&t, "glob", json!({"pattern": "**/*"})).await;
+        assert!(!gl.content.contains("id_key"), "{}", gl.content);
+        if crate::testutil::have_bwrap() {
+            crate::testutil::bwrap_exec(
+                &t.ov,
+                &format!("ln -s {} up.txt", outside.join("id_key").display()),
+            );
+            let g2 = run(&t, "grep", json!({"pattern": "PRIVATE"})).await;
+            assert!(
+                !g2.content.contains("PRIVATE-KEY-MATERIAL"),
+                "{}",
+                g2.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_skips_hidden_paths() {
+        let t = setup();
+        fs::create_dir_all(t.ws.join("secrets")).unwrap();
+        fs::write(t.ws.join("secrets/key"), "TOPSECRET").unwrap();
+        let reg = Registry::builtin();
+        let out = reg
+            .get("grep")
+            .unwrap()
+            .run(
+                json!({"pattern": "TOP"}),
+                ctx(&t, vec![t.ws.join("secrets")]),
+            )
+            .await;
+        assert!(!out.content.contains("TOPSECRET"), "{}", out.content);
+        let gl = reg
+            .get("glob")
+            .unwrap()
+            .run(
+                json!({"pattern": "**/*"}),
+                ctx(&t, vec![t.ws.join("secrets")]),
+            )
+            .await;
+        assert!(!gl.content.contains("secrets/key"), "{}", gl.content);
     }
 }

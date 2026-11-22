@@ -60,7 +60,11 @@ fn instructions(root: &Path, overlay: Option<&Overlay>) -> Option<(String, Strin
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let bytes = match overlay {
             Some(ov) => ov.read(Path::new(name)).ok(),
-            None => std::fs::read(root.join(name)).ok(),
+            // Only a real file: a symlink could point anywhere.
+            None => std::fs::symlink_metadata(root.join(name))
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|_| std::fs::read(root.join(name)).ok()),
         };
         if let Some(b) = bytes {
             let mut text = String::from_utf8_lossy(&b).into_owned();
@@ -218,5 +222,31 @@ mod tests {
             &Availability::Ready { landlock: true },
         );
         assert_eq!(p, cfg.base_system_prompt);
+    }
+
+    #[test]
+    fn symlinked_agents_md_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "SECRET-OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("secret.txt"), root.join("AGENTS.md")).unwrap();
+        let cfg = Config::default();
+        let ov = Overlay::open(&tmp.path().join("o"), &root).unwrap();
+        let a = system_prompt(
+            &cfg,
+            &cfg.agents[0],
+            &ws(&root),
+            Some(&ov),
+            &Availability::Ready { landlock: true },
+        );
+        let b = system_prompt(
+            &cfg,
+            &cfg.agents[0],
+            &ws(&root),
+            None,
+            &Availability::Ready { landlock: true },
+        );
+        assert!(!a.contains("SECRET-OUTSIDE") && !b.contains("SECRET-OUTSIDE"));
     }
 }

@@ -560,7 +560,8 @@ fn empty_state(ui: &mut Ui, p: &Palette, input: &mut String) {
 /// Draw a Chat tab. `tab` is its id; `conv` the conversation it shows (None until the first send).
 pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, conv: Option<ConversationId>) {
     let pal = theme::palette_of(ui);
-    let streaming = conv.is_some_and(|c| p.state.streams.contains_key(&c));
+    // Replying or running tools: Stop instead of Send.
+    let streaming = conv.is_some_and(|c| p.state.busy(c));
 
     egui::Panel::bottom(("chat-input", tab))
         .frame(egui::Frame::new().inner_margin(Margin {

@@ -1,6 +1,6 @@
 //! Small filesystem helpers: atomic writes and setting aside unreadable files.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,18 +10,55 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Write `bytes` to `path` via a temporary file and a rename, creating parent directories.
+/// Write `bytes` to `path` via a fresh, exclusively created temporary file (random name, never
+/// a symlink) and a rename, creating parent directories. Keeps an existing file's permissions;
+/// new files get 0644.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    use std::os::unix::fs::PermissionsExt;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent)?;
+    let perms = fs::metadata(path)
+        .map(|m| m.permissions())
+        .unwrap_or_else(|_| fs::Permissions::from_mode(0o644));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".void-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.as_file().set_permissions(perms)?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Remove a directory tree even when parts of it are unreadable (overlayfs leaves its
+/// `work/work` directory with mode 000). Missing is fine.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn open_up(p: &Path) {
+        let Ok(m) = fs::symlink_metadata(p) else {
+            return;
+        };
+        if m.is_dir() {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+            if let Ok(rd) = fs::read_dir(p) {
+                for e in rd.flatten() {
+                    open_up(&e.path());
+                }
+            }
+        }
     }
-    let tmp = with_suffix(path, ".tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
     }
-    fs::rename(&tmp, path)
+    open_up(path);
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
 }
 
 /// Rename an unreadable file to `<file>.bad-<unix-ts>` so it's kept, never overwritten.
@@ -69,5 +106,34 @@ mod tests {
                 .starts_with("x.json.bad-")
         );
         assert_eq!(std::fs::read(&bad).unwrap(), b"junk");
+    }
+
+    #[test]
+    fn atomic_write_ignores_a_planted_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "untouched").unwrap();
+        let p = dir.path().join("data");
+        std::os::unix::fs::symlink(&outside, dir.path().join("data.tmp")).unwrap();
+        atomic_write(&p, b"new").unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "new");
+        assert!(
+            fs::symlink_metadata(dir.path().join("data.tmp")).is_ok(),
+            "an unrelated .tmp file is left alone"
+        );
+    }
+
+    #[test]
+    fn remove_tree_handles_unreadable_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("t");
+        fs::create_dir_all(root.join("work/work")).unwrap();
+        fs::write(root.join("f"), "x").unwrap();
+        fs::set_permissions(root.join("work/work"), fs::Permissions::from_mode(0o000)).unwrap();
+        remove_tree(&root).unwrap();
+        assert!(!root.exists());
+        remove_tree(&root).unwrap(); // already gone is fine
     }
 }

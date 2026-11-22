@@ -13,7 +13,7 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &'static str {
-        "Run a shell command (bash -lc) in the workspace, inside a sandbox: the rest of the disk is read-only, .git is read-only, file changes land in the pending review (not on disk), and the network is available unless turned off. Returns the exit code and the last 30 KB of output. Default timeout 120 s, at most 600 s."
+        "Run a shell command (bash -c) in the workspace, inside a sandbox: the rest of the disk is read-only, .git is read-only, file changes land in the pending review (not on disk), and the network is available unless turned off. Returns the exit code and the last 30 KB of output. Default timeout 120 s, at most 600 s."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{

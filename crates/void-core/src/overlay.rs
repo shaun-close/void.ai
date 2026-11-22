@@ -39,12 +39,16 @@ pub enum Entry {
     Missing,
     File(PathBuf),
     Dir(PathBuf),
+    /// A symlink (never followed by the merged view).
+    Link(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirItem {
     pub name: String,
     pub is_dir: bool,
+    #[serde(default)]
+    pub is_link: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +68,9 @@ pub struct Change {
     pub ignored: bool,
     /// The real file changed since this change was made.
     pub conflict: bool,
+    /// For a symlink: its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,7 +235,9 @@ impl Overlay {
             match fs::symlink_metadata(&cur) {
                 Ok(m) if is_whiteout(&m) => return Entry::Missing,
                 Ok(m) if last => {
-                    return if m.is_dir() {
+                    return if m.file_type().is_symlink() {
+                        Entry::Link(cur)
+                    } else if m.is_dir() {
                         Entry::Dir(cur)
                     } else {
                         Entry::File(cur)
@@ -246,8 +255,17 @@ impl Overlay {
         if !lower_visible {
             return Entry::Missing;
         }
+        // Never go through a symlinked directory in the real workspace.
+        let mut prefix = self.ws.to_path_buf();
+        for c in &comps[..comps.len() - 1] {
+            prefix.push(c);
+            if fs::symlink_metadata(&prefix).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Entry::Missing;
+            }
+        }
         let low = self.ws.join(rel);
-        match fs::metadata(&low) {
+        match fs::symlink_metadata(&low) {
+            Ok(m) if m.file_type().is_symlink() => Entry::Link(low),
             Ok(m) if m.is_dir() => Entry::Dir(low),
             Ok(_) => Entry::File(low),
             Err(_) => Entry::Missing,
@@ -261,6 +279,7 @@ impl Overlay {
                 "{} is a directory",
                 rel.display()
             ))),
+            Entry::Link(_) => Err(io::Error::other(format!("{} is a symlink", rel.display()))),
             Entry::Missing => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} doesn't exist", rel.display()),
@@ -276,7 +295,7 @@ impl Overlay {
                 format!("{} isn't a directory", rel.display()),
             ));
         }
-        let mut names: BTreeMap<String, bool> = BTreeMap::new();
+        let mut names: BTreeMap<String, (bool, bool)> = BTreeMap::new();
         let mut gone: HashSet<String> = HashSet::new();
         let up = self.upper().join(rel);
         if let Ok(rd) = fs::read_dir(&up) {
@@ -288,8 +307,12 @@ impl Overlay {
                 if is_whiteout(&m) {
                     gone.insert(name);
                 } else {
-                    let is_dir = matches!(self.resolve(&rel.join(&name)), Entry::Dir(_));
-                    names.insert(name, is_dir);
+                    let kind = match self.resolve(&rel.join(&name)) {
+                        Entry::Dir(_) => (true, false),
+                        Entry::Link(_) => (false, true),
+                        _ => (false, false),
+                    };
+                    names.insert(name, kind);
                 }
             }
         }
@@ -301,13 +324,21 @@ impl Overlay {
                 if gone.contains(&name) || names.contains_key(&name) {
                     continue;
                 }
-                let is_dir = fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false);
-                names.insert(name, is_dir);
+                let kind = match fs::symlink_metadata(e.path()) {
+                    Ok(m) if m.file_type().is_symlink() => (false, true),
+                    Ok(m) => (m.is_dir(), false),
+                    Err(_) => (false, false),
+                };
+                names.insert(name, kind);
             }
         }
         Ok(names
             .into_iter()
-            .map(|(name, is_dir)| DirItem { name, is_dir })
+            .map(|(name, (is_dir, is_link))| DirItem {
+                name,
+                is_dir,
+                is_link,
+            })
             .collect())
     }
 
@@ -335,9 +366,14 @@ impl Overlay {
         fsutil::atomic_write(&self.upper().join(rel), bytes)
     }
 
+    fn manifest_path(&self, rel: &Path) -> PathBuf {
+        with_suffix(&self.base(rel), ".void-dir")
+    }
+
     fn has_base(&self, rel: &Path) -> bool {
         fs::symlink_metadata(self.base(rel)).is_ok()
             || fs::symlink_metadata(self.absent(rel)).is_ok()
+            || fs::symlink_metadata(self.manifest_path(rel)).is_ok()
     }
 
     fn record_base(&self, rel: &Path) -> io::Result<()> {
@@ -346,7 +382,10 @@ impl Overlay {
         }
         let low = self.ws.join(rel);
         match fs::metadata(&low) {
-            Ok(m) if m.is_dir() => Ok(()),
+            Ok(m) if m.is_dir() => fsutil::atomic_write(
+                &self.manifest_path(rel),
+                &serde_json::to_vec(&dir_manifest(&low)).map_err(io::Error::other)?,
+            ),
             Ok(_) => {
                 let b = self.base(rel);
                 if let Some(p) = b.parent() {
@@ -361,6 +400,7 @@ impl Overlay {
     fn clear_base(&self, rel: &Path) {
         let _ = fs::remove_file(self.base(rel));
         let _ = fs::remove_file(self.absent(rel));
+        let _ = fs::remove_file(self.manifest_path(rel));
         let b = self.base(rel);
         if b.is_dir() {
             let _ = fs::remove_dir_all(&b);
@@ -401,6 +441,9 @@ impl Overlay {
                     continue;
                 }
                 if m.is_dir() {
+                    if is_opaque(&e.path()) {
+                        self.record_base(&rel)?;
+                    }
                     stack.push(rel);
                 } else {
                     self.record_base(&rel)?;
@@ -422,6 +465,10 @@ impl Overlay {
 
     fn conflicted(&self, rel: &Path) -> bool {
         let low = self.ws.join(rel);
+        if let Ok(saved) = fs::read(self.manifest_path(rel)) {
+            let saved: Vec<ManifestEntry> = serde_json::from_slice(&saved).unwrap_or_default();
+            return saved != dir_manifest(&low);
+        }
         if fs::symlink_metadata(self.absent(rel)).is_ok() {
             return fs::symlink_metadata(&low).is_ok();
         }
@@ -469,6 +516,7 @@ impl Overlay {
                     kind: ChangeKind::Deleted,
                     ignored,
                     conflict,
+                    link: None,
                 });
             } else if m.is_dir() {
                 if ignored && !has_base {
@@ -477,16 +525,38 @@ impl Overlay {
                     continue;
                 }
                 if is_opaque(&e.path()) {
+                    let conflict = self.conflicted(&rel);
                     out.push(Change {
                         path: rel.clone(),
                         kind: ChangeKind::ReplacedDir,
                         ignored,
-                        conflict: false,
+                        conflict,
+                        link: None,
                     });
                 }
                 self.walk_changes(gi, &rel, out);
             } else {
                 if ignored && !has_base {
+                    continue;
+                }
+                if m.file_type().is_symlink() {
+                    let target = fs::read_link(e.path()).ok();
+                    let lower = fs::read_link(self.ws.join(&rel)).ok();
+                    if target.is_some() && target == lower {
+                        continue;
+                    }
+                    let kind = if fs::symlink_metadata(self.ws.join(&rel)).is_ok() {
+                        ChangeKind::Modified
+                    } else {
+                        ChangeKind::Added
+                    };
+                    out.push(Change {
+                        path: rel,
+                        kind,
+                        ignored,
+                        conflict: false,
+                        link: target,
+                    });
                     continue;
                 }
                 let reference = self.reference(&rel);
@@ -505,6 +575,7 @@ impl Overlay {
                     kind,
                     ignored,
                     conflict,
+                    link: None,
                 });
             }
         }
@@ -522,9 +593,33 @@ impl Overlay {
 
     /// The change to one file as hunks (3 lines of context).
     pub fn diff(&self, rel: &Path) -> io::Result<Vec<Hunk>> {
+        let up = self.upper().join(rel);
+        if fs::symlink_metadata(&up)?.file_type().is_symlink() {
+            let new = format!("symlink → {}\n", fs::read_link(&up)?.display());
+            let old = match fs::read_link(self.ws.join(rel)) {
+                Ok(t) => format!("symlink → {}\n", t.display()),
+                Err(_) => String::new(),
+            };
+            return Ok(hunks(&old, &new));
+        }
         let old = self.reference(rel).map(|b| text(&b)).unwrap_or_default();
         let new = self.upper_text(rel)?;
-        let td = TextDiff::from_lines(&old, &new);
+        Ok(hunks(&old, &new))
+    }
+
+    /// What changed on disk since void first changed this file (base → the real file now).
+    pub fn disk_diff(&self, rel: &Path) -> io::Result<Vec<Hunk>> {
+        let base = self.reference(rel).map(|b| text(&b)).unwrap_or_default();
+        let now = fs::read(self.ws.join(rel))
+            .map(|b| text(&b))
+            .unwrap_or_default();
+        Ok(hunks(&base, &now))
+    }
+}
+
+fn hunks(old: &str, new: &str) -> Vec<Hunk> {
+    {
+        let td = TextDiff::from_lines(old, new);
         let mut out = Vec::new();
         for (index, group) in td.grouped_ops(3).iter().enumerate() {
             let (Some(first), Some(last)) = (group.first(), group.last()) else {
@@ -550,9 +645,11 @@ impl Overlay {
                 lines,
             });
         }
-        Ok(out)
+        out
     }
+}
 
+impl Overlay {
     /// Refuse a path whose real location isn't inside the workspace.
     pub(crate) fn check_inside(&self, path: &Path) -> Result<(), OverlayError> {
         let ws = self.ws.canonicalize()?;
@@ -592,9 +689,24 @@ impl Overlay {
         Ok(())
     }
 
+    /// Before creating directories: the deepest existing ancestor must be inside the workspace.
+    fn check_existing_ancestor(&self, path: &Path) -> Result<(), OverlayError> {
+        let mut p = path;
+        loop {
+            if fs::symlink_metadata(p).is_ok() {
+                return self.check_inside(p);
+            }
+            match p.parent() {
+                Some(parent) => p = parent,
+                None => return Err(OverlayError::Outside(path.to_path_buf())),
+            }
+        }
+    }
+
     fn write_lower(&self, rel: &Path, bytes: &[u8], mode_from: &Path) -> Result<(), OverlayError> {
         let low = self.ws.join(rel);
         if let Some(parent) = low.parent() {
+            self.check_existing_ancestor(parent)?;
             fs::create_dir_all(parent)?;
         }
         self.check_parent_inside(&low)?;
@@ -620,6 +732,10 @@ impl Overlay {
             fs::remove_file(&up)?;
             self.clear_base(rel);
         } else if m.is_dir() {
+            if is_opaque(&up) && self.conflicted(rel) && !force {
+                return Err(OverlayError::Conflict(rel.to_path_buf()));
+            }
+            self.check_existing_ancestor(&self.ws.join(rel))?;
             if is_opaque(&up)
                 && let Ok(rd) = fs::read_dir(self.ws.join(rel))
             {
@@ -631,6 +747,7 @@ impl Overlay {
                 }
             }
             fs::create_dir_all(self.ws.join(rel))?;
+            self.check_inside(&self.ws.join(rel))?;
             for e in fs::read_dir(&up)?.flatten() {
                 self.accept_file(&rel.join(e.file_name()), force)?;
             }
@@ -643,6 +760,19 @@ impl Overlay {
                 let target = fs::read_link(&up)?;
                 let low = self.ws.join(rel);
                 self.check_parent_inside(&low)?;
+                // A link may only point inside the workspace.
+                let abs = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    low.parent().unwrap_or(&self.ws).join(&target)
+                };
+                let inside = lexical(&abs).is_some_and(|a| {
+                    a.starts_with(self.ws.as_path())
+                        || self.ws.canonicalize().is_ok_and(|w| a.starts_with(w))
+                });
+                if !inside {
+                    return Err(OverlayError::Outside(abs));
+                }
                 let _ = fs::remove_file(&low);
                 std::os::unix::fs::symlink(target, &low)?;
             } else {
@@ -751,8 +881,9 @@ impl Overlay {
                     };
                     if m.is_dir() {
                         stack.push(rel);
-                    } else if !rel.starts_with(".git") {
-                        self.accept_file(&rel, true)?;
+                    } else if !rel.starts_with(".git") && !self.has_base(&rel) {
+                        // Only hidden build output (never based, so never in conflict).
+                        self.accept_file(&rel, false)?;
                     }
                 }
             }
@@ -772,10 +903,7 @@ impl Overlay {
 
     /// Delete the whole layer.
     pub fn discard(self) -> io::Result<()> {
-        match fs::remove_dir_all(self.dir.as_path()) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            r => r,
-        }
+        fsutil::remove_tree(self.dir.as_path())
     }
 
     fn meta(&self) -> Meta {
@@ -909,6 +1037,58 @@ impl Overlay {
             Err(io::Error::other("recreating deleted-file markers failed"))
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ManifestEntry {
+    path: String,
+    len: u64,
+    mtime_ns: i128,
+    dir: bool,
+}
+
+/// What's in a real directory (not following links), to notice changes before deleting it.
+fn dir_manifest(dir: &Path) -> Vec<ManifestEntry> {
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let Ok(rd) = fs::read_dir(dir.join(&rel)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(m) = fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            let r = rel.join(e.file_name());
+            out.push(ManifestEntry {
+                path: r.to_string_lossy().into_owned(),
+                len: m.len(),
+                mtime_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
+                dir: m.is_dir(),
+            });
+            if m.is_dir() && out.len() < 20_000 {
+                stack.push(r);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn lexical(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 /// Copy a layer directory: files, symlinks, directories (keeping the opaque mark); whiteouts
@@ -1284,5 +1464,152 @@ mod tests {
         let skipped = t.ov.accept_all(false).unwrap();
         assert_eq!(skipped, vec![PathBuf::from("a")]);
         assert_eq!(fs::read_to_string(t.ws.join("b")).unwrap(), "b");
+    }
+
+    #[test]
+    fn merged_view_never_follows_symlinks() {
+        let t = setup();
+        let outside = t._tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("id_key"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(&outside, t.ws.join("keys")).unwrap();
+        std::os::unix::fs::symlink(outside.join("id_key"), t.ws.join("k1")).unwrap();
+        assert!(
+            t.ov.read(Path::new("k1")).is_err(),
+            "a lower symlink isn't read through"
+        );
+        assert!(
+            t.ov.read(Path::new("keys/id_key")).is_err(),
+            "a symlinked lower directory isn't entered"
+        );
+        assert!(t.ov.read_dir(Path::new("keys")).is_err());
+        let items = t.ov.read_dir(Path::new("")).unwrap();
+        assert!(items.iter().all(|i| !i.is_dir || i.name != "keys"));
+        assert!(items.iter().find(|i| i.name == "keys").unwrap().is_link);
+        if crate::testutil::have_bwrap() {
+            crate::testutil::bwrap_exec(
+                &t.ov,
+                &format!("ln -s {} up", outside.join("id_key").display()),
+            );
+            assert!(
+                t.ov.read(Path::new("up")).is_err(),
+                "an upper symlink isn't read through"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_all_keep_ignored_never_overwrites_conflicts() {
+        let t = setup();
+        fs::write(t.ws.join(".gitignore"), "target/\n").unwrap();
+        fs::write(t.ws.join("a.txt"), "1").unwrap();
+        t.ov.write(Path::new("a.txt"), b"agent").unwrap();
+        fs::write(t.ws.join("a.txt"), "shaun's edit").unwrap();
+        let skipped = t.ov.accept_all(true).unwrap();
+        assert_eq!(skipped, vec![PathBuf::from("a.txt")]);
+        assert_eq!(
+            fs::read_to_string(t.ws.join("a.txt")).unwrap(),
+            "shaun's edit"
+        );
+    }
+
+    #[test]
+    fn symlink_changes_are_flagged_and_outside_targets_refused() {
+        if !crate::testutil::have_bwrap() {
+            return;
+        }
+        let t = setup();
+        crate::testutil::bwrap_exec(&t.ov, "ln -s /etc/passwd pw; ln -s inside.txt ok");
+        t.ov.snapshot_bases().unwrap();
+        let ch = t.ov.changes();
+        let pw = ch.iter().find(|c| c.path == Path::new("pw")).unwrap();
+        assert_eq!(pw.link.as_deref(), Some(Path::new("/etc/passwd")));
+        let d = t.ov.diff(Path::new("pw")).unwrap();
+        assert!(
+            d.iter()
+                .flat_map(|h| h.lines.iter())
+                .any(|(_, l)| l.contains("symlink → /etc/passwd"))
+        );
+        assert!(
+            !d.iter()
+                .flat_map(|h| h.lines.iter())
+                .any(|(_, l)| l.contains("root:")),
+            "target contents never shown"
+        );
+        assert!(matches!(
+            t.ov.accept_file(Path::new("pw"), true),
+            Err(OverlayError::Outside(_))
+        ));
+        t.ov.accept_file(Path::new("ok"), false).unwrap();
+        assert!(
+            fs::symlink_metadata(t.ws.join("ok"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn deleted_dir_conflicts_when_contents_changed() {
+        if !crate::testutil::have_bwrap() {
+            return;
+        }
+        let t = setup();
+        fs::create_dir_all(t.ws.join("d")).unwrap();
+        fs::write(t.ws.join("d/a"), "a").unwrap();
+        crate::testutil::bwrap_exec(&t.ov, "rm -rf d");
+        t.ov.snapshot_bases().unwrap();
+        assert!(!t.ov.changes()[0].conflict);
+        fs::write(t.ws.join("d/new-by-shaun"), "keep me").unwrap();
+        let c = t.ov.changes();
+        assert!(c[0].conflict, "{c:?}");
+        assert!(matches!(
+            t.ov.accept_file(Path::new("d"), false),
+            Err(OverlayError::Conflict(_))
+        ));
+        assert!(t.ws.join("d/new-by-shaun").exists());
+    }
+
+    #[test]
+    fn disk_diff_shows_edits_made_on_disk() {
+        let t = setup();
+        fs::write(t.ws.join("a"), "one\n").unwrap();
+        t.ov.write(Path::new("a"), b"agent\n").unwrap();
+        fs::write(t.ws.join("a"), "shaun\n").unwrap();
+        let d = t.ov.disk_diff(Path::new("a")).unwrap();
+        let lines: Vec<String> = d
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|(c, l)| format!("{c}{l}"))
+            .collect();
+        assert_eq!(lines, ["-one", "+shaun"]);
+    }
+
+    #[test]
+    fn accept_refuses_creating_dirs_through_outside_symlink() {
+        let t = setup();
+        let outside = t._tmp.path().join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, t.ws.join("ln")).unwrap();
+        // A file staged under the link's name (as if the link had been a dir in the layer).
+        fs::create_dir_all(t.ov.upper().join("ln/sub")).unwrap();
+        fs::write(t.ov.upper().join("ln/sub/f"), "x").unwrap();
+        assert!(t.ov.accept_file(Path::new("ln/sub/f"), true).is_err());
+        assert!(
+            !outside.join("sub").exists(),
+            "no directories created outside"
+        );
+    }
+
+    #[test]
+    fn discard_after_a_real_mount_removes_everything() {
+        if !crate::testutil::have_bwrap() {
+            return;
+        }
+        let t = setup();
+        crate::testutil::bwrap_exec(&t.ov, "echo x > f");
+        let dir = t.ov.dir().to_path_buf();
+        t.ov.clone().discard().unwrap();
+        assert!(!dir.exists());
     }
 }

@@ -59,7 +59,26 @@ impl Default for SandboxSettings {
                 "~/.config/void.ai",
                 "~/.local/share/void.ai",
                 "~/.claude",
+                "~/.claude.json",
                 "~/.config/Claude",
+                "~/.config/strata",
+                "~/.local/share/opencode",
+                "~/.npmrc",
+                "~/.pypirc",
+                "~/.cargo/credentials",
+                "~/.cargo/credentials.toml",
+                "~/.git-credentials",
+                "~/.config/git/credentials",
+                "~/.docker",
+                "~/.kube",
+                "~/.password-store",
+                "~/.config/gcloud",
+                "~/.azure",
+                "~/.terraform.d",
+                "~/.bash_history",
+                "~/.zsh_history",
+                "~/.python_history",
+                "~/.local/share/fish/fish_history",
                 "/run/user/$UID",
                 "/run/dbus",
                 "/var/run/docker.sock",
@@ -305,22 +324,6 @@ impl Sandbox {
             "--tmpfs".as_ref(),
             "/tmp".as_ref(),
         ]);
-        // Mount over the real location (bwrap can't mount through symlinks such as
-        // /var/run → /run): directories get an empty tmpfs, files and sockets /dev/null.
-        let mut seen = std::collections::HashSet::new();
-        for h in self.hidden_paths() {
-            let Ok(real) = std::fs::canonicalize(&h) else {
-                continue;
-            };
-            if !seen.insert(real.clone()) {
-                continue;
-            }
-            if real.is_dir() {
-                push(&["--tmpfs".as_ref(), real.as_os_str()]);
-            } else {
-                push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), real.as_os_str()]);
-            }
-        }
         let caches = self.caches();
         for (cache, layer) in &caches {
             let (up, work) = (layer.join("upper"), layer.join("work"));
@@ -348,6 +351,23 @@ impl Sandbox {
         }
         let target = plan.target_dir.as_os_str();
         push(&["--bind".as_ref(), target, target]);
+        // Hidden paths last, so they also cover anything inside the workspace or caches.
+        // Mount over the real location (bwrap can't mount through symlinks such as
+        // /var/run → /run): directories get an empty tmpfs, files and sockets /dev/null.
+        let mut seen = std::collections::HashSet::new();
+        for h in self.hidden_paths() {
+            let Ok(real) = std::fs::canonicalize(&h) else {
+                continue;
+            };
+            if !seen.insert(real.clone()) {
+                continue;
+            }
+            if real.is_dir() {
+                push(&["--tmpfs".as_ref(), real.as_os_str()]);
+            } else {
+                push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), real.as_os_str()]);
+            }
+        }
         push(&["--clearenv".as_ref()]);
         for k in ENV_PASS {
             if let Some(v) = std::env::var_os(k) {
@@ -370,7 +390,14 @@ impl Sandbox {
             }
             push(&["--".as_ref()]);
         }
-        push(&["bash".as_ref(), "-lc".as_ref(), plan.command.as_ref()]);
+        // No profile or rc files: the environment is exactly what's set above.
+        push(&[
+            "bash".as_ref(),
+            "--noprofile".as_ref(),
+            "--norc".as_ref(),
+            "-c".as_ref(),
+            plan.command.as_ref(),
+        ]);
         a
     }
 
@@ -592,7 +619,10 @@ mod tests {
         assert!(pos(&a, &["--setenv", "HOME", &p(&home)]).is_some());
         assert!(pos(&a, &["--setenv", "CARGO_TARGET_DIR", &p(&plan.target_dir)]).is_some());
         assert!(pos(&a, &["--chdir", &p(&ws)]).is_some());
-        assert_eq!(&a[a.len() - 3..], ["bash", "-lc", "echo hi"]);
+        assert_eq!(
+            &a[a.len() - 5..],
+            ["bash", "--noprofile", "--norc", "-c", "echo hi"]
+        );
 
         let offline = Sandbox::with_paths(
             Some("/usr/bin/bwrap".into()),
@@ -610,7 +640,10 @@ mod tests {
         assert!(pos(&b[h..], &["--write", &p(&ws)]).is_some());
         assert!(pos(&b[h..], &["--write", "/tmp"]).is_some());
         assert!(pos(&b[h..], &["--write", &p(&plan.target_dir)]).is_some());
-        assert_eq!(&b[b.len() - 4..], ["--", "bash", "-lc", "echo hi"]);
+        assert_eq!(
+            &b[b.len() - 6..],
+            ["--", "bash", "--noprofile", "--norc", "-c", "echo hi"]
+        );
     }
 
     #[test]
@@ -704,5 +737,65 @@ mod tests {
         assert_eq!(cut, 10);
         assert!(out.starts_with('y'));
         assert_eq!(out.len(), OUTPUT_CAP);
+    }
+
+    #[test]
+    fn defaults_hide_credentials_found_on_desktops() {
+        let s = SandboxSettings::default();
+        for h in [
+            "~/.npmrc",
+            "~/.local/share/fish/fish_history",
+            "~/.bash_history",
+            "~/.cargo/credentials.toml",
+            "~/.git-credentials",
+            "~/.docker",
+            "~/.kube",
+            "~/.password-store",
+            "~/.claude.json",
+            "~/.config/strata",
+            "~/.local/share/opencode",
+        ] {
+            assert!(s.hidden.iter().any(|x| x == h), "{h}");
+        }
+    }
+
+    #[test]
+    fn hidden_mounts_come_after_the_overlays_and_shell_skips_profiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join("secrets")).unwrap();
+        let p = |x: &Path| x.to_string_lossy().into_owned();
+        let settings = SandboxSettings {
+            hidden: vec![p(&ws.join("secrets"))],
+            caches: vec![],
+            ..SandboxSettings::default()
+        };
+        let sb = Sandbox::with_paths(
+            Some("/usr/bin/bwrap".into()),
+            None,
+            tmp.path().join("d"),
+            tmp.path().join("h"),
+            settings,
+        );
+        let plan = RunPlan {
+            workspace: ws.clone(),
+            upper: tmp.path().join("u"),
+            work: tmp.path().join("w"),
+            target_dir: tmp.path().join("t"),
+            command: "true".into(),
+            timeout_secs: None,
+        };
+        let a = strs(&sb.bwrap_args(&plan));
+        let ovl = pos(&a, &["--overlay", &p(&plan.upper), &p(&plan.work), &p(&ws)]).unwrap();
+        let hid = pos(
+            &a,
+            &["--tmpfs", &p(&ws.join("secrets").canonicalize().unwrap())],
+        )
+        .unwrap();
+        assert!(hid > ovl, "hidden mounts must cover the workspace overlay");
+        assert_eq!(
+            &a[a.len() - 5..],
+            ["bash", "--noprofile", "--norc", "-c", "true"]
+        );
     }
 }

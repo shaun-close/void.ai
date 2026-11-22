@@ -175,6 +175,8 @@ pub enum Event {
         conversation: ConversationId,
         path: PathBuf,
         hunks: Vec<Hunk>,
+        /// For a conflicted file: what changed on disk since void first changed it.
+        disk: Vec<Hunk>,
     },
     ReviewError {
         conversation: ConversationId,
@@ -183,6 +185,11 @@ pub enum Event {
     },
     /// Older messages were summarised.
     Compacted(ConversationId),
+    /// An agent turn started or ended (the UI shows Stop while it's active).
+    TurnState {
+        conversation: ConversationId,
+        active: bool,
+    },
 }
 
 /// Knobs for embedding the engine (tests lower the step limit and skip the sandbox).
@@ -325,6 +332,8 @@ enum Msg {
         tool: String,
         prefix: String,
     },
+    /// The grace period after Stop is over: abort whatever is still running.
+    ForceEnd(ConversationId),
 }
 
 enum ToolMsg {
@@ -358,6 +367,8 @@ struct Turn {
     cancel: CancellationToken,
     runner: Option<AbortHandle>,
     workspace: Workspace,
+    /// Stop was pressed: let the running tool finish with its partial output, then end.
+    stopping: bool,
 }
 
 enum StreamItem {
@@ -432,7 +443,7 @@ impl State {
                     }
                     let turns: Vec<_> = self.turns.keys().copied().collect();
                     for id in turns {
-                        self.end_turn(id);
+                        self.finalize_turn(id);
                     }
                     let _ = ack.send(());
                 }
@@ -455,6 +466,11 @@ impl State {
                     self.next_approval += 1;
                     self.approvals.insert(req.id, (req.conversation, reply));
                     self.emit(Event::ApprovalNeeded(req));
+                }
+                Msg::ForceEnd(id) => {
+                    if self.turns.get(&id).is_some_and(|t| t.stopping) {
+                        self.finalize_turn(id);
+                    }
                 }
                 Msg::AddRule { ws, tool, prefix } => {
                     let path = self.store.permissions_path(&ws);
@@ -527,12 +543,57 @@ impl State {
                 cancel: CancellationToken::new(),
                 runner: None,
                 workspace: ws,
+                stopping: false,
             },
         );
+        self.emit(Event::TurnState {
+            conversation: c.id,
+            active: true,
+        });
     }
 
-    /// Stop a turn: cancel its tools, refuse its pending approvals, report its changes.
+    fn busy(&self, id: ConversationId) -> bool {
+        self.streams.contains_key(&id) || self.turns.contains_key(&id)
+    }
+
+    /// Stop a turn: cancel its tools and refuse its pending approvals. A running tool gets a
+    /// moment to finish with what it has (bash returns "stopped" plus its output); after 3 s
+    /// it's aborted.
     fn end_turn(&mut self, id: ConversationId) {
+        let Some(t) = self.turns.get_mut(&id) else {
+            return;
+        };
+        t.cancel.cancel();
+        let running = t.runner.is_some();
+        let pending: Vec<u64> = self
+            .approvals
+            .iter()
+            .filter(|(_, (c, _))| *c == id)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in pending {
+            self.approvals.remove(&k);
+            self.emit(Event::ApprovalResolved { id: k });
+        }
+        if !running {
+            self.finalize_turn(id);
+            return;
+        }
+        if let Some(t) = self.turns.get_mut(&id) {
+            if t.stopping {
+                return;
+            }
+            t.stopping = true;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = tx.send(Msg::ForceEnd(id));
+        });
+    }
+
+    /// End a turn now (abort a running tool) and report its changes.
+    fn finalize_turn(&mut self, id: ConversationId) {
         let Some(t) = self.turns.remove(&id) else {
             return;
         };
@@ -550,6 +611,10 @@ impl State {
             self.approvals.remove(&k);
             self.emit(Event::ApprovalResolved { id: k });
         }
+        self.emit(Event::TurnState {
+            conversation: id,
+            active: false,
+        });
         self.emit_changes(&t.workspace, id);
     }
 
@@ -596,8 +661,12 @@ impl State {
                 let Some(t) = self.turns.get_mut(&id) else {
                     return;
                 };
-                t.round += 1;
                 t.runner = None;
+                if t.stopping {
+                    self.finalize_turn(id);
+                    return;
+                }
+                t.round += 1;
                 let ws = t.workspace.clone();
                 self.emit_changes(&ws, id);
                 if let Some(c) = self.convs.get(&id).cloned() {
@@ -638,7 +707,7 @@ impl State {
             let mut first = true;
             for (call_id, name, arguments) in calls {
                 if cancel.is_cancelled() {
-                    return;
+                    break;
                 }
                 let tool = registry.get(&name);
                 let args: Option<Value> = if arguments.trim().is_empty() {
@@ -743,9 +812,7 @@ impl State {
                 first = false;
                 send(ToolMsg::Finished { call_id, output });
             }
-            if !cancel.is_cancelled() {
-                send(ToolMsg::RoundDone);
-            }
+            send(ToolMsg::RoundDone);
         });
         if let Some(t) = self.turns.get_mut(&id) {
             t.runner = Some(task.abort_handle());
@@ -818,7 +885,7 @@ impl State {
                 if let Some(s) = self.streams.remove(&id) {
                     s.abort.abort();
                 }
-                self.end_turn(id);
+                self.finalize_turn(id);
                 let ws = self
                     .convs
                     .remove(&id)
@@ -831,7 +898,7 @@ impl State {
                 }
                 let overlay = self.store.overlay_dir(&ws, &id);
                 if overlay.exists()
-                    && let Err(e) = std::fs::remove_dir_all(&overlay)
+                    && let Err(e) = crate::fsutil::remove_tree(&overlay)
                 {
                     self.emit(Event::Error(format!(
                         "Couldn't discard the pending changes: {e}"
@@ -845,7 +912,7 @@ impl State {
             }
             Command::SendMessage { conversation, text } => self.send_message(conversation, text),
             Command::Retry(id) => {
-                if self.streams.contains_key(&id) {
+                if self.busy(id) {
                     return;
                 }
                 let ws = self.workspace.clone();
@@ -901,11 +968,22 @@ impl State {
                     .existing_overlay(&ws, conversation)
                     .map(|ov| ov.diff(&path))
                 {
-                    Some(Ok(hunks)) => self.emit(Event::Diff {
-                        conversation,
-                        path,
-                        hunks,
-                    }),
+                    Some(Ok(hunks)) => {
+                        let ov = self.existing_overlay(&ws, conversation);
+                        let conflicted = ov.as_ref().is_some_and(|o| {
+                            o.changes().iter().any(|c| c.path == path && c.conflict)
+                        });
+                        let disk = match (conflicted, ov) {
+                            (true, Some(o)) => o.disk_diff(&path).unwrap_or_default(),
+                            _ => Vec::new(),
+                        };
+                        self.emit(Event::Diff {
+                            conversation,
+                            path,
+                            hunks,
+                            disk,
+                        })
+                    }
                     Some(Err(e)) => self.emit(Event::ReviewError {
                         conversation,
                         path,
@@ -987,7 +1065,7 @@ impl State {
             Command::ClearSandboxCaches => {
                 if let Some(sb) = &self.sandbox {
                     let dir = sb.cache_layer_dir();
-                    match std::fs::remove_dir_all(&dir) {
+                    match crate::fsutil::remove_tree(&dir) {
                         Ok(()) => self.emit(Event::Info("Sandbox caches cleared.".into())),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             self.emit(Event::Info("Sandbox caches were already empty.".into()))
@@ -1092,9 +1170,9 @@ impl State {
     }
 
     fn send_message(&mut self, id: ConversationId, text: String) {
-        if self.streams.contains_key(&id) {
+        if self.busy(id) {
             self.emit(Event::Error(
-                "This conversation is already replying; stop it first.".into(),
+                "void is still working on this chat (already replying or running tools); stop it first.".into(),
             ));
             return;
         }
@@ -2587,5 +2665,139 @@ mod tests {
             first.starts_with("Summary of earlier conversation:\nSUMMARY TEXT"),
             "{first}"
         );
+    }
+
+    #[test]
+    fn send_during_turn_is_rejected_and_turn_state_reported() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        a.r.until(|e| matches!(e, Event::TurnState { active: true, .. }));
+        let id = match a.r.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => req.id,
+            _ => unreachable!(),
+        };
+        a.r.send(a.conv, "another thing");
+        match a.r.until(|e| matches!(e, Event::Error(_))) {
+            Event::Error(m) => assert!(m.contains("still working"), "{m}"),
+            _ => unreachable!(),
+        }
+        a.r.handle.send(Command::Approve {
+            id,
+            decision: Decision::Once,
+        });
+        a.finish_with("ok");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        let users = a
+            .saved()
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+        assert_eq!(users, 1, "the second message was refused, not queued");
+    }
+
+    #[test]
+    fn stop_during_bash_keeps_partial_output() {
+        let rules = defaults_with(Rule {
+            tool: "bash".into(),
+            prefix: None,
+            action: Action::Allow,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let ws = root.join("project");
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = Config {
+            active_profile: "agent".into(),
+            profiles: vec![profile("agent", "http://fake")],
+            ..Config::default()
+        };
+        let cfg_path = root.join("config/config.toml");
+        save_config(&cfg_path, &cfg).unwrap();
+        let store = Store::new(root.join("data"));
+        let w = store.workspace_for(&ws).unwrap();
+        Permissions { rules }
+            .save(&store.permissions_path(&w.id))
+            .unwrap();
+        let seq = Arc::new(Seq {
+            scripts: Mutex::new(
+                vec![
+                    call(
+                        "b1",
+                        "bash",
+                        serde_json::json!({"command": "echo started; sleep 30"}),
+                    ),
+                    say("after"),
+                ]
+                .into(),
+            ),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let factory: BackendFactory =
+            Arc::new(move |_p: &Profile, _k: Option<String>| seq.clone() as Arc<dyn Backend>);
+        let handle = Engine::start_with_options(
+            cfg_path,
+            store.clone(),
+            Arc::new(|| {}),
+            factory,
+            EngineOptions {
+                step_limit: 50,
+                sandbox: true,
+            },
+        );
+        let mut r = Rig {
+            _dir: dir,
+            root,
+            store,
+            handle,
+            notified: Arc::new(AtomicUsize::new(0)),
+            received: 0,
+        };
+        match r.until(|e| matches!(e, Event::SandboxStatus(_))) {
+            Event::SandboxStatus(crate::sandbox::Availability::Ready { .. }) => {}
+            other => {
+                eprintln!("skipping: {other:?}");
+                return;
+            }
+        }
+        r.handle.send(Command::OpenWorkspace(Some(ws.clone())));
+        r.until(
+            |e| matches!(e, Event::WorkspaceOpened { workspace, .. } if workspace.root.is_some()),
+        );
+        let conv = r.new_conversation();
+        r.send(conv, "run it");
+        r.until(|e| matches!(e, Event::ToolOutput { text, .. } if text.contains("started")));
+        let t = Instant::now();
+        r.handle.send(Command::Stop(conv));
+        match r.until(|e| matches!(e, Event::ToolFinished { .. })) {
+            Event::ToolFinished { output, .. } => {
+                assert!(output.content.starts_with("stopped"), "{output:?}");
+                assert!(output.content.contains("started"), "{output:?}");
+            }
+            _ => unreachable!(),
+        }
+        r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let saved = r.store.load(&w.id, &conv).unwrap();
+        assert!(saved.messages.iter().any(|m| m.parts.iter().any(
+            |p| matches!(p, Part::ToolResult { content, .. } if content.contains("started"))
+        )));
     }
 }

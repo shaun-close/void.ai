@@ -218,3 +218,21 @@ async fn sandbox_landlock_blocks_abstract_socket() {
     );
     drop(listener);
 }
+
+#[tokio::test]
+async fn sandbox_hides_paths_inside_the_workspace() {
+    let Some(r) = rig_with(|tmp| SandboxSettings {
+        hidden: vec![tmp.join("ws/secrets").to_string_lossy().into_owned()],
+        caches: vec![],
+        ..SandboxSettings::default()
+    })
+    .await
+    else {
+        return;
+    };
+    fs::create_dir_all(r.ws.join("secrets")).unwrap();
+    fs::write(r.ws.join("secrets/key"), "TOPSECRET").unwrap();
+    let res = r.run("cat secrets/key; echo rc=$?").await;
+    assert!(res.output.contains("rc="), "{}", res.output);
+    assert!(!res.output.contains("TOPSECRET"), "{}", res.output);
+}
