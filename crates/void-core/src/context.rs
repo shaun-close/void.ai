@@ -47,6 +47,7 @@ pub fn build_request(conv: &Conversation, profile: &Profile, cfg: &Config) -> Ch
         messages,
         max_output: profile.max_output,
         extra_body: profile.extra_body.clone(),
+        tools: Vec::new(),
     }
 }
 
@@ -138,5 +139,38 @@ mod tests {
         c.messages.push(a);
         c.messages.push(Message::user("abcd"));
         assert_eq!(context_used(&c), 121);
+    }
+
+    #[test]
+    fn tool_messages_are_not_merged() {
+        let cfg = Config::default();
+        let profile = cfg.profile("strata").unwrap();
+        let mut c = Conversation::new(Workspace::scratch().id);
+        c.messages.push(Message::user("go"));
+        c.messages.push(Message::new(
+            Role::Assistant,
+            vec![Part::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        ));
+        c.messages.push(Message::new(
+            Role::Tool,
+            vec![Part::ToolResult {
+                call_id: "c1".into(),
+                content: "A".into(),
+            }],
+        ));
+        c.messages.push(Message::new(
+            Role::Tool,
+            vec![Part::ToolResult {
+                call_id: "c2".into(),
+                content: "B".into(),
+            }],
+        ));
+        let req = build_request(&c, profile, &cfg);
+        assert_eq!(req.messages.len(), 4);
+        assert!(req.tools.is_empty());
     }
 }

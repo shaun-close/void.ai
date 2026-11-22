@@ -29,6 +29,7 @@ async fn pong(id: &str) {
         messages: vec![Message::user("Reply with the word pong.")],
         max_output: 256,
         extra_body: extra,
+        tools: vec![],
     };
     let events: Vec<StreamEvent> = b
         .stream(req)

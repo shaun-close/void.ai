@@ -11,7 +11,7 @@ use super::{
     connect_error, drive, http_client, http_error, join_url, merge_json,
 };
 use crate::config::Profile;
-use crate::model::{Role, Usage};
+use crate::model::{Part, Role, Usage};
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -42,20 +42,78 @@ impl AnthropicBackend {
 /// The JSON body for a streaming messages request. The system prompt is top-level; past
 /// reasoning and empty turns are not sent.
 pub fn request_body(req: &ChatRequest) -> Value {
-    let messages: Vec<Value> = req
-        .messages
-        .iter()
-        .filter_map(|m| {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                // System text goes in `system`; tool turns arrive with milestone 2.
-                Role::System | Role::Tool => return None,
-            };
-            let text = m.text();
-            (!text.is_empty()).then(|| json!({"role": role, "content": text}))
-        })
-        .collect();
+    let mut messages: Vec<Value> = Vec::new();
+    // Consecutive tool results share one user turn.
+    let mut results_open = false;
+    for m in &req.messages {
+        match m.role {
+            // System text goes in `system`.
+            Role::System => {}
+            Role::User => {
+                let text = m.text();
+                if !text.is_empty() {
+                    messages.push(json!({"role": "user", "content": text}));
+                    results_open = false;
+                }
+            }
+            Role::Assistant => {
+                let text = m.text();
+                let calls: Vec<Value> = m
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": serde_json::from_str::<Value>(arguments)
+                                .ok()
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| json!({})),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if calls.is_empty() {
+                    if !text.is_empty() {
+                        messages.push(json!({"role": "assistant", "content": text}));
+                    }
+                } else {
+                    let mut blocks = Vec::new();
+                    if !text.is_empty() {
+                        blocks.push(json!({"type": "text", "text": text}));
+                    }
+                    blocks.extend(calls);
+                    messages.push(json!({"role": "assistant", "content": blocks}));
+                }
+                results_open = false;
+            }
+            Role::Tool => {
+                let blocks: Vec<Value> = m
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::ToolResult { call_id, content } => Some(json!({
+                            "type": "tool_result", "tool_use_id": call_id, "content": content})),
+                        _ => None,
+                    })
+                    .collect();
+                if results_open
+                    && let Some(Value::Array(arr)) =
+                        messages.last_mut().and_then(|l| l.get_mut("content"))
+                {
+                    arr.extend(blocks);
+                } else {
+                    messages.push(json!({"role": "user", "content": blocks}));
+                    results_open = true;
+                }
+            }
+        }
+    }
     let mut body = match json!({
         "model": req.model,
         "system": req.system,
@@ -66,6 +124,14 @@ pub fn request_body(req: &ChatRequest) -> Value {
         Value::Object(m) => m,
         _ => unreachable!(),
     };
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.parameters}))
+            .collect();
+        body.insert("tools".into(), Value::Array(tools));
+    }
     merge_json(&mut body, &req.extra_body);
     Value::Object(body)
 }
@@ -279,6 +345,7 @@ mod tests {
             ],
             max_output: 321,
             extra_body: json!({"temperature": 0.5}).as_object().cloned().unwrap(),
+            tools: vec![],
         }
     }
 
@@ -424,6 +491,73 @@ mod tests {
         let evs = b.stream(request()).collect::<Vec<_>>().await;
         assert!(
             !matches!(evs.as_slice(), [Err(BackendError::Protocol(m))] if m.contains("isn't available"))
+        );
+    }
+
+    #[test]
+    fn anthropic_body_includes_tools() {
+        let mut r = request();
+        r.tools = vec![crate::backend::ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        assert_eq!(
+            request_body(&r)["tools"],
+            json!([{"name":"read","description":"Read a file","input_schema":{"type":"object"}}])
+        );
+        assert!(request_body(&request()).get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_maps_tool_history() {
+        let mut r = request();
+        r.messages = vec![
+            Message::user("go"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    Part::Text("Let me look.".into()),
+                    Part::ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: "{\"path\":\"a\"}".into(),
+                    },
+                    Part::ToolCall {
+                        id: "c2".into(),
+                        name: "list".into(),
+                        arguments: "not json".into(),
+                    },
+                ],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![Part::ToolResult {
+                    call_id: "c1".into(),
+                    content: "A".into(),
+                }],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![Part::ToolResult {
+                    call_id: "c2".into(),
+                    content: "B".into(),
+                }],
+            ),
+        ];
+        let b = request_body(&r);
+        assert_eq!(
+            b["messages"],
+            json!([
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Let me look."},
+                    {"type":"tool_use","id":"c1","name":"read","input":{"path":"a"}},
+                    {"type":"tool_use","id":"c2","name":"list","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"c1","content":"A"},
+                    {"type":"tool_result","tool_use_id":"c2","content":"B"}]}
+            ])
         );
     }
 }

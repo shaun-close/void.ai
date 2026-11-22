@@ -73,6 +73,8 @@ pub enum Part {
         call_id: String,
         content: String,
     },
+    /// Compaction marker: a summary of everything before it, sent in place of those messages.
+    Summary(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +147,9 @@ pub struct Conversation {
     /// The profile this conversation uses; None follows the active profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The agent profile (build, plan…); None follows the default agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub messages: Vec<Message>,
 }
 
@@ -160,6 +165,7 @@ impl Conversation {
             created: now,
             updated: now,
             profile_id: None,
+            agent: None,
             messages: Vec::new(),
         }
     }
@@ -229,5 +235,23 @@ mod tests {
         let back: Conversation = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c);
         assert_eq!(back.meta().title, "New chat");
+    }
+
+    #[test]
+    fn summary_part_is_not_text() {
+        let m = Message::new(
+            Role::Assistant,
+            vec![Part::Summary("s".into()), Part::Text("t".into())],
+        );
+        assert_eq!(m.text(), "t");
+    }
+
+    #[test]
+    fn conversation_without_agent_field_loads() {
+        let c = Conversation::new(Workspace::scratch().id);
+        let mut v = serde_json::to_value(&c).unwrap();
+        v.as_object_mut().unwrap().remove("agent");
+        let back: Conversation = serde_json::from_value(v).unwrap();
+        assert_eq!(back.agent, None);
     }
 }

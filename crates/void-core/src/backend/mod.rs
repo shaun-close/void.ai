@@ -19,6 +19,14 @@ pub(crate) mod testsrv;
 
 use sse::{SseEvent, SseParser};
 
+/// A tool the model may call: name, description and JSON-Schema parameters.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 /// What a backend is asked for, independent of its wire format.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatRequest {
@@ -27,6 +35,8 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub max_output: u32,
     pub extra_body: Map<String, Value>,
+    /// Tools offered to the model; empty for plain chat.
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

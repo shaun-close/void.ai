@@ -11,7 +11,7 @@ use super::{
     http_client, http_error, join_url, merge_json,
 };
 use crate::config::Profile;
-use crate::model::{Role, Usage};
+use crate::model::{Part, Role, Usage};
 
 pub struct OpenAiBackend {
     base_url: String,
@@ -40,14 +40,50 @@ impl OpenAiBackend {
 pub fn request_body(req: &ChatRequest) -> Value {
     let mut messages = vec![json!({"role": "system", "content": req.system})];
     for m in &req.messages {
-        let role = match m.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            // Tool turns arrive with milestone 2.
-            Role::Tool => continue,
-        };
-        messages.push(json!({"role": role, "content": m.text()}));
+        match m.role {
+            Role::System => messages.push(json!({"role": "system", "content": m.text()})),
+            Role::User => messages.push(json!({"role": "user", "content": m.text()})),
+            Role::Assistant => {
+                let calls: Vec<Value> = m
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let text = m.text();
+                if calls.is_empty() {
+                    messages.push(json!({"role": "assistant", "content": text}));
+                } else {
+                    let content = if text.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(text)
+                    };
+                    messages.push(
+                        json!({"role": "assistant", "content": content, "tool_calls": calls}),
+                    );
+                }
+            }
+            Role::Tool => {
+                for p in &m.parts {
+                    if let Part::ToolResult { call_id, content } = p {
+                        messages.push(
+                            json!({"role": "tool", "tool_call_id": call_id, "content": content}),
+                        );
+                    }
+                }
+            }
+        }
     }
     let mut body = match json!({
         "model": req.model,
@@ -59,6 +95,17 @@ pub fn request_body(req: &ChatRequest) -> Value {
         Value::Object(m) => m,
         _ => unreachable!(),
     };
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({"type": "function", "function": {
+                "name": t.name, "description": t.description, "parameters": t.parameters}})
+            })
+            .collect();
+        body.insert("tools".into(), Value::Array(tools));
+    }
     merge_json(&mut body, &req.extra_body);
     Value::Object(body)
 }
@@ -265,6 +312,7 @@ mod tests {
             messages: vec![Message::user("hi"), assistant, Message::user("again")],
             max_output: 100,
             extra_body: extra.as_object().cloned().unwrap_or_default(),
+            tools: vec![],
         }
     }
 
@@ -450,5 +498,90 @@ mod tests {
         for p in Config::default().profiles {
             let _ = crate::backend::make_backend(&p, None);
         }
+    }
+
+    fn read_spec() -> crate::backend::ToolSpec {
+        crate::backend::ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        }
+    }
+
+    fn tool_history() -> Vec<Message> {
+        vec![
+            Message::user("go"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    Part::Text("Let me look.".into()),
+                    Part::ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: "{\"path\":\"a\"}".into(),
+                    },
+                    Part::ToolCall {
+                        id: "c2".into(),
+                        name: "list".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![Part::ToolResult {
+                    call_id: "c1".into(),
+                    content: "A".into(),
+                }],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![Part::ToolResult {
+                    call_id: "c2".into(),
+                    content: "B".into(),
+                }],
+            ),
+        ]
+    }
+
+    #[test]
+    fn openai_body_includes_tools() {
+        let mut r = request(json!({}));
+        r.tools = vec![read_spec()];
+        let b = request_body(&r);
+        assert_eq!(
+            b["tools"],
+            json!([{"type":"function","function":{"name":"read","description":"Read a file","parameters":read_spec().parameters}}])
+        );
+        assert!(request_body(&request(json!({}))).get("tools").is_none());
+    }
+
+    #[test]
+    fn openai_maps_tool_history() {
+        let mut r = request(json!({}));
+        r.messages = tool_history();
+        let b = request_body(&r);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 5);
+        assert_eq!(
+            m[2],
+            json!({"role":"assistant","content":"Let me look.","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},
+                {"id":"c2","type":"function","function":{"name":"list","arguments":"{}"}}]})
+        );
+        assert_eq!(
+            m[3],
+            json!({"role":"tool","tool_call_id":"c1","content":"A"})
+        );
+        assert_eq!(
+            m[4],
+            json!({"role":"tool","tool_call_id":"c2","content":"B"})
+        );
+        // An assistant turn with only tool calls has null content.
+        r.messages[1].parts.remove(0);
+        assert_eq!(
+            request_body(&r)["messages"][2]["content"],
+            serde_json::Value::Null
+        );
     }
 }
