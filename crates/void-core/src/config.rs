@@ -357,7 +357,8 @@ mod tests {
     #[test]
     fn key_fields_serialize_as_optional_profile_fields() {
         let mut c = Config::default();
-        c.profiles[0].api_key = ApiKeySource::Command("strata launch --show-key --preset daily".into());
+        c.profiles[0].api_key =
+            ApiKeySource::Command("strata launch --show-key --preset daily".into());
         let s = toml::to_string(&c).unwrap();
         assert!(s.contains("api_key_cmd = \"strata launch --show-key --preset daily\""));
         let bad = r#"

@@ -18,7 +18,10 @@ async fn pong(id: &str) {
     let mut extra = profile.extra_body.clone();
     // Keep the live check quick: no thinking where the template supports turning it off.
     if extra.contains_key("chat_template_kwargs") {
-        extra.insert("chat_template_kwargs".into(), serde_json::json!({"enable_thinking": false}));
+        extra.insert(
+            "chat_template_kwargs".into(),
+            serde_json::json!({"enable_thinking": false}),
+        );
     }
     let req = ChatRequest {
         model: profile.model.clone(),
@@ -41,8 +44,14 @@ async fn pong(id: &str) {
         .collect();
     println!("{id}: {text:?} ({} events)", events.len());
     assert!(text.to_lowercase().contains("pong"), "got {text:?}");
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::Usage(_))), "no usage");
-    assert!(matches!(events.last(), Some(StreamEvent::Done(_))), "no Done");
+    assert!(
+        events.iter().any(|e| matches!(e, StreamEvent::Usage(_))),
+        "no usage"
+    );
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done(_))),
+        "no Done"
+    );
 }
 
 #[tokio::test]
@@ -63,5 +72,8 @@ async fn live_strata_lists_models() {
     let (_, b) = backend_for("strata").await;
     let models = b.list_models().await.unwrap();
     println!("models: {models:?}");
-    assert!(models.iter().any(|m| m == "qwen3.8-flash-next-iq3_xxs"), "got {models:?}");
+    assert!(
+        models.iter().any(|m| m == "qwen3.8-flash-next-iq3_xxs"),
+        "got {models:?}"
+    );
 }

@@ -7,6 +7,11 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     let open = std::env::args_os().nth(1).map(PathBuf::from);
+    // VOID_AI_CONFIG / VOID_AI_DATA_DIR point at another config file / data folder (testing,
+    // portable setups); otherwise ~/.config/void.ai/config.toml and ~/.local/share/void.ai.
+    let (default_config, default_data) = void_core::store::Store::default_paths();
+    let config_path = std::env::var_os("VOID_AI_CONFIG").map_or(default_config, PathBuf::from);
+    let data_dir = std::env::var_os("VOID_AI_DATA_DIR").map_or(default_data, PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("void-ai")
@@ -18,6 +23,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "void.ai",
         options,
-        Box::new(move |cc| Ok(Box::new(app::VoidApp::new(cc, open)))),
+        Box::new(move |cc| Ok(Box::new(app::VoidApp::new(cc, open, config_path, data_dir)))),
     )
 }

@@ -36,8 +36,12 @@ pub struct VoidApp {
 }
 
 impl VoidApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
-        let (config_path, data_dir) = Store::default_paths();
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        open: Option<PathBuf>,
+        config_path: PathBuf,
+        data_dir: PathBuf,
+    ) -> Self {
         let store = Store::new(data_dir);
         let ctx = cc.egui_ctx.clone();
         let engine = Engine::start(
@@ -76,14 +80,37 @@ impl VoidApp {
                 .as_deref()
                 .and_then(layout::from_text)
                 .unwrap_or_else(layout::default_layout);
-            self.saved_layout = layout::to_text(&self.dock);
             self.focused_chat = None;
+            // Restored Chat tabs: load their conversations, forget ones that are gone.
+            let known: Vec<ConversationId> =
+                self.state.conversations.iter().map(|m| m.id).collect();
+            let mut load = Vec::new();
+            for (_, tab) in self.dock.iter_all_tabs_mut() {
+                if let Tab::Chat { conversation, .. } = tab
+                    && let Some(c) = *conversation
+                {
+                    if known.contains(&c) {
+                        load.push(c);
+                    } else {
+                        *conversation = None;
+                    }
+                }
+            }
+            for c in load {
+                if !self.state.loaded.contains_key(&c) {
+                    self.engine.send(Command::OpenConversation(c));
+                }
+            }
+            self.saved_layout = layout::to_text(&self.dock);
         }
         if let Some(id) = self.state.take_created() {
             match self.pending_start.take() {
                 Some((tab, text)) => {
                     match self.chat_tab_mut(tab) {
-                        Some(slot) => *slot = Some(id),
+                        Some(slot) => {
+                            *slot = Some(id);
+                            self.focused_chat = Some(tab);
+                        }
                         None => self.apply_action(Action::Show(id)),
                     }
                     self.engine.send(Command::SendMessage {
@@ -194,7 +221,7 @@ impl VoidApp {
     }
 
     fn focused_conversation(&self) -> Option<ConversationId> {
-        let id = self.focused_chat?;
+        let id = self.focused_chat.or_else(|| self.any_chat())?;
         self.dock.iter_all_tabs().find_map(|(_, t)| match t {
             Tab::Chat {
                 id: i,
@@ -429,5 +456,298 @@ impl eframe::App for VoidApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_layout_now();
+    }
+}
+
+/// End-to-end checks of the real app against a running Strata (`strata launch --preset daily`),
+/// driven headlessly by egui_kittest. Run with:
+/// `cargo test -p void-gui e2e -- --ignored --nocapture`
+/// Set VOID_AI_E2E_DIR to keep the config and data it writes (otherwise a temp dir is used).
+#[cfg(test)]
+mod e2e {
+    use super::*;
+    use egui::accesskit::Role;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use void_core::model::Role as MsgRole;
+
+    struct Paths {
+        _tmp: Option<tempfile::TempDir>,
+        root: PathBuf,
+    }
+
+    fn paths() -> Paths {
+        match std::env::var_os("VOID_AI_E2E_DIR") {
+            Some(d) => {
+                let root = PathBuf::from(d);
+                let _ = std::fs::remove_dir_all(&root);
+                std::fs::create_dir_all(&root).unwrap();
+                Paths { _tmp: None, root }
+            }
+            None => {
+                let t = tempfile::tempdir().unwrap();
+                Paths {
+                    root: t.path().to_path_buf(),
+                    _tmp: Some(t),
+                }
+            }
+        }
+    }
+
+    fn harness(p: &Paths) -> Harness<'static, VoidApp> {
+        let (cfg, data) = (p.root.join("config.toml"), p.root.join("data"));
+        Harness::builder()
+            .with_size([1280.0, 800.0])
+            .with_max_steps(10)
+            // egui_dock's splitters have no accessible name; that's upstream, not ours.
+            .with_accessibility_check(false)
+            .build_eframe(move |cc| VoidApp::new(cc, None, cfg, data))
+    }
+
+    /// Step the app (letting engine events arrive) until `done` holds.
+    fn until(h: &mut Harness<'_, VoidApp>, secs: u64, what: &str, done: impl Fn(&VoidApp) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            h.step();
+            if done(h.state()) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn type_and_send(h: &mut Harness<'_, VoidApp>, text: &str) {
+        let input = h.get_by_role(Role::MultilineTextInput);
+        input.focus();
+        h.step();
+        h.get_by_role(Role::MultilineTextInput).type_text(text);
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+    }
+
+    fn last_assistant(app: &VoidApp) -> Option<void_core::model::Message> {
+        let c = app.focused_conversation()?;
+        app.state
+            .loaded
+            .get(&c)?
+            .messages
+            .last()
+            .filter(|m| m.role == MsgRole::Assistant)
+            .cloned()
+    }
+
+    fn idle(app: &VoidApp) -> bool {
+        app.state.streams.is_empty()
+    }
+
+    /// Offline: a first message typed into the Chat tab makes that tab's conversation the
+    /// focused one (status bar, list highlight) without a click on the tab.
+    #[test]
+    fn first_message_focuses_its_chat_tab() {
+        let p = paths_tmp();
+        let cfg = void_core::config::Config {
+            active_profile: "llama-server".into(),
+            profiles: vec![void_core::config::Profile {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                ..void_core::config::Config::default()
+                    .profile("llama-server")
+                    .unwrap()
+                    .clone()
+            }],
+            ..void_core::config::Config::default()
+        };
+        void_core::config::save_config(&p.root.join("config.toml"), &cfg).unwrap();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.config.active_profile == "llama-server"
+        });
+        type_and_send(&mut h, "hello");
+        until(&mut h, 10, "conversation", |a| {
+            a.state.conversations.len() == 1
+        });
+        until(&mut h, 10, "focused conversation", |a| {
+            a.focused_conversation().is_some()
+        });
+        let id = h.state().state.conversations[0].id;
+        assert_eq!(h.state().focused_conversation(), Some(id));
+    }
+
+    /// Offline: after a restart, a Chat tab restored from the layout loads its conversation,
+    /// and a tab whose conversation is gone falls back to an empty chat.
+    #[test]
+    fn restored_chat_tab_loads_its_conversation() {
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        h.state().engine.send(Command::NewConversation);
+        until(&mut h, 10, "bound", |a| a.focused_conversation().is_some());
+        let id = h.state().focused_conversation().unwrap();
+        // A second Chat tab pointing at a conversation that doesn't exist.
+        let ghost = ConversationId::new();
+        let tab = layout::next_chat_id(&h.state().dock);
+        layout::ensure_tab(
+            &mut h.state_mut().dock,
+            Tab::Chat {
+                id: tab,
+                conversation: Some(ghost),
+            },
+        );
+        h.step();
+        h.state_mut().save_layout_now();
+        drop(h);
+
+        let mut h = harness(&p);
+        until(&mut h, 10, "restored conversation loaded", |a| {
+            a.state.loaded.contains_key(&id)
+        });
+        let ghost_tab = h.state().dock.iter_all_tabs().find_map(|(_, t)| match t {
+            Tab::Chat { id, conversation } if *id == tab => Some(*conversation),
+            _ => None,
+        });
+        assert_eq!(
+            ghost_tab,
+            Some(None),
+            "missing conversation cleared from its tab"
+        );
+    }
+
+    fn paths_tmp() -> Paths {
+        let t = tempfile::tempdir().unwrap();
+        Paths {
+            root: t.path().to_path_buf(),
+            _tmp: Some(t),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn e2e_chat_with_strata() {
+        let p = paths();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch" && a.state.config.active_profile == "strata"
+        });
+
+        // 1. First message from an empty Chat tab: creates the conversation and streams a reply.
+        type_and_send(&mut h, "Reply with the single word pong.");
+        until(&mut h, 30, "stream start", |a| !a.state.streams.is_empty());
+        until(&mut h, 180, "reply", |a| {
+            idle(a) && last_assistant(a).is_some()
+        });
+        let reply = last_assistant(h.state()).unwrap();
+        println!(
+            "reply: {:?} / reasoning {} chars / tps {:?}",
+            reply.text(),
+            reply.reasoning().len(),
+            h.state().state.last_tps
+        );
+        assert!(reply.error.is_none(), "error: {:?}", reply.error);
+        assert!(reply.text().to_lowercase().contains("pong"));
+        assert!(h.state().state.last_tps.is_some());
+        assert!(
+            h.query_by_label_contains("tok/s").is_some(),
+            "status bar shows tok/s"
+        );
+        assert!(
+            h.query_by_label_contains("context ").is_some(),
+            "status bar shows context"
+        );
+        assert_eq!(h.state().state.conversations.len(), 1);
+
+        // 2. Stop mid-stream keeps the partial reply.
+        type_and_send(
+            &mut h,
+            "Count from 1 to 400, one number per line, no other text.",
+        );
+        // With thinking on, the reply may arrive as reasoning first (or only); any output will do.
+        until(&mut h, 120, "some streamed output", |a| {
+            a.state
+                .streams
+                .values()
+                .any(|s| s.text.len() + s.reasoning.len() > 20)
+        });
+        h.get_by_label("Stop").click();
+        until(&mut h, 10, "stopped", idle);
+        let stopped = last_assistant(h.state()).unwrap();
+        println!(
+            "stopped after {} text / {} reasoning chars",
+            stopped.text().len(),
+            stopped.reasoning().len()
+        );
+        assert!(stopped.stopped);
+        assert!(!stopped.text().is_empty() || !stopped.reasoning().is_empty());
+
+        // 3. The same conversation through the Anthropic-style profile.
+        let conv = h.state().focused_conversation().unwrap();
+        h.state().engine.send(Command::SetConversationProfile(
+            conv,
+            Some("strata-anthropic".into()),
+        ));
+        until(&mut h, 10, "profile switch", |a| {
+            a.state
+                .loaded
+                .get(&conv)
+                .and_then(|c| c.profile_id.as_deref())
+                == Some("strata-anthropic")
+        });
+        type_and_send(&mut h, "Now reply with the single word ping.");
+        until(&mut h, 30, "stream start", |a| !a.state.streams.is_empty());
+        until(&mut h, 180, "anthropic reply", |a| {
+            idle(a) && last_assistant(a).is_some_and(|m| !m.stopped)
+        });
+        let ping = last_assistant(h.state()).unwrap();
+        println!("anthropic reply: {:?}", ping.text());
+        assert!(ping.error.is_none(), "error: {:?}", ping.error);
+        assert!(ping.text().to_lowercase().contains("ping"));
+
+        // 4. Close Settings, reopen it from View, then close it again and keep that layout.
+        let path = h.state_mut().dock.find_tab(&Tab::Settings).unwrap();
+        h.state_mut().dock.remove_tab(path);
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Settings);
+        assert!(h.state().dock.find_tab(&Tab::Settings).is_some());
+        let path = h.state_mut().dock.find_tab(&Tab::Settings).unwrap();
+        h.state_mut().dock.remove_tab(path);
+        h.step();
+        h.state_mut().save_layout_now();
+        drop(h);
+
+        // 5. Restart: same conversations, same layout (no Settings tab).
+        let mut h = harness(&p);
+        until(&mut h, 10, "reopen", |a| a.state.conversations.len() == 1);
+        h.step();
+        assert!(
+            h.state().dock.find_tab(&Tab::Settings).is_none(),
+            "layout kept"
+        );
+        assert!(h.state().dock.find_tab(&Tab::Backends).is_some());
+
+        // 6. A folder workspace has its own conversations; Scratch still has ours.
+        let proj = p.root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        h.state_mut().open_workspace(Some(proj));
+        until(&mut h, 10, "folder workspace", |a| {
+            a.state.workspace.name == "proj"
+        });
+        assert!(h.state().state.conversations.is_empty());
+        assert!(
+            h.state().dock.find_tab(&Tab::Settings).is_some(),
+            "fresh workspace gets the default layout"
+        );
+        h.state_mut().open_workspace(None);
+        until(&mut h, 10, "back to scratch", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        until(&mut h, 10, "scratch list", |a| {
+            a.state.conversations.len() == 1
+        });
+        h.step();
+        assert!(
+            h.state().dock.find_tab(&Tab::Settings).is_none(),
+            "scratch layout restored"
+        );
     }
 }
