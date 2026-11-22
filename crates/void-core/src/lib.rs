@@ -8,6 +8,9 @@ pub mod fsutil;
 pub mod model;
 pub mod overlay;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testutil;
+pub mod tools;
 
 /// The crate version.
 pub fn version() -> &'static str {

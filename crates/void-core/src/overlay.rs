@@ -367,7 +367,8 @@ impl Overlay {
         }
     }
 
-    fn ignore_matcher(&self) -> ignore::gitignore::Gitignore {
+    /// The workspace's .gitignore rules, read through the merged view.
+    pub fn ignore_matcher(&self) -> ignore::gitignore::Gitignore {
         let mut b = ignore::gitignore::GitignoreBuilder::new(self.ws.as_path());
         if let Ok(bytes) = self.read(Path::new(".gitignore")) {
             for line in String::from_utf8_lossy(&bytes).lines() {
@@ -378,7 +379,7 @@ impl Overlay {
             .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
     }
 
-    fn ignored(&self, gi: &ignore::gitignore::Gitignore, rel: &Path, is_dir: bool) -> bool {
+    pub fn ignored(&self, gi: &ignore::gitignore::Gitignore, rel: &Path, is_dir: bool) -> bool {
         gi.matched_path_or_any_parents(self.ws.join(rel), is_dir)
             .is_ignore()
     }
