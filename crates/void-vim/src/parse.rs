@@ -4,6 +4,7 @@
 //! command is either complete, still waiting for keys, or invalid.
 
 use crate::Mode;
+use crate::block::{BlockOp, BlockSize};
 use crate::keys::char_of;
 use crate::motion::{Find, Motion};
 use crate::registers::Registers;
@@ -125,6 +126,21 @@ pub(crate) enum Act {
     VisualSwap,
     /// Only built by dot-repeat of a Visual operator.
     VisualRepeat(Op, Extent),
+    SetMark(char),
+    /// `<C-o>` / `<C-i>`.
+    Jump {
+        older: bool,
+    },
+    /// `<C-a>` / `<C-x>`.
+    Add {
+        subtract: bool,
+    },
+    /// Visual-block `I` / `A`.
+    BlockInsert {
+        append: bool,
+    },
+    /// Only built by dot-repeat of a Visual-block command.
+    BlockRepeat(BlockOp, BlockSize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -231,6 +247,17 @@ fn normal_act(key: &str, k: &mut Keys, recording: bool, count: &mut Option<usize
         "." => Act::Repeat,
         "u" => Act::Undo,
         "<C-r>" => Act::Redo,
+        "m" => {
+            let name = char_of(k.next()?).ok_or(Fail::Bad)?;
+            if !crate::marks::is_mark(name) {
+                return Err(Fail::Bad);
+            }
+            Act::SetMark(name)
+        }
+        "<C-o>" => Act::Jump { older: true },
+        "<Tab>" => Act::Jump { older: false },
+        "<C-a>" => Act::Add { subtract: false },
+        "<C-x>" => Act::Add { subtract: true },
         "v" => Act::Visual(Mode::Visual),
         "V" => Act::Visual(Mode::VisualLine),
         "<C-v>" => Act::Visual(Mode::VisualBlock),
@@ -290,6 +317,8 @@ fn visual_act(key: &str, k: &mut Keys) -> P<Act> {
         "C" | "S" | "R" => Act::VisualLinesOp(Op::Change),
         "J" => Act::Join { spaces: true },
         "r" => Act::ReplaceChar(char_arg(k.next()?, true)?),
+        "I" => Act::BlockInsert { append: false },
+        "A" => Act::BlockInsert { append: true },
         "p" => Act::Paste {
             before: false,
             after: false,
@@ -403,6 +432,16 @@ fn motion(key: &str, k: &mut Keys) -> P<Option<Motion>> {
         ";" => Motion::RepeatFind { reverse: false },
         "," => Motion::RepeatFind { reverse: true },
         "%" => Motion::Match,
+        "'" | "`" => {
+            let name = char_of(k.next()?).ok_or(Fail::Bad)?;
+            if !crate::marks::is_mark(name) {
+                return Err(Fail::Bad);
+            }
+            Motion::Mark {
+                name,
+                line: key == "'",
+            }
+        }
         "}" => Motion::ParagraphForward,
         "{" => Motion::ParagraphBack,
         "+" | "<CR>" => Motion::NextLine,

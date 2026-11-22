@@ -1,21 +1,31 @@
 //! A clean-room Vim engine, written from Vim's documented behaviour (`:help motion.txt`,
-//! `change.txt`, `visual.txt`, `repeat.txt`, `pattern.txt`, `undo.txt`, `scroll.txt`).
+//! `change.txt`, `visual.txt`, `repeat.txt`, `pattern.txt`, `undo.txt`, `scroll.txt`,
+//! `mark-motions`, `jump-motions`, `blockwise-operators`, `CTRL-A`).
 //!
-//! The engine owns modes, pending keys, registers, macros and dot-repeat; the text, the selection,
-//! undo history, scrolling and prompts belong to a [`VimHost`]. Every position is a char index
-//! into the host's rope.
+//! The engine owns modes, pending keys, registers, marks, the jump list, macros and dot-repeat;
+//! the text, the selection, undo history, scrolling and prompts belong to a [`VimHost`]. Every
+//! position is a char index into the host's rope.
+//!
+//! Marks and jump-list entries move with the text. The engine sees its own edits (and undo/redo);
+//! a host that changes the text itself (a paste from the UI, a reload from disk) reports it with
+//! [`Engine::adjust_marks`]. In Visual-block mode, [`Engine::visual_block`] gives the block to
+//! draw.
 //!
 //! Keys are Vim key names: a single character (`"a"`, `"$"`), or a name in angle brackets
 //! (`"<Esc>"`, `"<CR>"`, `"<C-r>"`). [`key_name`] builds them from a UI key event.
 
+mod block;
 mod engine;
 mod ex;
 mod insert;
 mod keys;
+mod marks;
 mod motion;
+mod number;
 mod operator;
 mod parse;
 mod registers;
+mod scroll;
 mod text;
 mod textobj;
 
@@ -24,6 +34,7 @@ mod tests;
 
 use std::ops::Range;
 
+pub use block::Block;
 pub use engine::{Engine, Mode, State};
 pub use keys::{KeyLike, key_name};
 pub use registers::{Register, Registers};
@@ -43,6 +54,8 @@ pub trait VimHost {
     /// selection); in Visual modes both ends are inclusive, as Vim draws them.
     fn selection(&self) -> (usize, usize);
     fn select(&mut self, anchor: usize, head: usize);
+    /// Replace `range` with `text`. (Edits the host makes on its own, outside this call, should
+    /// be reported with [`Engine::adjust_marks`].)
     fn replace(&mut self, range: Range<usize>, text: &str);
     /// Start one undo step; the host remembers the current head as the cursor to restore.
     fn begin_group(&mut self);

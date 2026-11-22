@@ -68,6 +68,11 @@ pub(crate) enum Motion {
         pattern: String,
         forward: bool,
     },
+    /// `'x` (`line`: its line's first non-blank) and `` `x `` (the exact position).
+    Mark {
+        name: char,
+        line: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +159,14 @@ impl Engine {
             }
             Motion::Find(f, c) => {
                 self.last_find = Some((*f, *c));
+            }
+            Motion::Mark { name, line } => {
+                let r = h.rope();
+                let p = self.mark(r, *name)?;
+                if *line {
+                    return Reach::new(first_non_blank(r, line_of(r, p)), Kind::Linewise);
+                }
+                return Reach::new(p, Kind::Exclusive);
             }
             _ => {}
         }
@@ -364,6 +377,7 @@ impl Engine {
             Motion::SearchNext { .. }
             | Motion::Search { .. }
             | Motion::Word { .. }
+            | Motion::Mark { .. }
             | Motion::RepeatFind { .. } => unreachable!("handled above"),
         }
     }

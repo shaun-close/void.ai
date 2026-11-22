@@ -270,6 +270,8 @@ impl Engine {
         match (name, args.trim()) {
             ("", "") => {
                 if let Some((_, l)) = range {
+                    let cur = h.selection().1;
+                    self.push_jump(h.rope(), cur);
                     let pos = first_non_blank(h.rope(), l);
                     self.set_cursor(h, pos);
                 }
@@ -383,7 +385,7 @@ impl Engine {
         let count = edits.len();
         self.begin(h);
         for (m, text) in edits.into_iter().rev() {
-            h.replace(m, &text);
+            self.edit(h, m, &text);
         }
         let r = h.rope();
         let at = (last_match.start as isize + shift).max(0) as usize;

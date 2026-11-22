@@ -1,17 +1,19 @@
 //! The engine: modes, pending keys, dispatch, dot-repeat (`:help repeat.txt`), macros, Visual
-//! mode (`:help visual.txt`) and scrolling (`:help scroll.txt`).
+//! mode (`:help visual.txt`).
 
 use std::collections::VecDeque;
 
+use crate::VimHost;
+use crate::block::{BlockInsert, BlockOp};
 use crate::insert::{InsKey, Session};
 use crate::keys::{canon, char_of, decode, encode};
+use crate::marks::{Marks, is_jump};
 use crate::motion::{Find, Motion, Want as ReachWant};
 use crate::operator::{Region, extent_region, motion_region, visual_extent, visual_region};
-use crate::parse::{Act, Cmd, Fail, Op, Scroll, Target, parse};
+use crate::parse::{Act, Cmd, Fail, Op, Target, parse};
 use crate::registers::{Register, Registers};
 use crate::text::*;
 use crate::textobj::object;
-use crate::{ScrollAt, VimHost};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -21,7 +23,7 @@ pub enum Mode {
     Replace,
     Visual,
     VisualLine,
-    /// Entered with `<C-v>`; block operators come with the visual-block work.
+    /// Entered with `<C-v>`; see [`Engine::visual_block`] for the block it selects.
     VisualBlock,
 }
 
@@ -89,7 +91,9 @@ pub struct Engine {
     prompt: Option<Prompt>,
     cmdline: Option<(Prompt, String)>,
     pub(crate) last_visual: Option<(Mode, usize, usize)>,
-    scroll_amount: Option<usize>,
+    pub(crate) scroll_amount: Option<usize>,
+    pub(crate) marks: Marks,
+    pub(crate) block_insert: Option<BlockInsert>,
 }
 
 impl Engine {
@@ -238,6 +242,10 @@ impl Engine {
     }
 
     fn normal_key(&mut self, h: &mut dyn VimHost, key: &str) -> bool {
+        // There are no windows to command: Ctrl+W is swallowed, so the app does not act on it.
+        if key == "<C-w>" && self.pending.is_empty() {
+            return true;
+        }
         if matches!(key, "<Esc>" | "<C-c>") {
             if !self.pending.is_empty() {
                 self.pending.clear();
@@ -297,7 +305,7 @@ impl Engine {
         }
     }
 
-    fn changed(&mut self, cmd: Cmd) {
+    pub(crate) fn changed(&mut self, cmd: Cmd) {
         if self.insert.is_none() {
             self.last_change = Some(Change {
                 cmd,
@@ -326,6 +334,11 @@ impl Engine {
             }
             Act::Insert(ins) => self.begin_insert(h, &cmd, Some(ins)),
             Act::Replace => self.begin_insert(h, &cmd, None),
+            Act::Paste { .. } if self.state.mode == Mode::VisualBlock => {
+                self.state.message = "Putting over a Visual block is not supported".into();
+                self.exit_visual(h);
+                false
+            }
             Act::Paste { before, .. } if visual => self.visual_put(h, &cmd, before),
             Act::Paste { before, after } => {
                 let ok = self.put(h, &cmd, before, after);
@@ -354,6 +367,9 @@ impl Engine {
                 }
                 ok
             }
+            Act::ReplaceChar(c) if self.state.mode == Mode::VisualBlock => {
+                self.block_op(h, &cmd, BlockOp::Replace(c), false)
+            }
             Act::ReplaceChar(c) if visual => self.visual_replace(h, c),
             Act::ReplaceChar(c) => {
                 let ok = self.replace_chars(h, c, n);
@@ -370,12 +386,8 @@ impl Engine {
                 ok
             }
             Act::Repeat => self.dot(h, cmd.count),
-            Act::Undo => {
-                (0..n).for_each(|_| h.undo());
-                true
-            }
-            Act::Redo => {
-                (0..n).for_each(|_| h.redo());
+            Act::Undo | Act::Redo => {
+                self.history(h, n, cmd.act == Act::Redo);
                 true
             }
             Act::Visual(mode) => {
@@ -470,6 +482,31 @@ impl Engine {
                 }
                 ok
             }
+            Act::SetMark(name) => {
+                self.set_mark(h, name);
+                true
+            }
+            Act::Jump { older } => self.jump(h, n, older),
+            Act::Add { subtract } => {
+                let ok = self.add(h, if subtract { -(n as i64) } else { n as i64 });
+                if ok {
+                    self.changed(cmd.clone());
+                }
+                ok
+            }
+            Act::BlockInsert { append } if self.state.mode == Mode::VisualBlock => {
+                let op = if append {
+                    BlockOp::Append
+                } else {
+                    BlockOp::Insert
+                };
+                self.block_op(h, &cmd, op, false)
+            }
+            Act::BlockInsert { .. } => {
+                self.exit_visual(h);
+                false
+            }
+            Act::BlockRepeat(op, size) => self.block_repeat(h, &cmd, op, size),
         };
         if !ok {
             self.failed = true;
@@ -481,6 +518,9 @@ impl Engine {
         let Some(reach) = self.reach(h, m, count, false) else {
             return false;
         };
+        if is_jump(m) {
+            self.push_jump(h.rope(), cur);
+        }
         let r = h.rope();
         let pos = if self.state.mode.is_visual() {
             reach.pos.min(r.len_chars())
@@ -568,8 +608,9 @@ impl Engine {
     }
 
     fn visual_op(&mut self, h: &mut dyn VimHost, cmd: &Cmd, op: Op, lines: bool) -> bool {
-        if self.state.mode == Mode::VisualBlock {
-            return self.block_op(h, cmd, op);
+        // In a block, `D` and `C` run to the end of each line; `Y` yanks whole lines.
+        if self.state.mode == Mode::VisualBlock && !(lines && op == Op::Yank) {
+            return self.block_op(h, cmd, BlockOp::Op(op), lines);
         }
         let (anchor, head) = h.selection();
         let mode = if lines {
@@ -594,14 +635,6 @@ impl Engine {
             self.changed(repeat);
         }
         ok
-    }
-
-    /// Visual-block operators: not built yet, so they do nothing rather than act on the wrong
-    /// text.
-    fn block_op(&mut self, h: &mut dyn VimHost, _cmd: &Cmd, _op: Op) -> bool {
-        self.state.message = "Visual-block operators are not supported yet".into();
-        self.exit_visual(h);
-        false
     }
 
     /// `.`: run the last change again, with `count` replacing its count, as one undo step.
@@ -701,98 +734,5 @@ impl Engine {
                 self.exec(h, cmd);
             }
         }
-    }
-
-    fn scroll(&mut self, h: &mut dyn VimHost, s: Scroll, count: Option<usize>) -> bool {
-        let r = h.rope();
-        let last = last_line(r);
-        let cur = h.selection().1;
-        let line = line_of(r, cur);
-        let (top, bottom) = h.visible_lines();
-        let top = top.min(last);
-        let height = bottom.saturating_sub(top) + 1;
-        let n = count.unwrap_or(1);
-        let page = n * height.saturating_sub(2).max(1);
-        let (view, at, cursor_line, first_col) = match s {
-            Scroll::Top
-            | Scroll::Center
-            | Scroll::Bottom
-            | Scroll::TopFirst
-            | Scroll::CenterFirst
-            | Scroll::BottomFirst => {
-                let l = count.map_or(line, |c| (c.max(1) - 1).min(last));
-                let at = match s {
-                    Scroll::Top | Scroll::TopFirst => ScrollAt::Top,
-                    Scroll::Center | Scroll::CenterFirst => ScrollAt::Center,
-                    _ => ScrollAt::Bottom,
-                };
-                let first = matches!(
-                    s,
-                    Scroll::TopFirst | Scroll::CenterFirst | Scroll::BottomFirst
-                );
-                (l, at, Some(l), first)
-            }
-            Scroll::HalfDown | Scroll::HalfUp => {
-                if count.is_some() {
-                    self.scroll_amount = count;
-                }
-                let amount = self.scroll_amount.unwrap_or((height / 2).max(1));
-                if s == Scroll::HalfDown {
-                    if line == last {
-                        return false;
-                    }
-                    let view = (top + amount).min(last);
-                    (view, ScrollAt::Top, Some((line + amount).min(last)), true)
-                } else {
-                    if line == 0 {
-                        return false;
-                    }
-                    let view = top.saturating_sub(amount);
-                    (view, ScrollAt::Top, Some(line.saturating_sub(amount)), true)
-                }
-            }
-            Scroll::PageDown | Scroll::LineDown => {
-                if top >= last {
-                    return false;
-                }
-                let step = if s == Scroll::PageDown { page } else { n };
-                let view = (top + step).min(last);
-                (
-                    view,
-                    ScrollAt::Top,
-                    (line < view).then_some(view),
-                    s == Scroll::PageDown,
-                )
-            }
-            Scroll::PageUp | Scroll::LineUp => {
-                if top == 0 {
-                    return false;
-                }
-                let step = if s == Scroll::PageUp { page } else { n };
-                let view = top.saturating_sub(step);
-                let view_bottom = view + height - 1;
-                (
-                    view,
-                    ScrollAt::Top,
-                    (line > view_bottom).then_some(view_bottom),
-                    s == Scroll::PageUp,
-                )
-            }
-        };
-        h.scroll_to(view, at);
-        if let Some(l) = cursor_line {
-            let r = h.rope();
-            let pos = if first_col {
-                first_non_blank(r, l)
-            } else if l == line {
-                cur
-            } else {
-                (line_start(r, l) + col(r, cur)).min(line_last(r, l))
-            };
-            if pos != cur {
-                self.set_cursor(h, pos);
-            }
-        }
-        true
     }
 }

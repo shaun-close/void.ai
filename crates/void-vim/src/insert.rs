@@ -73,7 +73,7 @@ impl Engine {
             Some(Ins::Above) => {
                 let indent = indent(r, line);
                 let start = line_start(r, line);
-                h.replace(start..start, &format!("{indent}\n"));
+                self.edit(h, start..start, &format!("{indent}\n"));
                 start + indent.chars().count()
             }
         };
@@ -92,7 +92,7 @@ impl Engine {
         let r = h.rope();
         let end = line_end(r, line_of(r, h.selection().1));
         h.select(end, end);
-        h.newline();
+        self.host_insert(h, |h| h.newline());
     }
 
     /// A key in Insert or Replace mode. Returns whether it was used.
@@ -119,15 +119,15 @@ impl Engine {
                 record(s);
                 if replace {
                     s.replaced.push(None);
-                    h.replace(cur..cur, "\n");
+                    self.edit(h, cur..cur, "\n");
                     self.set_cursor(h, cur + 1);
                 } else {
-                    h.newline();
+                    self.host_insert(h, |h| h.newline());
                 }
             }
             "<Tab>" => {
                 record(s);
-                h.tab();
+                self.host_insert(h, |h| h.tab());
             }
             "<BS>" => {
                 record(s);
@@ -136,7 +136,7 @@ impl Engine {
             "<Del>" => {
                 record(s);
                 if cur < h.rope().len_chars() {
-                    h.replace(cur..cur + 1, "");
+                    self.edit(h, cur..cur + 1, "");
                 }
             }
             "<C-w>" | "<C-u>" => {
@@ -162,7 +162,7 @@ impl Engine {
                     }
                     p
                 };
-                h.replace(from..cur, "");
+                self.edit(h, from..cur, "");
                 self.set_cursor(h, from);
             }
             "<Left>" | "<Right>" | "<Up>" | "<Down>" | "<Home>" | "<End>" => {
@@ -182,7 +182,9 @@ impl Engine {
                     _ => cur,
                 };
                 if pos != cur {
-                    // Moving the cursor starts a new undo step and a new insert to repeat.
+                    // Moving the cursor starts a new undo step and a new insert to repeat, and
+                    // ends a block insert without copying it.
+                    self.block_insert = None;
                     self.end(h);
                     self.set_cursor(h, pos);
                     self.begin(h);
@@ -225,7 +227,7 @@ impl Engine {
             }
         } else {
             let cur = h.selection().1;
-            h.replace(cur..cur, text);
+            self.edit(h, cur..cur, text);
             self.set_cursor(h, cur + text.chars().count());
         }
     }
@@ -241,9 +243,9 @@ impl Engine {
                 s.replaced.push(over);
             }
             let end = if over.is_some() { cur + 1 } else { cur };
-            h.replace(cur..end, text);
+            self.edit(h, cur..end, text);
         } else {
-            h.replace(cur..cur, text);
+            self.edit(h, cur..cur, text);
         }
         self.set_cursor(h, cur + 1);
     }
@@ -255,14 +257,14 @@ impl Engine {
         }
         if self.state.mode == Mode::Replace {
             match self.insert.as_mut().and_then(|s| s.replaced.pop()) {
-                Some(Some(old)) => h.replace(cur - 1..cur, &old.to_string()),
-                Some(None) => h.replace(cur - 1..cur, ""),
+                Some(Some(old)) => self.edit(h, cur - 1..cur, &old.to_string()),
+                Some(None) => self.edit(h, cur - 1..cur, ""),
                 // Before where Replace mode started: only move.
                 None if cur == line_start(h.rope(), line_of(h.rope(), cur)) => return,
                 None => {}
             }
         } else {
-            h.replace(cur - 1..cur, "");
+            self.edit(h, cur - 1..cur, "");
         }
         self.set_cursor(h, cur - 1);
     }
@@ -327,10 +329,10 @@ impl Engine {
         self.state.mode = Mode::Normal;
         let r = h.rope();
         let cur = h.selection().1;
-        let pos = if cur > line_start(r, line_of(r, cur)) {
-            cur - 1
-        } else {
-            cur
+        let pos = match self.block_insert.take() {
+            Some(b) if repeat => self.finish_block_insert(h, b, cur),
+            _ if cur > line_start(r, line_of(r, cur)) => cur - 1,
+            _ => cur,
         };
         self.set_cursor(h, pos);
         self.end(h);

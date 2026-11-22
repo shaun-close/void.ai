@@ -114,6 +114,48 @@ fn region_text(r: &Rope, region: &Region) -> (Range<usize>, Register) {
     }
 }
 
+/// `text` with its case changed the way `op` (`~`, `u`, `U`) changes it.
+pub(crate) fn recase(text: impl Iterator<Item = char>, op: Op) -> String {
+    let mut out = String::new();
+    for c in text {
+        let upper = match op {
+            Op::Upper => true,
+            Op::Lower => false,
+            _ => c.is_lowercase(),
+        };
+        if upper {
+            out.extend(c.to_uppercase());
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// How many of the blanks at the start of `chars` a left shift by `times` levels of `unit`
+/// removes: a tab is one level, otherwise up to a unit's width of spaces.
+pub(crate) fn outdent_len(chars: impl Iterator<Item = char>, unit: &str, times: usize) -> usize {
+    let width = if unit == "\t" {
+        4
+    } else {
+        unit.chars().count().max(1)
+    };
+    let mut chars = chars.peekable();
+    let mut remove = 0;
+    for _ in 0..times {
+        if chars.next_if_eq(&'\t').is_some() {
+            remove += 1;
+            continue;
+        }
+        let mut n = 0;
+        while n < width && chars.next_if_eq(&' ').is_some() {
+            n += 1;
+        }
+        remove += n;
+    }
+    remove
+}
+
 impl Engine {
     pub(crate) fn store(
         &mut self,
@@ -189,7 +231,7 @@ impl Engine {
                         self.set_cursor(h, pos);
                     }
                     Region::Chars(range) => {
-                        h.replace(range.clone(), "");
+                        self.edit(h, range.clone(), "");
                         self.set_cursor(h, range.start);
                     }
                 }
@@ -204,7 +246,7 @@ impl Engine {
                 };
                 self.store(h, cmd.reg, reg, Write::Delete);
                 self.begin(h);
-                h.replace(range.clone(), &text);
+                self.edit(h, range.clone(), &text);
                 let pos = range.start + text.chars().count();
                 self.set_cursor(h, pos);
                 self.start_insert(Mode::Insert, Some(cmd.clone()), 1, false);
@@ -227,25 +269,12 @@ impl Engine {
                     Region::Lines(l1, l2) => line_start(r, l1)..line_end(r, l2),
                     Region::Chars(c) => c,
                 };
-                let old = r.slice(range.clone()).to_string();
-                let new: String = old
-                    .chars()
-                    .flat_map(|c| -> Box<dyn Iterator<Item = char>> {
-                        let upper = match op {
-                            Op::Upper => true,
-                            Op::Lower => false,
-                            _ => c.is_lowercase(),
-                        };
-                        if upper {
-                            Box::new(c.to_uppercase())
-                        } else {
-                            Box::new(c.to_lowercase())
-                        }
-                    })
-                    .collect();
+                let old = r.slice(range.clone());
+                let new = recase(old.chars(), op);
+                let same = old == new.as_str();
                 self.begin(h);
-                if new != old {
-                    h.replace(range.clone(), &new);
+                if !same {
+                    self.edit(h, range.clone(), &new);
                 }
                 self.set_cursor(h, range.start);
                 self.end(h);
@@ -264,42 +293,23 @@ impl Engine {
         } else {
             0..r.len_chars()
         };
-        h.replace(range, "");
+        self.edit(h, range, "");
     }
 
     fn shift(&mut self, h: &mut dyn VimHost, l1: usize, l2: usize, right: bool, times: usize) {
         let unit = h.indent_unit().to_string();
-        let width = if unit == "\t" {
-            4
-        } else {
-            unit.chars().count().max(1)
-        };
         for l in l1..=l2 {
             let r = h.rope();
             let start = line_start(r, l);
             if right {
                 if line_len(r, l) > 0 {
-                    h.replace(start..start, &unit.repeat(times));
+                    self.edit(h, start..start, &unit.repeat(times));
                 }
                 continue;
             }
-            let mut chars = r.line(l).chars().peekable();
-            let mut remove = 0;
-            for _ in 0..times {
-                if chars.peek() == Some(&'\t') {
-                    chars.next();
-                    remove += 1;
-                    continue;
-                }
-                let mut n = 0;
-                while n < width && chars.peek() == Some(&' ') {
-                    chars.next();
-                    n += 1;
-                }
-                remove += n;
-            }
+            let remove = outdent_len(r.chars_at(start), &unit, times);
             if remove > 0 {
-                h.replace(start..start + remove, "");
+                self.edit(h, start..start + remove, "");
             }
         }
     }
@@ -330,10 +340,10 @@ impl Engine {
             let first = if before { line } else { line + 1 };
             if before || line < last_line(r) {
                 let at = line_start(r, first);
-                h.replace(at..at, &text);
+                self.edit(h, at..at, &text);
             } else {
                 let at = r.len_chars();
-                h.replace(at..at, &format!("\n{}", &text[..text.len() - 1]));
+                self.edit(h, at..at, &format!("\n{}", &text[..text.len() - 1]));
             }
             let r = h.rope();
             if after {
@@ -348,7 +358,7 @@ impl Engine {
             } else {
                 cur + 1
             };
-            h.replace(at..at, &text);
+            self.edit(h, at..at, &text);
             let len = text.chars().count();
             if after {
                 at + len
@@ -388,12 +398,12 @@ impl Engine {
                 self.delete_lines(h, l1, l2);
                 let len = h.rope().len_chars();
                 if at_end && l1 > 0 {
-                    h.replace(len..len, &format!("\n{}", &text[..text.len() - 1]));
+                    self.edit(h, len..len, &format!("\n{}", &text[..text.len() - 1]));
                 } else if at_end {
-                    h.replace(0..len, &text[..text.len() - 1]);
+                    self.edit(h, 0..len, &text[..text.len() - 1]);
                 } else {
                     let at = line_start(h.rope(), l1);
-                    h.replace(at..at, &text);
+                    self.edit(h, at..at, &text);
                 }
                 first_non_blank(h.rope(), l1)
             }
@@ -403,7 +413,7 @@ impl Engine {
                 } else {
                     reg.text.repeat(n)
                 };
-                h.replace(range.clone(), &text);
+                self.edit(h, range.clone(), &text);
                 if reg.linewise {
                     range.start + 1
                 } else {
@@ -448,7 +458,7 @@ impl Engine {
             } else {
                 (next, "")
             };
-            h.replace(end..to, insert);
+            self.edit(h, end..to, insert);
             pos = end;
         }
         self.set_cursor(h, pos);
@@ -465,10 +475,10 @@ impl Engine {
         }
         self.begin(h);
         let pos = if c == '\n' {
-            h.replace(cur..cur + n, "\n");
+            self.edit(h, cur..cur + n, "\n");
             cur + 1
         } else {
-            h.replace(cur..cur + n, &c.to_string().repeat(n));
+            self.edit(h, cur..cur + n, &c.to_string().repeat(n));
             cur + n - 1
         };
         self.set_cursor(h, pos);
@@ -491,7 +501,7 @@ impl Engine {
             .collect();
         self.exit_visual(h);
         self.begin(h);
-        h.replace(range.clone(), &new);
+        self.edit(h, range.clone(), &new);
         self.set_cursor(h, range.start);
         self.end(h);
         true
@@ -505,19 +515,9 @@ impl Engine {
         if end == cur {
             return false;
         }
-        let new: String = r
-            .slice(cur..end)
-            .chars()
-            .flat_map(|c| -> Box<dyn Iterator<Item = char>> {
-                if c.is_lowercase() {
-                    Box::new(c.to_uppercase())
-                } else {
-                    Box::new(c.to_lowercase())
-                }
-            })
-            .collect();
+        let new = recase(r.slice(cur..end).chars(), Op::Toggle);
         self.begin(h);
-        h.replace(cur..end, &new);
+        self.edit(h, cur..end, &new);
         let pos = cur + new.chars().count();
         self.set_cursor(h, pos);
         self.end(h);

@@ -7,6 +7,8 @@ use void_editor::Buffer;
 
 use crate::{Engine, KeyLike, Mode, ScrollAt, VimHost, key_name};
 
+mod extensions;
+
 struct Host {
     buf: Buffer,
     sel: (usize, usize),
@@ -1175,12 +1177,12 @@ fn vim_visual_change_put_and_repeat() {
     feed(&mut e, &mut h, "vr-");
     assert_eq!(h.text(), "aa-");
 
-    // Visual-block is a mode now; its operators come later and must not edit anything.
+    // Visual-block operators act on the block (more in tests/extensions.rs).
     let (mut e, mut h) = vim("abc\ndef");
     feed(&mut e, &mut h, "<C-v>jl");
     assert_eq!(e.state().mode, Mode::VisualBlock);
     feed(&mut e, &mut h, "d");
-    assert_eq!(h.text(), "abc\ndef");
+    assert_eq!(h.text(), "c\nf");
     assert_eq!(e.state().mode, Mode::Normal);
 }
 
