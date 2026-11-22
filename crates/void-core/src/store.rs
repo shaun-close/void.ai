@@ -173,6 +173,20 @@ impl Store {
         }
     }
 
+    pub fn permissions_path(&self, ws: &WorkspaceId) -> PathBuf {
+        self.workspace_dir(ws).join("permissions.json")
+    }
+
+    /// Where a conversation's overlay lives.
+    pub fn overlay_dir(&self, ws: &WorkspaceId, id: &ConversationId) -> PathBuf {
+        self.workspace_dir(ws).join("overlays").join(id.to_string())
+    }
+
+    /// The workspace's read-write CARGO_TARGET_DIR for sandboxed builds.
+    pub fn sandbox_target(&self, ws: &WorkspaceId) -> PathBuf {
+        self.workspace_dir(ws).join("sandbox-target")
+    }
+
     pub fn load_layout(&self, ws: &WorkspaceId) -> Option<String> {
         std::fs::read_to_string(self.workspace_dir(ws).join("layout.ron")).ok()
     }

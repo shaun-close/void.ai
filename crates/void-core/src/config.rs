@@ -147,6 +147,10 @@ pub struct Config {
     pub theme: Theme,
     pub font_size: f32,
     pub profiles: Vec<Profile>,
+    /// Agent profiles (build, plan, …).
+    pub agents: Vec<crate::agent::AgentProfile>,
+    pub default_agent: String,
+    pub sandbox: crate::sandbox::SandboxSettings,
 }
 
 const STRATA_MODEL: &str = "qwen3.8-flash-next-iq3_xxs";
@@ -212,6 +216,9 @@ impl Default for Config {
                     "default",
                 ),
             ],
+            agents: crate::agent::default_agents(),
+            default_agent: "build".into(),
+            sandbox: crate::sandbox::SandboxSettings::default(),
         }
     }
 }
@@ -219,6 +226,13 @@ impl Default for Config {
 impl Config {
     pub fn profile(&self, id: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.id == id)
+    }
+
+    /// The agent with this id, else the default agent, else the first one.
+    pub fn agent(&self, id: Option<&str>) -> Option<&crate::agent::AgentProfile> {
+        id.and_then(|i| self.agents.iter().find(|a| a.id == i))
+            .or_else(|| self.agents.iter().find(|a| a.id == self.default_agent))
+            .or_else(|| self.agents.first())
     }
 }
 
