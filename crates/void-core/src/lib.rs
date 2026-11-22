@@ -1,5 +1,9 @@
 //! void.ai core: the UI-agnostic harness (backends, conversations, context, storage, engine).
 
+pub mod config;
+pub mod fsutil;
+pub mod model;
+
 /// The crate version.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
