@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 pub mod fsutil;
 pub mod model;
+pub mod store;
 
 /// The crate version.
 pub fn version() -> &'static str {
