@@ -23,6 +23,8 @@ pub struct Status {
 #[derive(Debug)]
 pub struct UiState {
     pub config: Config,
+    /// The config as last loaded or saved (Settings compares against it).
+    pub saved_config: Config,
     pub workspace: Workspace,
     pub recent: Vec<WorkspaceEntry>,
     pub conversations: Vec<ConversationMeta>,
@@ -41,6 +43,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             config: Config::default(),
+            saved_config: Config::default(),
             workspace: Workspace::scratch(),
             recent: Vec::new(),
             conversations: Vec::new(),
@@ -59,6 +62,7 @@ impl UiState {
     pub fn apply(&mut self, ev: Event) {
         match ev {
             Event::ConfigLoaded { config, warning } => {
+                self.saved_config = config.clone();
                 self.config = config;
                 if let Some(w) = warning {
                     self.error(w);

@@ -7,11 +7,21 @@ use egui::{Id, Ui, WidgetText};
 use void_core::engine::EngineHandle;
 use void_core::model::ConversationId;
 
+pub mod backends;
 pub mod chat;
 pub mod conversations;
+pub mod settings;
+
+use void_core::engine::Command;
 
 use crate::layout::Tab;
 use crate::state::UiState;
+
+/// Persist the UI's config and remember it as the saved version.
+pub fn save_config(state: &mut UiState, engine: &EngineHandle) {
+    state.saved_config = state.config.clone();
+    engine.send(Command::SaveConfig(state.config.clone()));
+}
 
 /// Dock changes a panel asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +40,7 @@ pub struct Panels<'a> {
     pub inputs: &'a mut HashMap<u32, String>,
     pub actions: &'a mut Vec<Action>,
     pub list: &'a mut conversations::ListUi,
+    pub backends: &'a mut backends::BackendsUi,
     /// The conversation in the focused Chat tab (highlighted in the list).
     pub focused: Option<ConversationId>,
 }
@@ -72,9 +83,8 @@ impl egui_dock::TabViewer for Panels<'_> {
         match tab {
             Tab::Chat { id, conversation } => chat::show(ui, self, *id, *conversation),
             Tab::Conversations => conversations::show(ui, self),
-            other => {
-                ui.label(format!("{} — coming next", other.kind()));
-            }
+            Tab::Backends => backends::show(ui, self),
+            Tab::Settings => settings::show(ui, self),
         }
     }
 }

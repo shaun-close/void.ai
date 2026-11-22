@@ -30,6 +30,7 @@ pub struct VoidApp {
     applied_style: Option<(Theme, u32)>,
     title: String,
     list: crate::panels::conversations::ListUi,
+    backends: crate::panels::backends::BackendsUi,
     /// A first message waiting for the conversation it asked the engine to create.
     pending_start: Option<(u32, String)>,
 }
@@ -61,6 +62,7 @@ impl VoidApp {
             applied_style: None,
             title: String::new(),
             list: Default::default(),
+            backends: Default::default(),
             pending_start: None,
         }
     }
@@ -215,7 +217,7 @@ impl VoidApp {
             Theme::Dark => egui::Visuals::dark(),
             Theme::Light => egui::Visuals::light(),
         });
-        let size = self.state.config.font_size.clamp(10.0, 24.0);
+        let size = crate::panels::settings::clamp_font(self.state.config.font_size);
         ctx.global_style_mut(|style| {
             use egui::{FontFamily, FontId, TextStyle};
             style.text_styles = [
@@ -325,8 +327,7 @@ impl VoidApp {
                 }
                 if active != self.state.config.active_profile {
                     self.state.config.active_profile = active;
-                    self.engine
-                        .send(Command::SaveConfig(self.state.config.clone()));
+                    crate::panels::save_config(&mut self.state, &self.engine);
                 }
             });
         });
@@ -409,6 +410,7 @@ impl eframe::App for VoidApp {
             inputs: &mut self.inputs,
             actions: &mut actions,
             list: &mut self.list,
+            backends: &mut self.backends,
             focused,
         };
         DockArea::new(&mut self.dock)
