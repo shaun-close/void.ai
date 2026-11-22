@@ -2,6 +2,8 @@
 
 pub mod backend;
 pub mod config;
+pub mod context;
+pub mod engine;
 pub mod fsutil;
 pub mod model;
 pub mod store;
