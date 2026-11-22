@@ -37,7 +37,7 @@ use std::ops::Range;
 pub use block::Block;
 pub use engine::{Engine, Mode, State};
 pub use keys::{KeyLike, key_name};
-pub use registers::{Register, Registers};
+pub use registers::{RegKind, Register, Registers};
 
 /// Where [`VimHost::scroll_to`] puts the line in the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

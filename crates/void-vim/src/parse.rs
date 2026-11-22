@@ -317,6 +317,10 @@ fn visual_act(key: &str, k: &mut Keys) -> P<Act> {
         "C" | "S" | "R" => Act::VisualLinesOp(Op::Change),
         "J" => Act::Join { spaces: true },
         "r" => Act::ReplaceChar(char_arg(k.next()?, true)?),
+        "<C-a>" => Act::Add { subtract: false },
+        "<C-x>" => Act::Add { subtract: true },
+        "<C-o>" => Act::Jump { older: true },
+        "<Tab>" => Act::Jump { older: false },
         "I" => Act::BlockInsert { append: false },
         "A" => Act::BlockInsert { append: true },
         "p" => Act::Paste {

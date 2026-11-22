@@ -8,7 +8,7 @@ use void_editor::{CaseMode, Query, captures_in, find_next, find_prev, validate};
 
 use crate::VimHost;
 use crate::engine::Engine;
-use crate::registers::Register;
+use crate::registers::{RegKind, Register};
 use crate::text::*;
 
 /// A Vim search pattern as a query for `void_editor`'s search.
@@ -180,7 +180,7 @@ impl Engine {
             '/',
             Register {
                 text: pattern.to_string(),
-                linewise: false,
+                kind: RegKind::Char,
             },
         );
     }

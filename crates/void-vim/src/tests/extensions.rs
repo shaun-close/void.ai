@@ -328,3 +328,134 @@ fn ctrl_keys_escape_cancel_and_ignore() {
     assert_eq!(h.text(), "yxabc\ndef");
     assert_eq!(e.state().mode, Mode::Normal);
 }
+
+#[test]
+fn marks_restored_by_undo_after_substitute() {
+    let text: Vec<String> = (0..20).map(|i| format!("foo {i}")).collect();
+    let (mut e, mut h) = vim(&text.join("\n"));
+    h.set_cursor(10, 4);
+    feed(&mut e, &mut h, "ma:");
+    answer(&mut e, &mut h, &format!("%s/foo/f{}/", "o".repeat(19)));
+    feed(&mut e, &mut h, "gg`a");
+    assert_eq!(h.cursor(), (10, 21));
+    feed(&mut e, &mut h, "ugg`a");
+    assert_eq!(h.cursor(), (10, 4), "undo puts the mark back");
+    feed(&mut e, &mut h, "<C-r>gg`a");
+    assert_eq!(h.cursor(), (10, 21), "redo moves it again");
+    feed(&mut e, &mut h, "ugg'a");
+    assert_eq!(h.cursor(), (10, 0));
+}
+
+#[test]
+fn marks_restored_by_undo_after_block_insert() {
+    let (mut e, mut h) = vim("abcdef\nabcdef\nabcdef");
+    h.set_cursor(1, 3);
+    feed(&mut e, &mut h, "magg0<C-v>jjIxxxx<Esc>`a");
+    assert_eq!(h.cursor(), (1, 7));
+    feed(&mut e, &mut h, "u`a");
+    assert_eq!(h.cursor(), (1, 3));
+    feed(&mut e, &mut h, "<C-r>`a");
+    assert_eq!(h.cursor(), (1, 7));
+}
+
+#[test]
+fn deleted_line_mark_restored_by_undo() {
+    let (mut e, mut h) = vim("a\nb\nc");
+    feed(&mut e, &mut h, "jmadd'a");
+    assert!(e.state().message.contains("E20"));
+    feed(&mut e, &mut h, "ugg'a");
+    assert_eq!(
+        h.cursor(),
+        (1, 0),
+        "undo brings the mark back with its line"
+    );
+    feed(&mut e, &mut h, "<C-r>gg'a");
+    assert!(e.state().message.contains("E20"), "redo deletes it again");
+
+    // A mark set after the change follows the text through the undo.
+    let (mut e, mut h) = vim("a\nb\nc\nd");
+    feed(&mut e, &mut h, "jddjmbu'b");
+    assert_eq!(h.text(), "a\nb\nc\nd");
+    assert_eq!(h.cursor(), (3, 0));
+    // Undo of an edit the engine did not record (made by the host) still moves marks.
+    h.buf.begin_group(0);
+    h.buf.replace(0..0, "zz\n");
+    h.buf.end_group(0);
+    e.adjust_marks(0, 0, 3);
+    feed(&mut e, &mut h, "u'b");
+    assert_eq!(h.text(), "a\nb\nc\nd");
+    assert_eq!(h.cursor(), (3, 0));
+}
+
+#[test]
+fn block_yank_put_keeps_shape() {
+    let (mut e, mut h) = vim("abcd\nefgh\nijkl");
+    feed(&mut e, &mut h, "<C-v>jly$p");
+    assert_eq!(h.text(), "abcdab\nefghef\nijkl");
+    assert_eq!(h.cursor(), (0, 4));
+
+    // Short block lines are padded when text follows; lines are added at the end.
+    let (mut e, mut h) = vim("12\n3\nabcd\na");
+    feed(&mut e, &mut h, "j<C-v>kly2jP");
+    assert_eq!(h.text(), "12\n3\n12abcd\n3 a");
+    feed(&mut e, &mut h, "u3jp");
+    assert_eq!(h.text(), "12\n3\nabcd\na12\n 3");
+
+    // A count repeats the block sideways.
+    let (mut e, mut h) = vim("ab\ncd");
+    feed(&mut e, &mut h, "<C-v>jy2p");
+    assert_eq!(h.text(), "aaab\ncccd");
+    assert_eq!(reg(&e, '"').map(|r| r.0), Some("a\nc".into()));
+}
+
+#[test]
+fn block_delete_then_put_moves_column() {
+    let (mut e, mut h) = vim("abc\nabc\nabc");
+    feed(&mut e, &mut h, "<C-v>jjdp");
+    assert_eq!(h.text(), "bac\nbac\nbac");
+    feed(&mut e, &mut h, "u");
+    assert_eq!(h.text(), "bc\nbc\nbc", "the put is one undo step");
+    // Putting over a Visual block is still refused, leaving the text alone.
+    feed(&mut e, &mut h, "<C-v>jp");
+    assert_eq!(h.text(), "bc\nbc\nbc");
+    assert_eq!(e.state().mode, Mode::Normal);
+}
+
+#[test]
+fn block_r_cr_does_not_corrupt() {
+    let (mut e, mut h) = vim("abcd\nefgh\nijkl");
+    feed(&mut e, &mut h, "<C-v>jjr<CR>");
+    assert_eq!(h.text(), "abcd\nefgh\nijkl");
+    assert_eq!(e.state().mode, Mode::Normal);
+}
+
+#[test]
+fn visual_ctrl_keys_consumed() {
+    let (mut e, mut h) = vim("1\nx 2\n3 4");
+    feed(&mut e, &mut h, "Vjj<C-a>");
+    assert_eq!(h.text(), "2\nx 3\n4 4", "the first number of each line");
+    assert_eq!(e.state().mode, Mode::Normal);
+    feed(&mut e, &mut h, "u");
+    assert_eq!(h.text(), "1\nx 2\n3 4", "one undo step");
+
+    let (mut e, mut h) = vim("a 5 b 6");
+    h.set_cursor(0, 3);
+    feed(&mut e, &mut h, "v$3<C-a>");
+    assert_eq!(h.text(), "a 5 b 9", "only numbers inside the selection");
+    assert_eq!(h.cursor(), (0, 3));
+
+    let (mut e, mut h) = vim("10 10\n20 20");
+    h.set_cursor(0, 3);
+    feed(&mut e, &mut h, "<C-v>jl<C-x>");
+    assert_eq!(h.text(), "10 9\n20 19");
+
+    let (mut e, mut h) = vim("a\nb\nc");
+    feed(&mut e, &mut h, "Gggv");
+    for k in ["<C-o>", "<C-i>", "<Tab>", "<C-a>", "<C-x>"] {
+        assert!(e.key(&mut h, k), "{k} is consumed in Visual mode");
+        if e.state().mode == Mode::Normal {
+            feed(&mut e, &mut h, "v");
+        }
+    }
+    assert_eq!(h.text(), "a\nb\nc");
+}

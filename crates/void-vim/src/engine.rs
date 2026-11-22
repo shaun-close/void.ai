@@ -11,7 +11,7 @@ use crate::marks::{Marks, is_jump};
 use crate::motion::{Find, Motion, Want as ReachWant};
 use crate::operator::{Region, extent_region, motion_region, visual_extent, visual_region};
 use crate::parse::{Act, Cmd, Fail, Op, Target, parse};
-use crate::registers::{Register, Registers};
+use crate::registers::{RegKind, Register, Registers};
 use crate::text::*;
 use crate::textobj::object;
 
@@ -284,6 +284,7 @@ impl Engine {
     pub(crate) fn begin(&mut self, h: &mut dyn VimHost) {
         if self.group_depth == 0 {
             h.begin_group();
+            self.open_step(h);
         }
         self.group_depth += 1;
     }
@@ -292,6 +293,7 @@ impl Engine {
         self.group_depth = self.group_depth.saturating_sub(1);
         if self.group_depth == 0 {
             h.end_group();
+            self.close_step(h);
         }
     }
 
@@ -436,7 +438,7 @@ impl Engine {
                 if let Some(r) = self.state.recording.take() {
                     let reg = Register {
                         text,
-                        linewise: false,
+                        kind: RegKind::Char,
                     };
                     if r.is_ascii_uppercase() {
                         let mut old = self.registers.get(r).cloned().unwrap_or_default();
@@ -487,6 +489,9 @@ impl Engine {
                 true
             }
             Act::Jump { older } => self.jump(h, n, older),
+            Act::Add { subtract } if visual => {
+                self.visual_add(h, if subtract { -(n as i64) } else { n as i64 })
+            }
             Act::Add { subtract } => {
                 let ok = self.add(h, if subtract { -(n as i64) } else { n as i64 });
                 if ok {
@@ -708,7 +713,7 @@ impl Engine {
                     ':',
                     Register {
                         text: text.clone(),
-                        linewise: false,
+                        kind: RegKind::Char,
                     },
                 );
                 self.ex(h, &text, lines);

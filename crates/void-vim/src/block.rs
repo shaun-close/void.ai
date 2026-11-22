@@ -10,7 +10,7 @@ use ropey::Rope;
 use crate::engine::{Curswant, Engine};
 use crate::operator::{outdent_len, recase};
 use crate::parse::{Act, Cmd, Op};
-use crate::registers::{Register, Write};
+use crate::registers::{RegKind, Register, Write};
 use crate::text::*;
 use crate::{Mode, VimHost};
 
@@ -62,7 +62,7 @@ pub(crate) struct BlockInsert {
 
 impl Block {
     /// The chars of `line` inside the block (empty when the line ends before it).
-    fn span(&self, r: &Rope, line: usize) -> Range<usize> {
+    pub(crate) fn span(&self, r: &Rope, line: usize) -> Range<usize> {
         let start = line_start(r, line);
         let len = line_len(r, line);
         let from = start + self.left.min(len);
@@ -96,7 +96,7 @@ impl Engine {
         })
     }
 
-    fn block_of(&self, r: &Rope, anchor: usize, head: usize) -> Block {
+    pub(crate) fn block_of(&self, r: &Rope, anchor: usize, head: usize) -> Block {
         let (la, lh) = (line_of(r, anchor), line_of(r, head));
         let (ca, ch) = (col(r, anchor), col(r, head));
         Block {
@@ -147,6 +147,10 @@ impl Engine {
     }
 
     fn run_block(&mut self, h: &mut dyn VimHost, cmd: &Cmd, op: BlockOp, b: Block) -> bool {
+        // `r<CR>` would split every line of the block; it fails instead of guessing.
+        if op == BlockOp::Replace('\n') {
+            return false;
+        }
         let repeat = Cmd {
             reg: cmd.reg,
             count: cmd.count,
@@ -162,7 +166,7 @@ impl Engine {
                 .collect();
             let reg = Register {
                 text: text.join("\n"),
-                linewise: false,
+                kind: RegKind::Block,
             };
             let w = if op == BlockOp::Op(Op::Yank) {
                 Write::Yank
@@ -236,6 +240,58 @@ impl Engine {
         self.end(h);
         self.changed(repeat);
         true
+    }
+
+    /// `p` / `P` of a block register (`:help blockwise-register`): its lines go in at one column
+    /// (after the cursor's, or at it for `P`) on successive lines, padding short lines with
+    /// spaces and adding lines at the end as needed. A count puts it side by side `n` times. The
+    /// cursor goes to the block's top-left, or just after it with `gp` / `gP`.
+    pub(crate) fn put_block(
+        &mut self,
+        h: &mut dyn VimHost,
+        text: &str,
+        before: bool,
+        after: bool,
+        n: usize,
+    ) {
+        let r = h.rope();
+        let cur = h.selection().1;
+        let top = line_of(r, cur);
+        let col = col(r, cur) + usize::from(!before && line_len(r, top) > 0);
+        let pieces: Vec<&str> = text.split('\n').collect();
+        let width = pieces.iter().map(|p| p.chars().count()).max().unwrap_or(0);
+        self.begin(h);
+        for (i, piece) in pieces.iter().enumerate() {
+            let line = top + i;
+            if line > last_line(h.rope()) {
+                let end = h.rope().len_chars();
+                self.edit(h, end..end, "\n");
+            }
+            let r = h.rope();
+            let (start, len) = (line_start(r, line), line_len(r, line));
+            let pad = " ".repeat(width - piece.chars().count());
+            let mut s = format!("{piece}{pad}").repeat(n - 1);
+            s.push_str(piece);
+            // Keep the text after the block in line with the other lines.
+            if len > col {
+                s.push_str(&pad);
+            }
+            if s.is_empty() {
+                continue;
+            }
+            let lead = " ".repeat(col.saturating_sub(len));
+            let at = start + col.min(len);
+            self.edit(h, at..at, &format!("{lead}{s}"));
+        }
+        let r = h.rope();
+        let pos = if after {
+            let line = top + pieces.len() - 1;
+            (line_start(r, line) + col + width * n).min(line_end(r, line))
+        } else {
+            line_start(r, top) + col
+        };
+        self.set_cursor(h, pos);
+        self.end(h);
     }
 
     /// Replace each line's part of the block with `f` of it.

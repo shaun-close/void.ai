@@ -15,6 +15,26 @@ use crate::text::*;
 
 /// Most entries the jump list keeps.
 const MAX_JUMPS: usize = 100;
+/// Most undo steps whose marks are remembered; older steps fall back to [`changed_span`].
+const MAX_STEPS: usize = 1000;
+
+/// The named marks `a`–`z`, then the context mark.
+type Slots = [Option<usize>; 27];
+
+/// One undo step the engine made (an outermost `begin`..`end`), so undo and redo can move the
+/// marks exactly: the edits in it, and the marks before and after it (marks it deleted with their
+/// line, or moved inside replaced text, come back from those).
+#[derive(Debug)]
+struct Step {
+    /// `(start, old_len, new_len)` of each edit, in order.
+    edits: Vec<(usize, usize, usize)>,
+    before: Slots,
+    after: Slots,
+    /// The text before and after: undo and redo only use the step when the host's history
+    /// turned out to be this step (the host may have steps of its own).
+    text_before: Rope,
+    text_after: Rope,
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Marks {
@@ -25,6 +45,12 @@ pub(crate) struct Marks {
     jumps: Vec<usize>,
     /// Where `<C-o>` / `<C-i>` stand in `jumps`; `jumps.len()` when past the newest entry.
     at: usize,
+    /// The step being made, between the outermost `begin` and `end`.
+    open: Option<Step>,
+    /// Steps that undo can take back, newest last.
+    done: Vec<Step>,
+    /// Steps that redo can make again, newest last.
+    undone: Vec<Step>,
 }
 
 /// Where position `p` goes when `old` chars at `start` become `new` chars: positions after the
@@ -77,6 +103,11 @@ fn changed_span(old: &Rope, new: &Rope) -> Option<(usize, usize, usize)> {
         old.len_chars() - tail - start,
         new.len_chars() - tail - start,
     ))
+}
+
+/// Whether `a` and `b` hold the same text.
+fn same(a: &Rope, b: &Rope) -> bool {
+    a.len_bytes() == b.len_bytes() && common_bytes(a, b, false, usize::MAX) == a.len_bytes()
 }
 
 /// How many bytes `a` and `b` share at their start (or, `from_end`, at their end), at most `most`.
@@ -134,6 +165,78 @@ fn common_bytes<'a>(a: &'a Rope, b: &'a Rope, from_end: bool, most: usize) -> us
 }
 
 impl Marks {
+    fn slots(&self) -> Slots {
+        let mut s = [None; 27];
+        s[..26].copy_from_slice(&self.named);
+        s[26] = self.context;
+        s
+    }
+
+    fn set_slot(&mut self, i: usize, value: Option<usize>) {
+        match self.named.get_mut(i) {
+            Some(m) => *m = value,
+            None => self.context = value,
+        }
+    }
+
+    fn open_step(&mut self, r: &Rope) {
+        self.open = Some(Step {
+            edits: Vec::new(),
+            before: self.slots(),
+            after: [None; 27],
+            text_before: r.clone(),
+            text_after: Rope::new(),
+        });
+    }
+
+    fn record(&mut self, start: usize, old: usize, new: usize) {
+        if let Some(step) = &mut self.open {
+            step.edits.push((start, old, new));
+        }
+    }
+
+    /// Keep the step if it changed the text (the host drops empty undo steps too).
+    fn close_step(&mut self, r: &Rope) {
+        let Some(mut step) = self.open.take() else {
+            return;
+        };
+        if step.edits.is_empty() {
+            return;
+        }
+        step.after = self.slots();
+        step.text_after = r.clone();
+        self.done.push(step);
+        if self.done.len() > MAX_STEPS {
+            self.done.remove(0);
+        }
+        self.undone.clear();
+    }
+
+    /// Move the marks over `step` undone (or redone): every position through its edits, and the
+    /// marks it changed back to what they were, unless they were set again since.
+    fn replay(&mut self, step: &Step, redo: bool) {
+        let now = self.slots();
+        if redo {
+            for &(start, old, new) in &step.edits {
+                self.adjust(start, old, new);
+            }
+        } else {
+            for &(start, old, new) in step.edits.iter().rev() {
+                self.adjust(start, new, old);
+            }
+        }
+        let (from, to) = if redo {
+            (&step.before, &step.after)
+        } else {
+            (&step.after, &step.before)
+        };
+        for i in 0..27 {
+            if from[i] != to[i] && now[i] == from[i] {
+                self.set_slot(i, to[i]);
+            }
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.named.iter().all(Option::is_none) && self.context.is_none() && self.jumps.is_empty()
     }
@@ -195,9 +298,10 @@ impl Engine {
 
     /// Replace `range` with `text` in the host, moving the marks with the text.
     pub(crate) fn edit(&mut self, h: &mut dyn VimHost, range: Range<usize>, text: &str) {
+        let new = text.chars().count();
         self.marks.forget_removed(h.rope(), &range);
-        self.marks
-            .adjust(range.start, range.len(), text.chars().count());
+        self.marks.adjust(range.start, range.len(), new);
+        self.marks.record(range.start, range.len(), new);
         h.replace(range, text);
     }
 
@@ -207,23 +311,47 @@ impl Engine {
         f(h);
         let added = h.rope().len_chars().saturating_sub(before);
         self.marks.adjust(at, 0, added);
+        self.marks.record(at, 0, added);
     }
 
-    /// `n` undo or redo steps. The host's history does not say what changed, so the marks move
-    /// over the span between the first and last changed chars.
+    /// The outermost `begin`: a new undo step starts.
+    pub(crate) fn open_step(&mut self, h: &dyn VimHost) {
+        self.marks.open_step(h.rope());
+    }
+
+    /// The outermost `end`.
+    pub(crate) fn close_step(&mut self, h: &dyn VimHost) {
+        self.marks.close_step(h.rope());
+    }
+
+    /// `n` undo or redo steps. A step the engine made moves the marks back (or forward) exactly;
+    /// for any other step (the host's own) they move over the span of text that changed.
     pub(crate) fn history(&mut self, h: &mut dyn VimHost, n: usize, redo: bool) {
         for _ in 0..n {
             let old = h.rope().clone();
+            let m = &mut self.marks;
+            let stack = if redo { &mut m.undone } else { &mut m.done };
+            let ours = stack
+                .last()
+                .is_some_and(|s| same(&old, if redo { &s.text_before } else { &s.text_after }));
+            let step = if ours { stack.pop() } else { None };
             if redo {
                 h.redo();
             } else {
                 h.undo();
             }
-            if self.marks.is_empty() {
-                continue;
-            }
-            if let Some((start, old_len, new_len)) = changed_span(&old, h.rope()) {
-                self.marks.adjust(start, old_len, new_len);
+            let m = &mut self.marks;
+            match step {
+                Some(s) if same(h.rope(), if redo { &s.text_after } else { &s.text_before }) => {
+                    m.replay(&s, redo);
+                    if redo { &mut m.done } else { &mut m.undone }.push(s);
+                }
+                _ if m.is_empty() => {}
+                _ => {
+                    if let Some((start, old_len, new_len)) = changed_span(&old, h.rope()) {
+                        m.adjust(start, old_len, new_len);
+                    }
+                }
             }
         }
     }

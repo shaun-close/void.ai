@@ -4,7 +4,7 @@
 use crate::engine::{Change, Engine};
 use crate::keys::char_of;
 use crate::parse::{Act, Cmd, Ins};
-use crate::registers::Register;
+use crate::registers::{RegKind, Register};
 use crate::text::*;
 use crate::{Mode, VimHost};
 
@@ -320,7 +320,7 @@ impl Engine {
             '.',
             Register {
                 text,
-                linewise: false,
+                kind: RegKind::Char,
             },
         );
         if let Some(cmd) = s.change {

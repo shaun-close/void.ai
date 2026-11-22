@@ -1,11 +1,12 @@
 //! `<C-a>` / `<C-x>` (`:help CTRL-A`): add to the number at or after the cursor. Decimal numbers
 //! may be negative; `0x` / `0X` numbers are hex (unsigned, 64-bit, wrapping). A number written
 //! with leading zeros keeps its width, as does every hex number; hex keeps the case of its
-//! letters.
+//! letters. In Visual mode the first number in the selected part of each line changes
+//! (`:help v_CTRL-A`).
 
-use crate::VimHost;
 use crate::engine::Engine;
 use crate::text::*;
+use crate::{Mode, VimHost};
 
 /// A number in a line: its chars `start..end` (with the `-` or `0x`), and its digits.
 #[derive(Debug, PartialEq, Eq)]
@@ -100,6 +101,52 @@ impl Engine {
         self.set_cursor(h, at + new.chars().count() - 1);
         self.end(h);
         true
+    }
+
+    /// Visual `<C-a>` / `<C-x>`: add `delta` to the first number in the selected part of each
+    /// line, as one undo step, and put the cursor at the start of the selection. `false` when no
+    /// line had a number.
+    pub(crate) fn visual_add(&mut self, h: &mut dyn VimHost, delta: i64) -> bool {
+        let mode = self.state.mode;
+        let (anchor, head) = h.selection();
+        let r = h.rope();
+        let block = self.block_of(r, anchor, head);
+        let (a, b) = (anchor.min(head), anchor.max(head));
+        let (l1, l2) = (line_of(r, a), line_of(r, b));
+        let start = match mode {
+            Mode::VisualLine => line_start(r, l1),
+            Mode::VisualBlock => clamp_normal(r, line_start(r, l1) + block.left),
+            _ => a,
+        };
+        self.exit_visual(h);
+        self.begin(h);
+        let mut any = false;
+        for l in l1..=l2 {
+            let r = h.rope();
+            let (ls, le) = (line_start(r, l), line_end(r, l));
+            let span = match mode {
+                Mode::VisualLine => ls..le,
+                Mode::VisualBlock => block.span(r, l),
+                _ => {
+                    let from = if l == l1 { a.min(le) } else { ls };
+                    let to = if l == l2 { (b + 1).min(le) } else { le };
+                    from..to.max(from)
+                }
+            };
+            let chars: Vec<char> = r.slice(span.clone()).chars().collect();
+            let Some(n) = find(&chars, 0) else {
+                continue;
+            };
+            let text: String = chars[n.start..n.end].iter().collect();
+            let Some(new) = added(&text, n.hex, delta) else {
+                continue;
+            };
+            self.edit(h, span.start + n.start..span.start + n.end, &new);
+            any = true;
+        }
+        self.set_cursor(h, start);
+        self.end(h);
+        any
     }
 }
 

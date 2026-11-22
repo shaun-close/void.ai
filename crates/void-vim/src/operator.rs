@@ -8,7 +8,7 @@ use ropey::Rope;
 use crate::engine::Engine;
 use crate::motion::{Kind, Reach};
 use crate::parse::{Cmd, Extent, Op};
-use crate::registers::{Register, Write};
+use crate::registers::{RegKind, Register, Write};
 use crate::text::*;
 use crate::{Mode, VimHost};
 
@@ -89,7 +89,7 @@ fn region_text(r: &Rope, region: &Region) -> (Range<usize>, Register) {
             range.clone(),
             Register {
                 text: r.slice(range.clone()).to_string(),
-                linewise: false,
+                kind: RegKind::Char,
             },
         ),
         Region::Lines(l1, l2) => {
@@ -107,7 +107,7 @@ fn region_text(r: &Rope, region: &Region) -> (Range<usize>, Register) {
                 start..end,
                 Register {
                     text,
-                    linewise: true,
+                    kind: RegKind::Line,
                 },
             )
         }
@@ -178,7 +178,11 @@ impl Engine {
         let name = name.unwrap_or('"');
         let reg = match name {
             '+' | '*' => h.clipboard_get().map(|text| Register {
-                linewise: text.ends_with('\n'),
+                kind: if text.ends_with('\n') {
+                    RegKind::Line
+                } else {
+                    RegKind::Char
+                },
                 text,
             }),
             c => self.registers.get(c).cloned(),
@@ -326,11 +330,15 @@ impl Engine {
             return false;
         };
         let n = cmd.count.unwrap_or(1);
+        if reg.kind == RegKind::Block {
+            self.put_block(h, &reg.text, before, after, n);
+            return true;
+        }
         let cur = h.selection().1;
         self.begin(h);
         let r = h.rope();
         let line = line_of(r, cur);
-        let pos = if reg.linewise {
+        let pos = if reg.linewise() {
             let mut text = reg.text.clone();
             if !text.ends_with('\n') {
                 text.push('\n');
@@ -408,13 +416,13 @@ impl Engine {
                 first_non_blank(h.rope(), l1)
             }
             Region::Chars(range) => {
-                let text = if reg.linewise {
+                let text = if reg.linewise() {
                     format!("\n{}", reg.text)
                 } else {
                     reg.text.repeat(n)
                 };
                 self.edit(h, range.clone(), &text);
-                if reg.linewise {
+                if reg.linewise() {
                     range.start + 1
                 } else {
                     range.start + text.chars().count().saturating_sub(1)

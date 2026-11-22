@@ -4,11 +4,29 @@
 
 use std::collections::HashMap;
 
+/// How a register's text goes back in (`:help linewise-register`, `blockwise-register`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegKind {
+    /// Characters, put after or before the cursor.
+    #[default]
+    Char,
+    /// Whole lines: the text ends with a line break and puts go below or above the cursor line.
+    Line,
+    /// A Visual block: its lines (joined with line breaks) go in at one column on successive
+    /// lines.
+    Block,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Register {
     pub text: String,
-    /// Whole lines: `text` ends with a line break and puts go above or below the cursor line.
-    pub linewise: bool,
+    pub kind: RegKind,
+}
+
+impl Register {
+    pub fn linewise(&self) -> bool {
+        self.kind == RegKind::Line
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,11 +65,13 @@ impl Registers {
                 let lower = c.to_ascii_lowercase();
                 let reg = match self.map.remove(&lower) {
                     Some(mut old) => {
-                        if reg.linewise && !old.linewise && !old.text.ends_with('\n') {
+                        if reg.linewise() && !old.linewise() && !old.text.ends_with('\n') {
                             old.text.push('\n');
                         }
                         old.text.push_str(&reg.text);
-                        old.linewise |= reg.linewise;
+                        if reg.linewise() {
+                            old.kind = RegKind::Line;
+                        }
                         old
                     }
                     None => reg,
@@ -68,7 +88,7 @@ impl Registers {
                 Write::Yank => {
                     self.map.insert('0', reg.clone());
                 }
-                Write::Delete if reg.linewise || reg.text.contains('\n') => {
+                Write::Delete if reg.linewise() || reg.text.contains('\n') => {
                     for n in (1..9).rev() {
                         let from = char::from(b'0' + n);
                         if let Some(r) = self.map.remove(&from) {

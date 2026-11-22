@@ -182,7 +182,7 @@ fn answer(e: &mut Engine, h: &mut Host, s: &str) {
 fn reg(e: &Engine, name: char) -> Option<(String, bool)> {
     e.registers()
         .get(name)
-        .map(|r| (r.text.clone(), r.linewise))
+        .map(|r| (r.text.clone(), r.linewise()))
 }
 
 #[test]
