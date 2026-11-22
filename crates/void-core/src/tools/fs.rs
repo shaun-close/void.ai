@@ -490,6 +490,8 @@ mod tests {
             hidden: Arc::new(hidden),
             cancel: tokio_util::sync::CancellationToken::new(),
             stream: None,
+            sandbox: None,
+            target_dir: t.tmp.path().join("target"),
         }
     }
 

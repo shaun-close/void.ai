@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::ToolSpec;
 use crate::overlay::Overlay;
 
+pub mod bash;
 pub mod fs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,10 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// Live output (bash) for the UI.
     pub stream: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Where bash runs; None means bash is unavailable.
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
+    /// The workspace's read-write CARGO_TARGET_DIR for sandboxed builds.
+    pub target_dir: PathBuf,
 }
 
 pub trait Tool: Send + Sync {
@@ -77,7 +82,9 @@ pub struct Registry {
 
 impl Registry {
     pub fn builtin() -> Registry {
-        Registry { tools: fs::all() }
+        let mut tools = fs::all();
+        tools.push(Arc::new(bash::Bash));
+        Registry { tools }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {

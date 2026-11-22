@@ -107,6 +107,8 @@ pub struct RunPlan {
     /// Read-write CARGO_TARGET_DIR (per workspace, outside the overlay).
     pub target_dir: PathBuf,
     pub command: String,
+    /// Overrides the settings' timeout (clamped to 1–600 s).
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +131,7 @@ pub struct Sandbox {
     settings: SandboxSettings,
     /// Cache overlays can't be mounted twice at once: commands take turns.
     lock: Arc<tokio::sync::Mutex<()>>,
+    avail: Arc<tokio::sync::OnceCell<Availability>>,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -195,6 +198,7 @@ impl Sandbox {
             uid: current_uid(),
             settings,
             lock: Arc::new(tokio::sync::Mutex::new(())),
+            avail: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -236,8 +240,12 @@ impl Sandbox {
         self.data_dir.join("cache-overlay")
     }
 
-    /// Check bwrap works here and whether Landlock can be applied.
+    /// Whether bwrap works here and Landlock can be applied (checked once, then remembered).
     pub async fn availability(&self) -> Availability {
+        self.avail.get_or_init(|| self.probe()).await.clone()
+    }
+
+    async fn probe(&self) -> Availability {
         let Some(bwrap) = &self.bwrap else {
             return Availability::Unavailable("bubblewrap (bwrap) isn't installed".into());
         };
@@ -418,7 +426,11 @@ impl Sandbox {
             pump(err, tx.clone());
         }
         drop(tx);
-        let timeout = Duration::from_secs(self.settings.timeout_secs.clamp(1, 600));
+        let timeout = Duration::from_secs(
+            plan.timeout_secs
+                .unwrap_or(self.settings.timeout_secs)
+                .clamp(1, 600),
+        );
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
         let mut out: Vec<u8> = Vec::new();
@@ -556,6 +568,7 @@ mod tests {
             work: tmp.path().join("ovl/work"),
             target_dir: tmp.path().join("target"),
             command: "echo hi".into(),
+            timeout_secs: None,
         };
         let a = strs(&sb.bwrap_args(&plan));
         let p = |x: &Path| x.to_string_lossy().into_owned();
@@ -624,6 +637,7 @@ mod tests {
             work: tmp.path().join("w"),
             target_dir: tmp.path().join("t"),
             command: "true".into(),
+            timeout_secs: None,
         };
         let a = strs(&sb.bwrap_args(&plan));
         assert!(pos(&a, &["--tmpfs", &home.join(".ssh").to_string_lossy()]).is_none());
@@ -659,6 +673,7 @@ mod tests {
             work: tmp.path().join("w"),
             target_dir: tmp.path().join("t"),
             command: "true".into(),
+            timeout_secs: None,
         };
         let a = strs(&sb.bwrap_args(&plan));
         let real_c = p(&real.canonicalize().unwrap());

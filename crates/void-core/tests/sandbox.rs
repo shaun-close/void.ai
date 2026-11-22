@@ -53,6 +53,7 @@ impl Rig {
             work: self.tmp.path().join("ovl/work"),
             target_dir: self.tmp.path().join("target"),
             command: cmd.into(),
+            timeout_secs: None,
         };
         fs::create_dir_all(&plan.upper).unwrap();
         fs::create_dir_all(&plan.work).unwrap();
