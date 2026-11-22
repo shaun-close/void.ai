@@ -450,8 +450,10 @@ mod tests {
     fn save_then_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sub/config.toml");
-        let mut c = Config::default();
-        c.font_size = 18.0;
+        let c = Config {
+            font_size: 18.0,
+            ..Config::default()
+        };
         save_config(&p, &c).unwrap();
         let (back, warning) = load_config(&p);
         assert!(warning.is_none());
