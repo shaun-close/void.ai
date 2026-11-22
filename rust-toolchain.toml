@@ -1,0 +1,5 @@
+# Keep in sync with .prototools; moon also synchronizes the channel.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

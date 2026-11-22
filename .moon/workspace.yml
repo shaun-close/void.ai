@@ -1,0 +1,14 @@
+$schema: 'https://moonrepo.dev/schemas/workspace.json'
+
+projects:
+  sources:
+    workspace: '.'
+  globs:
+    - 'apps/*'
+    - 'crates/*'
+
+vcs:
+  defaultBranch: 'main'
+
+versionConstraint: '2.5.0'
+telemetry: false

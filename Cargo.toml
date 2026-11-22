@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/void-core", "apps/void-gui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.99"
+
+[workspace.dependencies]
+void-core = { path = "crates/void-core" }

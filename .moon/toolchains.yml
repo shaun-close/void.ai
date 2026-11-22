@@ -1,0 +1,6 @@
+$schema: 'https://moonrepo.dev/schemas/toolchains.json'
+
+rust:
+  components: ['clippy', 'rustfmt']
+  versionFromPrototools: true
+  syncToolchainConfig: true

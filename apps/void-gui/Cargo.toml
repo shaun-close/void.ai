@@ -1,0 +1,13 @@
+[package]
+name = "void-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "void-ai"
+path = "src/main.rs"
+
+[dependencies]
+void-core.workspace = true

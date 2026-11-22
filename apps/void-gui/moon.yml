@@ -1,0 +1,11 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+layer: 'application'
+
+tasks:
+  run:
+    command: 'cargo run --package void-gui --locked --'
+    options:
+      cache: false
+      interactive: true

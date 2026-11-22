@@ -1,0 +1,26 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+layer: 'configuration'
+
+tasks:
+  check:
+    command: 'cargo check --workspace --all-targets --locked'
+    options:
+      cache: false
+  build:
+    command: 'cargo build --workspace --locked'
+    options:
+      cache: false
+  test:
+    command: 'cargo test --workspace --locked'
+    options:
+      cache: false
+  lint:
+    command: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
+    options:
+      cache: false
+  format:
+    command: 'cargo fmt --all -- --check'
+    options:
+      cache: false
