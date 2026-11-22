@@ -12,14 +12,24 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
+use serde_json::Value;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent;
 use crate::backend::{Backend, BackendError, StreamEvent, make_backend};
 use crate::config::{Config, Profile, load_config, resolve_api_key, save_config};
 use crate::context::{build_request, estimate_tokens};
+use crate::context::{compaction_split, needs_compaction};
 use crate::model::{
     Conversation, ConversationId, ConversationMeta, Message, NEW_CHAT_TITLE, Part, Role, Workspace,
     WorkspaceId,
 };
+use crate::overlay::{Change, Hunk, Overlay};
+use crate::permissions::{Action, ApprovalRequest, Decision, Permissions};
+use crate::sandbox::{Availability, Sandbox};
 use crate::store::{Store, WorkspaceEntry};
+use crate::tools::{Registry, ToolCtx, ToolOutput};
 
 /// Called after every event, so a UI can wake up (the GUI requests a repaint).
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -45,6 +55,46 @@ pub enum Command {
     Stop(ConversationId),
     SaveConfig(Config),
     TestProfile(Profile),
+    /// None follows the default agent.
+    SetConversationAgent(ConversationId, Option<String>),
+    /// Answer an `ApprovalNeeded`.
+    Approve {
+        id: u64,
+        decision: Decision,
+    },
+    ListChanges(ConversationId),
+    Diff {
+        conversation: ConversationId,
+        path: PathBuf,
+    },
+    AcceptFile {
+        conversation: ConversationId,
+        path: PathBuf,
+        force: bool,
+    },
+    RejectFile {
+        conversation: ConversationId,
+        path: PathBuf,
+    },
+    AcceptHunk {
+        conversation: ConversationId,
+        path: PathBuf,
+        index: usize,
+        force: bool,
+    },
+    RejectHunk {
+        conversation: ConversationId,
+        path: PathBuf,
+        index: usize,
+    },
+    AcceptAll {
+        conversation: ConversationId,
+        keep_ignored: bool,
+    },
+    RejectAll(ConversationId),
+    /// Summarise the conversation now.
+    Compact(ConversationId),
+    ClearSandboxCaches,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +143,64 @@ pub enum Event {
     },
     ConfigSaved,
     Error(String),
+    /// Something worth telling the user that isn't an error.
+    Info(String),
+    SandboxStatus(Availability),
+    ToolStarted {
+        conversation: ConversationId,
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    ToolOutput {
+        conversation: ConversationId,
+        call_id: String,
+        text: String,
+    },
+    ToolFinished {
+        conversation: ConversationId,
+        call_id: String,
+        output: ToolOutput,
+    },
+    ApprovalNeeded(ApprovalRequest),
+    ApprovalResolved {
+        id: u64,
+    },
+    /// The conversation's pending changes (after each tool round and review action).
+    Changes {
+        conversation: ConversationId,
+        changes: Vec<Change>,
+    },
+    Diff {
+        conversation: ConversationId,
+        path: PathBuf,
+        hunks: Vec<Hunk>,
+    },
+    ReviewError {
+        conversation: ConversationId,
+        path: PathBuf,
+        error: String,
+    },
+    /// Older messages were summarised.
+    Compacted(ConversationId),
+}
+
+/// Knobs for embedding the engine (tests lower the step limit and skip the sandbox).
+#[derive(Clone, Copy, Debug)]
+pub struct EngineOptions {
+    /// Tool rounds per turn before the agent is stopped.
+    pub step_limit: u32,
+    /// Set up the bash sandbox (false: bash reports it's unavailable).
+    pub sandbox: bool,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            step_limit: 50,
+            sandbox: true,
+        }
+    }
 }
 
 pub struct Engine;
@@ -108,6 +216,22 @@ impl Engine {
         store: Store,
         notify: Notify,
         factory: BackendFactory,
+    ) -> EngineHandle {
+        Self::start_with_options(
+            config_path,
+            store,
+            notify,
+            factory,
+            EngineOptions::default(),
+        )
+    }
+
+    pub fn start_with_options(
+        config_path: PathBuf,
+        store: Store,
+        notify: Notify,
+        factory: BackendFactory,
+        options: EngineOptions,
     ) -> EngineHandle {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -129,6 +253,13 @@ impl Engine {
             convs: HashMap::new(),
             streams: HashMap::new(),
             next_gen: 0,
+            registry: Registry::builtin(),
+            sandbox: None,
+            sandbox_status: Availability::Unavailable("not checked yet".into()),
+            turns: HashMap::new(),
+            approvals: HashMap::new(),
+            next_approval: 1,
+            options,
         };
         runtime.spawn(state.run(rx));
         EngineHandle {
@@ -184,11 +315,60 @@ enum Msg {
         generation: u64,
         item: StreamItem,
     },
+    Tool(ConversationId, ToolMsg),
+    Approval {
+        req: ApprovalRequest,
+        reply: oneshot::Sender<Decision>,
+    },
+    AddRule {
+        ws: WorkspaceId,
+        tool: String,
+        prefix: String,
+    },
+}
+
+enum ToolMsg {
+    Started {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    Output {
+        call_id: String,
+        text: String,
+    },
+    Finished {
+        call_id: String,
+        output: ToolOutput,
+    },
+    /// Every call of the round has a result.
+    RoundDone,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StreamMode {
+    Reply,
+    /// Summarise, then stop (Command::Compact).
+    CompactOnly,
+}
+
+/// An agent turn: from the user's message until a reply without tool calls.
+struct Turn {
+    round: u32,
+    cancel: CancellationToken,
+    runner: Option<AbortHandle>,
+    workspace: Workspace,
 }
 
 enum StreamItem {
     Event(StreamEvent),
     Failed(String),
+    /// Compaction produced a summary to insert before message `split`.
+    Summary {
+        split: usize,
+        text: String,
+    },
+    CompactOnlyDone,
     /// The backend's stream ended without saying Done.
     Ended,
 }
@@ -213,6 +393,13 @@ struct State {
     convs: HashMap<ConversationId, Conversation>,
     streams: HashMap<ConversationId, Streaming>,
     next_gen: u64,
+    registry: Registry,
+    sandbox: Option<Arc<Sandbox>>,
+    sandbox_status: Availability,
+    turns: HashMap<ConversationId, Turn>,
+    approvals: HashMap<u64, (ConversationId, oneshot::Sender<Decision>)>,
+    next_approval: u64,
+    options: EngineOptions,
 }
 
 const TITLE_CHARS: usize = 40;
@@ -224,6 +411,14 @@ impl State {
         self.emit(Event::ConfigLoaded { config, warning });
         let last = self.store.last_workspace();
         self.open_workspace(last);
+        if self.options.sandbox {
+            let sb = self.make_sandbox();
+            self.sandbox_status = sb.availability().await;
+            self.sandbox = Some(Arc::new(sb));
+        } else {
+            self.sandbox_status = Availability::Unavailable("the sandbox is turned off".into());
+        }
+        self.emit(Event::SandboxStatus(self.sandbox_status.clone()));
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Cmd(cmd) => self.command(cmd),
@@ -234,6 +429,10 @@ impl State {
                             s.abort.abort();
                         }
                         self.finish(id, true);
+                    }
+                    let turns: Vec<_> = self.turns.keys().copied().collect();
+                    for id in turns {
+                        self.end_turn(id);
                     }
                     let _ = ack.send(());
                 }
@@ -247,8 +446,338 @@ impl State {
                     generation,
                     item,
                 } => self.stream_item(conversation, generation, item),
+                Msg::Tool(id, m) => self.tool_msg(id, m),
+                Msg::Approval { mut req, reply } => {
+                    if !self.turns.contains_key(&req.conversation) {
+                        continue;
+                    }
+                    req.id = self.next_approval;
+                    self.next_approval += 1;
+                    self.approvals.insert(req.id, (req.conversation, reply));
+                    self.emit(Event::ApprovalNeeded(req));
+                }
+                Msg::AddRule { ws, tool, prefix } => {
+                    let path = self.store.permissions_path(&ws);
+                    let (mut perms, _) = Permissions::load(&path);
+                    perms.add_always(&tool, (!prefix.is_empty()).then_some(prefix));
+                    if let Err(e) = perms.save(&path) {
+                        self.emit(Event::Error(format!(
+                            "Couldn't save the permission rule: {e}"
+                        )));
+                    }
+                }
             }
         }
+    }
+
+    fn make_sandbox(&self) -> Sandbox {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Sandbox::new(
+            self.store.data_dir().to_path_buf(),
+            home,
+            self.config.sandbox.clone(),
+        )
+    }
+
+    /// The conversation's overlay in `ws` (created when missing); None outside a folder.
+    fn overlay_for(&self, ws: &Workspace, id: ConversationId) -> Option<Overlay> {
+        let root = ws.root.as_ref()?;
+        Overlay::open(&self.store.overlay_dir(&ws.id, &id), root).ok()
+    }
+
+    /// The overlay only if the conversation already has one.
+    fn existing_overlay(&self, ws: &Workspace, id: ConversationId) -> Option<Overlay> {
+        if self.store.overlay_dir(&ws.id, &id).exists() {
+            self.overlay_for(ws, id)
+        } else {
+            None
+        }
+    }
+
+    fn emit_changes(&self, ws: &Workspace, id: ConversationId) {
+        if let Some(ov) = self.existing_overlay(ws, id) {
+            self.emit(Event::Changes {
+                conversation: id,
+                changes: ov.changes(),
+            });
+        }
+    }
+
+    fn agent_for(&self, c: &Conversation) -> Option<agent::AgentProfile> {
+        self.config.agent(c.agent.as_deref()).cloned()
+    }
+
+    fn begin_turn(&mut self, c: &Conversation) {
+        let ws = self.workspace.clone();
+        let tools = ws.root.is_some() && self.agent_for(c).is_some_and(|a| !a.tools.is_empty());
+        if tools
+            && let Some(ov) = self.overlay_for(&ws, c.id)
+            && let Err(e) = ov.checkpoint()
+        {
+            self.emit(Event::Error(format!(
+                "Couldn't checkpoint pending changes: {e}"
+            )));
+        }
+        self.turns.insert(
+            c.id,
+            Turn {
+                round: 0,
+                cancel: CancellationToken::new(),
+                runner: None,
+                workspace: ws,
+            },
+        );
+    }
+
+    /// Stop a turn: cancel its tools, refuse its pending approvals, report its changes.
+    fn end_turn(&mut self, id: ConversationId) {
+        let Some(t) = self.turns.remove(&id) else {
+            return;
+        };
+        t.cancel.cancel();
+        if let Some(r) = t.runner {
+            r.abort();
+        }
+        let pending: Vec<u64> = self
+            .approvals
+            .iter()
+            .filter(|(_, (c, _))| *c == id)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in pending {
+            self.approvals.remove(&k);
+            self.emit(Event::ApprovalResolved { id: k });
+        }
+        self.emit_changes(&t.workspace, id);
+    }
+
+    fn tool_msg(&mut self, id: ConversationId, m: ToolMsg) {
+        if !self.turns.contains_key(&id) {
+            return;
+        }
+        match m {
+            ToolMsg::Started {
+                call_id,
+                name,
+                summary,
+            } => {
+                self.emit(Event::ToolStarted {
+                    conversation: id,
+                    call_id,
+                    name,
+                    summary,
+                });
+            }
+            ToolMsg::Output { call_id, text } => {
+                self.emit(Event::ToolOutput {
+                    conversation: id,
+                    call_id,
+                    text,
+                });
+            }
+            ToolMsg::Finished { call_id, output } => {
+                let msg = Message::new(
+                    Role::Tool,
+                    vec![Part::ToolResult {
+                        call_id: call_id.clone(),
+                        content: output.content.clone(),
+                    }],
+                );
+                self.append(id, msg);
+                self.emit(Event::ToolFinished {
+                    conversation: id,
+                    call_id,
+                    output,
+                });
+            }
+            ToolMsg::RoundDone => {
+                let Some(t) = self.turns.get_mut(&id) else {
+                    return;
+                };
+                t.round += 1;
+                t.runner = None;
+                let ws = t.workspace.clone();
+                self.emit_changes(&ws, id);
+                if let Some(c) = self.convs.get(&id).cloned() {
+                    self.start_stream(c, StreamMode::Reply);
+                }
+            }
+        }
+    }
+
+    /// Run a reply's tool calls in order on a task of their own.
+    fn spawn_tools(&mut self, id: ConversationId, calls: Vec<(String, String, String)>) {
+        let Some(turn) = self.turns.get(&id) else {
+            return;
+        };
+        let ws = turn.workspace.clone();
+        let cancel = turn.cancel.clone();
+        let agent = self.convs.get(&id).and_then(|c| self.agent_for(c));
+        let overlay = self.overlay_for(&ws, id);
+        let perms = Permissions::load(&self.store.permissions_path(&ws.id)).0;
+        let hidden = Arc::new(
+            self.sandbox
+                .as_ref()
+                .map(|s| s.hidden_paths())
+                .unwrap_or_default(),
+        );
+        let sandbox = self.sandbox.clone();
+        let target_dir = self.store.sandbox_target(&ws.id);
+        let registry = self.registry.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            let send = |m: ToolMsg| {
+                let _ = tx.send(Msg::Tool(id, m));
+            };
+            let notes = overlay
+                .as_ref()
+                .map(Overlay::take_rejections)
+                .unwrap_or_default();
+            let mut first = true;
+            for (call_id, name, arguments) in calls {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let tool = registry.get(&name);
+                let args: Option<Value> = if arguments.trim().is_empty() {
+                    Some(Value::Object(Default::default()))
+                } else {
+                    serde_json::from_str(&arguments)
+                        .ok()
+                        .filter(Value::is_object)
+                };
+                let summary = match (&tool, &args) {
+                    (Some(t), Some(a)) => t.summary(a),
+                    _ => String::new(),
+                };
+                send(ToolMsg::Started {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    summary: summary.clone(),
+                });
+                let mut output = 'out: {
+                    let Some(t) = tool else {
+                        break 'out ToolOutput::err(format!("there is no tool called `{name}`"));
+                    };
+                    let Some(a) = args else {
+                        break 'out ToolOutput::err("the arguments weren't a JSON object");
+                    };
+                    let (Some(ov), Some(root)) = (overlay.clone(), ws.root.clone()) else {
+                        break 'out ToolOutput::err(
+                            "tools need a folder workspace (File › Open Folder)",
+                        );
+                    };
+                    let Some(ag) = agent.as_ref() else {
+                        break 'out ToolOutput::err("no agent profile is configured");
+                    };
+                    if !ag.allows(&name) {
+                        break 'out ToolOutput::err(format!(
+                            "the {} agent can't use {name}",
+                            ag.id
+                        ));
+                    }
+                    match perms.decide(&name, &a) {
+                        Action::Allow => {}
+                        Action::Deny => {
+                            break 'out ToolOutput::err(format!(
+                                "{name} is denied by a workspace rule"
+                            ));
+                        }
+                        Action::Ask => {
+                            let (otx, orx) = oneshot::channel();
+                            let command =
+                                a.get("command").and_then(Value::as_str).map(str::to_owned);
+                            let req = ApprovalRequest {
+                                id: 0,
+                                conversation: id,
+                                tool: name.clone(),
+                                summary: summary.clone(),
+                                command,
+                            };
+                            let _ = tx.send(Msg::Approval { req, reply: otx });
+                            match orx.await {
+                                Ok(Decision::Once) => {}
+                                Ok(Decision::AlwaysForWorkspace(prefix)) => {
+                                    let _ = tx.send(Msg::AddRule {
+                                        ws: ws.id.clone(),
+                                        tool: name.clone(),
+                                        prefix,
+                                    });
+                                }
+                                _ => break 'out ToolOutput::err("denied by the user"),
+                            }
+                        }
+                    }
+                    let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let fwd_tx = tx.clone();
+                    let cid = call_id.clone();
+                    let fwd = tokio::spawn(async move {
+                        while let Some(text) = srx.recv().await {
+                            let _ = fwd_tx.send(Msg::Tool(
+                                id,
+                                ToolMsg::Output {
+                                    call_id: cid.clone(),
+                                    text,
+                                },
+                            ));
+                        }
+                    });
+                    let ctx = ToolCtx {
+                        workspace: root,
+                        overlay: ov,
+                        hidden: hidden.clone(),
+                        cancel: cancel.clone(),
+                        stream: Some(stx),
+                        sandbox: sandbox.clone(),
+                        target_dir: target_dir.clone(),
+                    };
+                    let out = t.run(a, ctx).await;
+                    let _ = fwd.await;
+                    out
+                };
+                if first && !notes.is_empty() {
+                    output.content = format!("{}\n\n{}", notes.join("\n"), output.content);
+                }
+                first = false;
+                send(ToolMsg::Finished { call_id, output });
+            }
+            if !cancel.is_cancelled() {
+                send(ToolMsg::RoundDone);
+            }
+        });
+        if let Some(t) = self.turns.get_mut(&id) {
+            t.runner = Some(task.abort_handle());
+        }
+    }
+
+    /// A review action on a conversation's overlay in the current workspace.
+    fn review(
+        &mut self,
+        id: ConversationId,
+        path: PathBuf,
+        f: impl FnOnce(&Overlay) -> Result<(), String>,
+    ) {
+        let ws = self.workspace.clone();
+        let Some(ov) = self.existing_overlay(&ws, id) else {
+            self.emit(Event::Changes {
+                conversation: id,
+                changes: Vec::new(),
+            });
+            return;
+        };
+        if let Err(error) = f(&ov) {
+            self.emit(Event::ReviewError {
+                conversation: id,
+                path,
+                error,
+            });
+        }
+        self.emit(Event::Changes {
+            conversation: id,
+            changes: ov.changes(),
+        });
     }
 
     fn emit(&self, ev: Event) {
@@ -289,6 +818,7 @@ impl State {
                 if let Some(s) = self.streams.remove(&id) {
                     s.abort.abort();
                 }
+                self.end_turn(id);
                 let ws = self
                     .convs
                     .remove(&id)
@@ -297,6 +827,14 @@ impl State {
                 if let Err(e) = self.store.delete(&ws, &id) {
                     self.emit(Event::Error(format!(
                         "Couldn't delete the conversation: {e}"
+                    )));
+                }
+                let overlay = self.store.overlay_dir(&ws, &id);
+                if overlay.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&overlay)
+                {
+                    self.emit(Event::Error(format!(
+                        "Couldn't discard the pending changes: {e}"
                     )));
                 }
                 self.emit(Event::ConversationDeleted(id));
@@ -310,30 +848,163 @@ impl State {
                 if self.streams.contains_key(&id) {
                     return;
                 }
+                let ws = self.workspace.clone();
                 let Some(c) = self.conversation(id) else {
                     return;
                 };
                 if !c.messages.iter().any(|m| m.role == Role::User) {
                     return;
                 }
-                // A retry replaces the replies after the last user message.
-                while c.messages.last().is_some_and(|m| m.role == Role::Assistant) {
+                // A retry replaces everything after the last user message — replies, tool
+                // results, and (via the turn's checkpoint) the attempt's file changes.
+                while c
+                    .messages
+                    .last()
+                    .is_some_and(|m| matches!(m.role, Role::Assistant | Role::Tool))
+                {
                     c.messages.pop();
                 }
                 let c = c.clone();
+                if let Some(ov) = self.existing_overlay(&ws, id)
+                    && let Err(e) = ov.restore_checkpoint()
+                {
+                    self.emit(Event::Error(format!(
+                        "Couldn't undo the last attempt's changes: {e}"
+                    )));
+                }
                 self.save(&c);
                 self.emit(Event::Conversation(c.clone()));
-                self.start_stream(c);
+                self.emit_changes(&ws, id);
+                self.begin_turn(&c);
+                self.start_stream(c, StreamMode::Reply);
             }
             Command::Stop(id) => {
                 if let Some(s) = self.streams.get(&id) {
                     s.abort.abort();
                     self.finish(id, true);
                 }
+                self.end_turn(id);
+            }
+            Command::SetConversationAgent(id, agent) => {
+                self.update(id, |c| c.agent = agent);
+            }
+            Command::Approve { id, decision } => {
+                if let Some((_, reply)) = self.approvals.remove(&id) {
+                    let _ = reply.send(decision);
+                }
+                self.emit(Event::ApprovalResolved { id });
+            }
+            Command::ListChanges(id) => self.review(id, PathBuf::new(), |_| Ok(())),
+            Command::Diff { conversation, path } => {
+                let ws = self.workspace.clone();
+                match self
+                    .existing_overlay(&ws, conversation)
+                    .map(|ov| ov.diff(&path))
+                {
+                    Some(Ok(hunks)) => self.emit(Event::Diff {
+                        conversation,
+                        path,
+                        hunks,
+                    }),
+                    Some(Err(e)) => self.emit(Event::ReviewError {
+                        conversation,
+                        path,
+                        error: e.to_string(),
+                    }),
+                    None => {}
+                }
+            }
+            Command::AcceptFile {
+                conversation,
+                path,
+                force,
+            } => {
+                let p = path.clone();
+                self.review(conversation, path, move |ov| {
+                    ov.accept_file(&p, force).map_err(|e| e.to_string())
+                });
+            }
+            Command::RejectFile { conversation, path } => {
+                let p = path.clone();
+                self.review(conversation, path, move |ov| {
+                    ov.reject_file(&p).map_err(|e| e.to_string())
+                });
+            }
+            Command::AcceptHunk {
+                conversation,
+                path,
+                index,
+                force,
+            } => {
+                let p = path.clone();
+                self.review(conversation, path, move |ov| {
+                    ov.accept_hunk(&p, index, force).map_err(|e| e.to_string())
+                });
+            }
+            Command::RejectHunk {
+                conversation,
+                path,
+                index,
+            } => {
+                let p = path.clone();
+                self.review(conversation, path, move |ov| {
+                    ov.reject_hunk(&p, index).map_err(|e| e.to_string())
+                });
+            }
+            Command::AcceptAll {
+                conversation,
+                keep_ignored,
+            } => {
+                self.review(conversation, PathBuf::new(), move |ov| {
+                    match ov.accept_all(keep_ignored) {
+                        Ok(skipped) if skipped.is_empty() => Ok(()),
+                        Ok(skipped) => Err(format!(
+                            "Not accepted because they changed on disk: {}",
+                            skipped
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                        Err(e) => Err(e.to_string()),
+                    }
+                });
+            }
+            Command::RejectAll(id) => {
+                self.review(id, PathBuf::new(), |ov| {
+                    ov.reject_all().map_err(|e| e.to_string())
+                });
+            }
+            Command::Compact(id) => {
+                if self.streams.contains_key(&id) || self.turns.contains_key(&id) {
+                    self.emit(Event::Error(
+                        "Wait for the reply to finish before compacting.".into(),
+                    ));
+                } else if let Some(c) = self.conversation(id).cloned() {
+                    self.start_stream(c, StreamMode::CompactOnly);
+                }
+            }
+            Command::ClearSandboxCaches => {
+                if let Some(sb) = &self.sandbox {
+                    let dir = sb.cache_layer_dir();
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => self.emit(Event::Info("Sandbox caches cleared.".into())),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.emit(Event::Info("Sandbox caches were already empty.".into()))
+                        }
+                        Err(e) => self.emit(Event::Error(format!(
+                            "Couldn't clear the sandbox caches: {e}"
+                        ))),
+                    }
+                }
             }
             Command::SaveConfig(config) => match save_config(&self.config_path, &config) {
                 Ok(()) => {
+                    let sandbox_changed = config.sandbox != self.config.sandbox;
                     self.config = config;
+                    if sandbox_changed && self.options.sandbox {
+                        self.sandbox = Some(Arc::new(self.make_sandbox()));
+                    }
                     self.emit(Event::ConfigSaved);
                 }
                 Err(e) => self.emit(Event::Error(format!("Couldn't save the settings: {e}"))),
@@ -443,11 +1114,12 @@ impl State {
         self.save(&c);
         self.emit(Event::Conversation(c.clone()));
         self.emit_list();
-        self.start_stream(c);
+        self.begin_turn(&c);
+        self.start_stream(c, StreamMode::Reply);
     }
 
-    /// Ask the conversation's backend for the next reply.
-    fn start_stream(&mut self, c: Conversation) {
+    /// Ask the conversation's backend for the next reply (compacting first when needed).
+    fn start_stream(&mut self, c: Conversation, mode: StreamMode) {
         let id = c.id;
         let profile_id = c
             .profile_id
@@ -456,7 +1128,36 @@ impl State {
         let generation = self.next_gen;
         self.next_gen += 1;
         let profile = self.config.profile(&profile_id).cloned();
-        let request = profile.as_ref().map(|p| build_request(&c, p, &self.config));
+        let turn_ws = self
+            .turns
+            .get(&id)
+            .map(|t| t.workspace.clone())
+            .unwrap_or_else(|| self.workspace.clone());
+        let mut request = profile.as_ref().map(|p| build_request(&c, p, &self.config));
+        if let (Some(req), Some(ag)) = (request.as_mut(), self.agent_for(&c))
+            && turn_ws.root.is_some()
+        {
+            let ov = self.existing_overlay(&turn_ws, id);
+            req.system = agent::system_prompt(
+                &self.config,
+                &ag,
+                &turn_ws,
+                ov.as_ref(),
+                &self.sandbox_status,
+            );
+            let names: Vec<String> = ag.tools.iter().filter(|t| ag.allows(t)).cloned().collect();
+            req.tools = self.registry.specs(&names);
+        }
+        let split = match (&profile, mode) {
+            (_, StreamMode::CompactOnly) => compaction_split(&c),
+            (Some(p), StreamMode::Reply) if needs_compaction(&c, p) => compaction_split(&c),
+            _ => None,
+        };
+        if mode == StreamMode::CompactOnly && split.is_none() {
+            self.emit(Event::Info("There's nothing to compact yet.".into()));
+            return;
+        }
+        let cfg = self.config.clone();
         let factory = self.factory.clone();
         let tx = self.tx.clone();
         let task = tokio::spawn(async move {
@@ -467,7 +1168,7 @@ impl State {
                     item,
                 });
             };
-            let (Some(profile), Some(request)) = (profile, request) else {
+            let (Some(profile), Some(mut request)) = (profile, request) else {
                 send(StreamItem::Failed(format!(
                     "There's no backend profile called \"{profile_id}\"."
                 )));
@@ -483,7 +1184,52 @@ impl State {
                     return;
                 }
             };
-            let mut stream = factory(&profile, key).stream(request);
+            let backend = factory(&profile, key);
+            if let Some(split) = split {
+                let mut earlier = c.clone();
+                earlier.messages.truncate(split);
+                let mut sreq = build_request(&earlier, &profile, &cfg);
+                sreq.system =
+                    "You write concise summaries of conversations so they can be continued later."
+                        .into();
+                sreq.tools = Vec::new();
+                sreq.max_output = profile.max_output.min(4096);
+                sreq.messages.push(Message::user(
+                    "Summarise the conversation so far for yourself: goals, decisions, files touched, \
+                     current state and open threads. Be concise but keep every detail needed to continue.",
+                ));
+                let mut text = String::new();
+                let mut stream = backend.stream(sreq);
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(StreamEvent::TextDelta(t)) => text.push_str(&t),
+                        Ok(_) => {}
+                        Err(e) => {
+                            send(StreamItem::Failed(format!(
+                                "Compacting failed: {}",
+                                error_text(&e)
+                            )));
+                            return;
+                        }
+                    }
+                }
+                send(StreamItem::Summary {
+                    split,
+                    text: text.clone(),
+                });
+                if mode == StreamMode::CompactOnly {
+                    send(StreamItem::CompactOnlyDone);
+                    return;
+                }
+                let mut compacted = c.clone();
+                compacted.messages.insert(
+                    split,
+                    Message::new(Role::Assistant, vec![Part::Summary(text)]),
+                );
+                let rebuilt = build_request(&compacted, &profile, &cfg);
+                request.messages = rebuilt.messages;
+            }
+            let mut stream = backend.stream(request);
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(ev) => {
@@ -510,7 +1256,9 @@ impl State {
                 first_delta: None,
             },
         );
-        self.emit(Event::StreamStarted(id));
+        if mode == StreamMode::Reply {
+            self.emit(Event::StreamStarted(id));
+        }
     }
 
     fn stream_item(&mut self, id: ConversationId, generation: u64, item: StreamItem) {
@@ -551,6 +1299,21 @@ impl State {
             StreamItem::Event(StreamEvent::Usage(u)) => s.message.usage = Some(u),
             StreamItem::Event(StreamEvent::Done(_)) | StreamItem::Ended => self.finish(id, false),
             StreamItem::Failed(error) => self.fail(id, error),
+            StreamItem::Summary { split, text } => {
+                if let Some(c) = self.convs.get_mut(&id) {
+                    let at = split.min(c.messages.len());
+                    c.messages
+                        .insert(at, Message::new(Role::Assistant, vec![Part::Summary(text)]));
+                    c.updated = Utc::now();
+                    let c = c.clone();
+                    self.save(&c);
+                    self.emit(Event::Conversation(c));
+                }
+                self.emit(Event::Compacted(id));
+            }
+            StreamItem::CompactOnlyDone => {
+                self.streams.remove(&id);
+            }
         }
     }
 
@@ -573,12 +1336,39 @@ impl State {
         });
         let message = s.message;
         self.append(id, message.clone());
+        let calls: Vec<(String, String, String)> = message
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
         self.emit(Event::StreamFinished {
             conversation: id,
             message,
             tokens_per_sec,
         });
         self.emit_list();
+        if stopped || calls.is_empty() {
+            self.end_turn(id);
+            return;
+        }
+        match self.turns.get(&id).map(|t| t.round) {
+            Some(round) if round >= self.options.step_limit => {
+                self.emit(Event::Error(format!(
+                    "Stopped after {} tool rounds (the step limit).",
+                    self.options.step_limit
+                )));
+                self.end_turn(id);
+            }
+            Some(_) => self.spawn_tools(id, calls),
+            None => {}
+        }
     }
 
     fn fail(&mut self, id: ConversationId, error: String) {
@@ -593,6 +1383,7 @@ impl State {
             conversation: id,
             error,
         });
+        self.end_turn(id);
     }
 
     fn append(&mut self, id: ConversationId, message: Message) -> Option<Conversation> {
@@ -1215,5 +2006,586 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // ---- agent loop ----------------------------------------------------------------
+
+    use crate::overlay::{ChangeKind, Overlay};
+    use crate::permissions::{Action, Decision, Permissions, Rule};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Replies with the next scripted stream on each call (the last one repeats) and records
+    /// every request.
+    struct Seq {
+        scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    impl Backend for Seq {
+        fn stream(&self, req: ChatRequest) -> EventStream {
+            self.requests.lock().unwrap().push(req);
+            let mut q = self.scripts.lock().unwrap();
+            let script = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap_or_default()
+            };
+            futures_util::stream::iter(script.into_iter().map(Ok)).boxed()
+        }
+        fn list_models(&self) -> BoxFuture<'static, Result<Vec<String>, BackendError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    fn call(id: &str, name: &str, args: serde_json::Value) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+            StreamEvent::Done(StopReason::ToolUse),
+        ]
+    }
+
+    fn say(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta(text.into()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]
+    }
+
+    struct Agent {
+        r: Rig,
+        ws: std::path::PathBuf,
+        conv: ConversationId,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    fn agent_rig(
+        scripts: Vec<Vec<StreamEvent>>,
+        step_limit: u32,
+        rules: Option<Vec<Rule>>,
+        context_limit: u32,
+    ) -> Agent {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let ws = root.join("project");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.txt"), "pineapple\n").unwrap();
+        let mut p = profile("agent", "http://fake");
+        p.context_limit = context_limit;
+        let cfg = Config {
+            active_profile: "agent".into(),
+            profiles: vec![p],
+            ..Config::default()
+        };
+        let cfg_path = root.join("config/config.toml");
+        save_config(&cfg_path, &cfg).unwrap();
+        let store = Store::new(root.join("data"));
+        if let Some(rules) = rules {
+            let w = store.workspace_for(&ws).unwrap();
+            Permissions { rules }
+                .save(&store.permissions_path(&w.id))
+                .unwrap();
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seq = Arc::new(Seq {
+            scripts: Mutex::new(scripts.into()),
+            requests: requests.clone(),
+        });
+        let factory: BackendFactory =
+            Arc::new(move |_p: &Profile, _k: Option<String>| seq.clone() as Arc<dyn Backend>);
+        let notified = Arc::new(AtomicUsize::new(0));
+        let n = notified.clone();
+        let notify: Notify = Arc::new(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+        });
+        let handle = Engine::start_with_options(
+            cfg_path,
+            store.clone(),
+            notify,
+            factory,
+            EngineOptions {
+                step_limit,
+                sandbox: false,
+            },
+        );
+        let mut r = Rig {
+            _dir: dir,
+            root,
+            store,
+            handle,
+            notified,
+            received: 0,
+        };
+        r.started();
+        r.handle.send(Command::OpenWorkspace(Some(ws.clone())));
+        r.until(
+            |e| matches!(e, Event::WorkspaceOpened { workspace, .. } if workspace.root.is_some()),
+        );
+        let conv = r.new_conversation();
+        Agent {
+            r,
+            ws,
+            conv,
+            requests,
+        }
+    }
+
+    impl Agent {
+        fn overlay(&self) -> Overlay {
+            let w = self.r.store.workspace_for(&self.ws).unwrap();
+            Overlay::open(&self.r.store.overlay_dir(&w.id, &self.conv), &self.ws).unwrap()
+        }
+        fn saved(&self) -> Conversation {
+            let w = self.r.store.workspace_for(&self.ws).unwrap();
+            self.r.store.load(&w.id, &self.conv).unwrap()
+        }
+        fn finish_with(&mut self, text: &str) {
+            let t = text.to_string();
+            self.r.until(
+                |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == t),
+            );
+        }
+    }
+
+    fn defaults_with(extra: Rule) -> Vec<Rule> {
+        let mut r = Permissions::defaults().rules;
+        r.push(extra);
+        r
+    }
+
+    #[test]
+    fn tool_round_trip_reads_file() {
+        let mut a = agent_rig(
+            vec![
+                call("c1", "read", serde_json::json!({"path": "a.txt"})),
+                say("done"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "read it");
+        a.r.until(|e| matches!(e, Event::ToolStarted { name, .. } if name == "read"));
+        match a.r.until(|e| matches!(e, Event::ToolFinished { .. })) {
+            Event::ToolFinished { output, .. } => {
+                assert!(output.content.contains("pineapple"), "{output:?}")
+            }
+            _ => unreachable!(),
+        }
+        a.finish_with("done");
+        let roles: Vec<Role> = a.saved().messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+        );
+        let reqs = a.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].tools.iter().any(|t| t.name == "bash"));
+        assert!(reqs[0].system.contains(&a.ws.display().to_string()));
+        assert!(reqs[1].messages.iter().any(|m| m.role == Role::Tool));
+    }
+
+    #[test]
+    fn edit_lands_in_overlay_and_changes_event() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "edit",
+                    serde_json::json!({"path": "a.txt", "old_string": "pineapple", "new_string": "mango"}),
+                ),
+                say("edited"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "change it");
+        match a
+            .r
+            .until(|e| matches!(e, Event::Changes { changes, .. } if !changes.is_empty()))
+        {
+            Event::Changes { changes, .. } => {
+                assert_eq!(changes[0].path, std::path::PathBuf::from("a.txt"));
+                assert_eq!(changes[0].kind, ChangeKind::Modified);
+            }
+            _ => unreachable!(),
+        }
+        a.finish_with("edited");
+        assert_eq!(
+            std::fs::read_to_string(a.ws.join("a.txt")).unwrap(),
+            "pineapple\n"
+        );
+        assert_eq!(
+            a.overlay().read(std::path::Path::new("a.txt")).unwrap(),
+            b"mango\n"
+        );
+    }
+
+    #[test]
+    fn ask_waits_for_approval() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        let id = match a.r.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => {
+                assert_eq!(req.tool, "write");
+                assert_eq!(req.conversation, a.conv);
+                req.id
+            }
+            _ => unreachable!(),
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            a.overlay().read(std::path::Path::new("b.txt")).is_err(),
+            "nothing runs before approval"
+        );
+        a.r.handle.send(Command::Approve {
+            id,
+            decision: Decision::Once,
+        });
+        a.r.until(|e| matches!(e, Event::ApprovalResolved { .. }));
+        a.finish_with("ok");
+        assert_eq!(
+            a.overlay().read(std::path::Path::new("b.txt")).unwrap(),
+            b"B"
+        );
+    }
+
+    #[test]
+    fn deny_reports_to_model() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        let id = match a.r.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => req.id,
+            _ => unreachable!(),
+        };
+        a.r.handle.send(Command::Approve {
+            id,
+            decision: Decision::Deny,
+        });
+        match a.r.until(|e| matches!(e, Event::ToolFinished { .. })) {
+            Event::ToolFinished { output, .. } => {
+                assert!(output.is_error);
+                assert!(output.content.contains("denied"));
+            }
+            _ => unreachable!(),
+        }
+        a.finish_with("ok");
+        assert!(a.overlay().read(std::path::Path::new("b.txt")).is_err());
+    }
+
+    #[test]
+    fn always_for_workspace_saves_rule() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        let id = match a.r.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => req.id,
+            _ => unreachable!(),
+        };
+        a.r.handle.send(Command::Approve {
+            id,
+            decision: Decision::AlwaysForWorkspace(String::new()),
+        });
+        a.finish_with("ok");
+        let w = a.r.store.workspace_for(&a.ws).unwrap();
+        let (perms, _) = Permissions::load(&a.r.store.permissions_path(&w.id));
+        assert_eq!(
+            perms.decide("write", &serde_json::json!({"path": "x"})),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn step_limit_stops_loop() {
+        let mut a = agent_rig(
+            vec![call("c1", "list", serde_json::json!({}))],
+            3,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "loop forever");
+        match a
+            .r
+            .until(|e| matches!(e, Event::Error(m) if m.contains("step limit")))
+        {
+            Event::Error(m) => assert!(m.contains('3')),
+            _ => unreachable!(),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let tools = a
+            .saved()
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .count();
+        assert_eq!(tools, 3);
+    }
+
+    #[test]
+    fn stop_during_approval_ends_turn() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("after"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        a.r.until(|e| matches!(e, Event::ApprovalNeeded(_)));
+        a.r.handle.send(Command::Stop(a.conv));
+        a.r.until(|e| matches!(e, Event::ApprovalResolved { .. }));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(a.overlay().read(std::path::Path::new("b.txt")).is_err());
+        // The conversation can carry on; the cut-off call gets a placeholder result.
+        a.r.send(a.conv, "carry on");
+        a.finish_with("after");
+        let reqs = a.requests.lock().unwrap();
+        let last = reqs.last().unwrap();
+        assert!(last.messages.iter().flat_map(|m| m.parts.iter()).any(|p| matches!(p, Part::ToolResult { content, .. } if content.contains("not run") || content.contains("denied"))));
+    }
+
+    #[test]
+    fn retry_restores_checkpoint() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("wrote"),
+                say("again"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "write b");
+        a.finish_with("wrote");
+        assert!(a.overlay().read(std::path::Path::new("b.txt")).is_ok());
+        a.r.handle.send(Command::Retry(a.conv));
+        a.finish_with("again");
+        assert!(
+            a.overlay().read(std::path::Path::new("b.txt")).is_err(),
+            "retry undid the attempt's changes"
+        );
+        let roles: Vec<Role> = a.saved().messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, [Role::User, Role::Assistant]);
+    }
+
+    #[test]
+    fn delete_conversation_discards_overlay() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("wrote"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "write b");
+        a.finish_with("wrote");
+        let w = a.r.store.workspace_for(&a.ws).unwrap();
+        let dir = a.r.store.overlay_dir(&w.id, &a.conv);
+        assert!(dir.exists());
+        a.r.handle.send(Command::DeleteConversation(a.conv));
+        a.r.until(|e| matches!(e, Event::ConversationDeleted(_)));
+        assert!(!dir.exists());
+        assert!(!a.ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn scratch_has_no_tools() {
+        let mut a = agent_rig(vec![say("plain")], 50, None, 1000);
+        a.r.handle.send(Command::OpenWorkspace(None));
+        a.r.until(
+            |e| matches!(e, Event::WorkspaceOpened { workspace, .. } if workspace.root.is_none()),
+        );
+        let c = a.r.new_conversation();
+        a.r.send(c, "hi");
+        a.finish_with("plain");
+        assert!(a.requests.lock().unwrap().last().unwrap().tools.is_empty());
+    }
+
+    #[test]
+    fn plan_agent_cannot_write() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.handle
+            .send(Command::SetConversationAgent(a.conv, Some("plan".into())));
+        a.r.send(a.conv, "write");
+        match a.r.until(|e| matches!(e, Event::ToolFinished { .. })) {
+            Event::ToolFinished { output, .. } => assert!(
+                output.is_error && output.content.contains("plan"),
+                "{output:?}"
+            ),
+            _ => unreachable!(),
+        }
+        a.finish_with("ok");
+        assert!(a.overlay().read(std::path::Path::new("b.txt")).is_err());
+        assert!(
+            !a.requests.lock().unwrap()[0]
+                .tools
+                .iter()
+                .any(|t| t.name == "write")
+        );
+    }
+
+    #[test]
+    fn review_commands_accept_and_reject() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "edit",
+                    serde_json::json!({"path": "a.txt", "old_string": "pineapple", "new_string": "mango"}),
+                ),
+                call(
+                    "c2",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("done"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "go");
+        a.finish_with("done");
+        a.r.handle.send(Command::AcceptFile {
+            conversation: a.conv,
+            path: "a.txt".into(),
+            force: false,
+        });
+        a.r.until(|e| matches!(e, Event::Changes { changes, .. } if changes.len() == 1));
+        assert_eq!(
+            std::fs::read_to_string(a.ws.join("a.txt")).unwrap(),
+            "mango\n"
+        );
+        a.r.handle.send(Command::Diff {
+            conversation: a.conv,
+            path: "b.txt".into(),
+        });
+        match a.r.until(|e| matches!(e, Event::Diff { .. })) {
+            Event::Diff { hunks, .. } => assert_eq!(hunks.len(), 1),
+            _ => unreachable!(),
+        }
+        a.r.handle.send(Command::RejectFile {
+            conversation: a.conv,
+            path: "b.txt".into(),
+        });
+        a.r.until(|e| matches!(e, Event::Changes { changes, .. } if changes.is_empty()));
+        assert!(!a.ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn compaction_inserts_summary() {
+        let mut a = agent_rig(
+            vec![say("ok"), say("SUMMARY TEXT"), say("fine")],
+            50,
+            None,
+            200,
+        );
+        a.r.send(a.conv, "short");
+        a.finish_with("ok");
+        a.r.send(a.conv, &"y".repeat(800));
+        a.r.until(|e| matches!(e, Event::Compacted(_)));
+        a.finish_with("fine");
+        let saved = a.saved();
+        assert!(saved.messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Summary(s) if s == "SUMMARY TEXT"))
+        }));
+        let reqs = a.requests.lock().unwrap();
+        assert!(reqs[1].tools.is_empty(), "the summary request has no tools");
+        let first = reqs[2].messages[0].text();
+        assert!(
+            first.starts_with("Summary of earlier conversation:\nSUMMARY TEXT"),
+            "{first}"
+        );
     }
 }

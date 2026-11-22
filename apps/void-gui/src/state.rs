@@ -140,6 +140,9 @@ impl UiState {
             }
             Event::ConfigSaved => self.info("Settings saved."),
             Event::Error(e) => self.error(e),
+            Event::Info(m) => self.info(m),
+            // Agent events: handled by the tool and review UI (milestone 2, task 8).
+            _ => {}
         }
     }
 
