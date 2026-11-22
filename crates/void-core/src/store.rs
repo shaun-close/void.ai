@@ -3,7 +3,7 @@
 //! ```text
 //! index.json                                   known workspaces, newest first
 //! workspaces/<id>/conversations/<conv>.json    one file per conversation
-//! workspaces/<id>/layout.json                  the UI's dock layout (opaque to the core)
+//! workspaces/<id>/layout.ron                   the UI's dock layout (opaque to the core)
 //! ```
 
 use std::io;
@@ -174,11 +174,11 @@ impl Store {
     }
 
     pub fn load_layout(&self, ws: &WorkspaceId) -> Option<String> {
-        std::fs::read_to_string(self.workspace_dir(ws).join("layout.json")).ok()
+        std::fs::read_to_string(self.workspace_dir(ws).join("layout.ron")).ok()
     }
 
     pub fn save_layout(&self, ws: &WorkspaceId, json: &str) -> io::Result<()> {
-        fsutil::atomic_write(&self.workspace_dir(ws).join("layout.json"), json.as_bytes())
+        fsutil::atomic_write(&self.workspace_dir(ws).join("layout.ron"), json.as_bytes())
     }
 }
 
@@ -342,8 +342,8 @@ mod tests {
         let a = WorkspaceId("aaaa".into());
         let b = WorkspaceId("bbbb".into());
         assert_eq!(s.load_layout(&a), None);
-        s.save_layout(&a, "{\"x\":1}").unwrap();
-        assert_eq!(s.load_layout(&a).as_deref(), Some("{\"x\":1}"));
+        s.save_layout(&a, "(x: 1)").unwrap();
+        assert_eq!(s.load_layout(&a).as_deref(), Some("(x: 1)"));
         assert_eq!(s.load_layout(&b), None);
     }
 }
