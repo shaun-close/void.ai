@@ -193,6 +193,272 @@ fn reply_body(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
         });
 }
 
+/// What a tool card shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardInfo {
+    pub name: String,
+    pub summary: String,
+    pub output: String,
+    pub status: CardStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+pub fn tool_icon(name: &str) -> &'static str {
+    match name {
+        "read" => icon::FILE_TEXT,
+        "list" | "glob" | "grep" => icon::MAGNIFIER,
+        "edit" | "write" => icon::PENCIL,
+        "bash" => icon::TERMINAL,
+        _ => icon::ROBOT,
+    }
+}
+
+/// A one-line summary from raw tool arguments (when the live card isn't around).
+pub fn args_summary(arguments: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    ["command", "path", "pattern"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+/// Cards for a reply's tool calls: live state when the call ran this session, otherwise the
+/// stored result.
+fn cards_for(
+    state: &crate::state::UiState,
+    conv: &void_core::model::Conversation,
+    m: &Message,
+) -> Vec<CardInfo> {
+    m.parts
+        .iter()
+        .filter_map(|part| match part {
+            void_core::model::Part::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id, name, arguments)),
+            _ => None,
+        })
+        .map(|(id, name, arguments)| {
+            if let Some(live) = state.tool_calls.get(id) {
+                let (output, status) = match &live.done {
+                    Some(o) => (
+                        o.content.clone(),
+                        if o.is_error {
+                            CardStatus::Failed
+                        } else {
+                            CardStatus::Done
+                        },
+                    ),
+                    None => (live.output.clone(), CardStatus::Running),
+                };
+                return CardInfo {
+                    name: name.clone(),
+                    summary: live.summary.clone(),
+                    output,
+                    status,
+                };
+            }
+            let stored = conv
+                .messages
+                .iter()
+                .flat_map(|m| m.parts.iter())
+                .find_map(|p| match p {
+                    void_core::model::Part::ToolResult { call_id, content } if call_id == id => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                });
+            CardInfo {
+                name: name.clone(),
+                summary: args_summary(arguments),
+                status: if stored.is_some() {
+                    CardStatus::Done
+                } else {
+                    CardStatus::Failed
+                },
+                output: stored.unwrap_or_else(|| "(no result)".into()),
+            }
+        })
+        .collect()
+}
+
+fn tool_card(
+    ui: &mut Ui,
+    p: &Palette,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    card: &CardInfo,
+) {
+    egui::Frame::new()
+        .fill(p.bg_raised)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            ui.horizontal(|ui| {
+                ui.label(theme::ico(tool_icon(&card.name)).color(p.accent2));
+                ui.label(
+                    RichText::new(&card.name)
+                        .family(FontFamily::Name(BOLD.into()))
+                        .color(p.text),
+                );
+                match card.status {
+                    CardStatus::Running => {
+                        ui.spinner();
+                    }
+                    CardStatus::Done => {
+                        ui.label(theme::ico(icon::CHECK_CIRCLE).color(p.ok));
+                    }
+                    CardStatus::Failed => {
+                        ui.label(theme::ico(icon::X_CIRCLE).color(p.err));
+                    }
+                }
+                ui.add(
+                    egui::Label::new(RichText::new(&card.summary).monospace().color(p.text_dim))
+                        .truncate(),
+                );
+            });
+            if !card.output.is_empty() {
+                egui::CollapsingHeader::new(RichText::new("output").small().color(p.text_faint))
+                    .id_salt(salt)
+                    .default_open(card.status == CardStatus::Running && card.name == "bash")
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        let shown = tail(&card.output, 6000);
+                        ui.add(
+                            egui::Label::new(RichText::new(shown).monospace().small())
+                                .selectable(true),
+                        );
+                    });
+            }
+        });
+}
+
+fn tail(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut i = s.len() - max;
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    &s[i..]
+}
+
+fn approval_card(
+    ui: &mut Ui,
+    p: &Palette,
+    req: &void_core::permissions::ApprovalRequest,
+    engine: &void_core::engine::EngineHandle,
+) {
+    egui::Frame::new()
+        .fill(with_alpha(p.warn, if p.dark { 18 } else { 28 }))
+        .stroke(Stroke::new(1.0, with_alpha(p.warn, 120)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::ico(icon::HAND).color(p.warn).size(18.0));
+                ui.label(
+                    RichText::new(format!("void wants to use {}", req.tool))
+                        .family(FontFamily::Name(BOLD.into()))
+                        .color(p.text),
+                );
+            });
+            let what = req.command.clone().unwrap_or_else(|| req.summary.clone());
+            egui::Frame::new()
+                .fill(p.bg_deep)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(RichText::new(&what).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
+            ui.horizontal_wrapped(|ui| {
+                use void_core::engine::Command;
+                use void_core::permissions::Decision;
+                if theme::primary_button(ui, icon::CHECK, "Allow once").clicked() {
+                    engine.send(Command::Approve {
+                        id: req.id,
+                        decision: Decision::Once,
+                    });
+                }
+                let prefix = req
+                    .command
+                    .as_deref()
+                    .map(void_core::permissions::always_prefix)
+                    .unwrap_or_default();
+                let always = if prefix.is_empty() {
+                    format!("Always allow {}", req.tool)
+                } else {
+                    format!("Always allow `{prefix}`")
+                };
+                if ui
+                    .button(theme::itext(icon::SHIELD_CHECK, &always))
+                    .clicked()
+                {
+                    engine.send(Command::Approve {
+                        id: req.id,
+                        decision: Decision::AlwaysForWorkspace(prefix),
+                    });
+                }
+                if ui
+                    .button(theme::itext_styled(
+                        icon::PROHIBIT,
+                        "Deny",
+                        theme::body_size(),
+                        p.err,
+                    ))
+                    .clicked()
+                {
+                    engine.send(Command::Approve {
+                        id: req.id,
+                        decision: Decision::Deny,
+                    });
+                }
+            });
+        });
+}
+
+fn summary_divider(
+    ui: &mut Ui,
+    p: &Palette,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(theme::ico(icon::LAYOUT).color(p.text_faint));
+        egui::CollapsingHeader::new(
+            RichText::new("Earlier messages summarised")
+                .small()
+                .color(p.text_faint),
+        )
+        .id_salt(salt)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(text).italics().color(p.text_dim)).wrap());
+        });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assistant_block(
     ui: &mut Ui,
@@ -204,8 +470,12 @@ fn assistant_block(
     model: &str,
     retry: bool,
     engine: &void_core::engine::EngineHandle,
+    cards: &[CardInfo],
+    header: bool,
 ) {
-    reply_header(ui, p, model, m.usage.map(|u| u.completion_tokens), false);
+    if header {
+        reply_header(ui, p, model, m.usage.map(|u| u.completion_tokens), false);
+    }
     reply_body(ui, |ui| {
         let text = m.text();
         reasoning_card(
@@ -218,6 +488,9 @@ fn assistant_block(
         );
         if !text.is_empty() {
             markdown(ui, md, (conv, index), &text);
+        }
+        for (k, card) in cards.iter().enumerate() {
+            tool_card(ui, p, (conv, index, k, "tool"), card);
         }
         if let Some(err) = &m.error {
             egui::Frame::new()
@@ -320,14 +593,45 @@ pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, conv: Option<ConversationId>)
             ui.add_space(4.0);
             let n = loaded.messages.len();
             for (i, m) in loaded.messages.iter().enumerate() {
+                // Tool results show inside their call's card.
+                if m.role == Role::Tool {
+                    continue;
+                }
+                let summary: String = m
+                    .parts
+                    .iter()
+                    .filter_map(|x| match x {
+                        void_core::model::Part::Summary(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !summary.is_empty() {
+                    summary_divider(ui, &pal, (c, i, "summary"), &summary);
+                    ui.add_space(8.0);
+                    continue;
+                }
                 if m.role == Role::User {
                     user_bubble(ui, &pal, p.md, (c, i), &m.text());
                 } else {
                     let last = i + 1 == n && !streaming;
                     let retry = last && (m.error.is_some() || m.stopped);
-                    assistant_block(ui, &pal, p.md, c, i, m, &model, retry, p.engine);
+                    let cards = cards_for(p.state, loaded, m);
+                    // Consecutive tool rounds read as one reply: one header.
+                    let header = !(i > 0 && loaded.messages[i - 1].role == Role::Tool);
+                    assistant_block(
+                        ui, &pal, p.md, c, i, m, &model, retry, p.engine, &cards, header,
+                    );
                 }
-                ui.add_space(12.0);
+                ui.add_space(
+                    if m.parts
+                        .iter()
+                        .any(|x| matches!(x, void_core::model::Part::ToolCall { .. }))
+                    {
+                        4.0
+                    } else {
+                        12.0
+                    },
+                );
             }
             if let Some(s) = p.state.streams.get(&c) {
                 reply_header(ui, &pal, &model, None, true);
@@ -345,6 +649,10 @@ pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, conv: Option<ConversationId>)
                     }
                     typing_dots(ui, &pal);
                 });
+                ui.add_space(8.0);
+            }
+            for req in p.state.approvals.iter().filter(|a| a.conversation == c) {
+                approval_card(ui, &pal, req, p.engine);
                 ui.add_space(8.0);
             }
         });
@@ -412,6 +720,45 @@ fn input_card(
                         });
                     if chosen != current {
                         p.engine.send(Command::SetConversationProfile(c, chosen));
+                    }
+                }
+                if let Some(c) = conv
+                    && let Some(loaded) = p.state.loaded.get(&c)
+                {
+                    if p.state.workspace.root.is_some() {
+                        let current = loaded.agent.clone();
+                        let mut chosen = current.clone();
+                        let agents = p.state.saved_config.agents.clone();
+                        let default = p.state.saved_config.default_agent.clone();
+                        let name = |id: &Option<String>| {
+                            let id = id.clone().unwrap_or_else(|| default.clone());
+                            agents
+                                .iter()
+                                .find(|a| a.id == id)
+                                .map(|a| a.name.clone())
+                                .unwrap_or(id)
+                        };
+                        egui::ComboBox::from_id_salt(("chat-agent", tab))
+                            .selected_text(theme::itext_small(icon::ROBOT, &name(&current)))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut chosen,
+                                    None,
+                                    format!("{} (default)", name(&None)),
+                                );
+                                for a in &agents {
+                                    ui.selectable_value(&mut chosen, Some(a.id.clone()), &a.name);
+                                }
+                            });
+                        if chosen != current {
+                            p.engine.send(Command::SetConversationAgent(c, chosen));
+                        }
+                    } else if ui.available_width() > 360.0 {
+                        ui.label(
+                            RichText::new("Open a folder to let void use tools")
+                                .small()
+                                .color(pal.text_faint),
+                        );
                     }
                 }
                 if ui.available_width() > 260.0 {

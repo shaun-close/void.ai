@@ -14,6 +14,16 @@ pub struct Streaming {
     pub reasoning: String,
 }
 
+/// A tool call as it runs (live output) and once it's finished.
+#[derive(Clone, Debug)]
+pub struct ToolCallView {
+    pub summary: String,
+    pub output: String,
+    pub done: Option<void_core::tools::ToolOutput>,
+}
+
+const LIVE_OUTPUT_CAP: usize = 200_000;
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub text: String,
@@ -33,6 +43,14 @@ pub struct UiState {
     pub last_tps: Option<f32>,
     pub tests: HashMap<String, Result<Vec<String>, String>>,
     pub status: Option<Status>,
+    pub tool_calls: HashMap<String, ToolCallView>,
+    pub approvals: Vec<void_core::permissions::ApprovalRequest>,
+    pub sandbox: Option<void_core::sandbox::Availability>,
+    pub changes: HashMap<ConversationId, Vec<void_core::overlay::Change>>,
+    pub diffs: HashMap<(ConversationId, std::path::PathBuf), Vec<void_core::overlay::Hunk>>,
+    /// The first pending changes of a chat ask the app to show Review.
+    review_request: bool,
+    reviewed: std::collections::HashSet<ConversationId>,
     /// Set by WorkspaceOpened: the layout the app should apply (None = default).
     layout: Option<Option<String>>,
     /// A conversation the engine just created, for the app to put in a Chat tab.
@@ -54,6 +72,13 @@ impl Default for UiState {
             last_tps: None,
             tests: HashMap::new(),
             status: None,
+            tool_calls: HashMap::new(),
+            approvals: Vec::new(),
+            sandbox: None,
+            changes: HashMap::new(),
+            diffs: HashMap::new(),
+            review_request: false,
+            reviewed: Default::default(),
             layout: None,
             created: None,
             deleted: Vec::new(),
@@ -141,8 +166,69 @@ impl UiState {
             Event::ConfigSaved => self.info("Settings saved."),
             Event::Error(e) => self.error(e),
             Event::Info(m) => self.info(m),
-            // Agent events: handled by the tool and review UI (milestone 2, task 8).
-            _ => {}
+            Event::SandboxStatus(a) => self.sandbox = Some(a),
+            Event::ToolStarted {
+                call_id, summary, ..
+            } => {
+                self.tool_calls.insert(
+                    call_id,
+                    ToolCallView {
+                        summary,
+                        output: String::new(),
+                        done: None,
+                    },
+                );
+            }
+            Event::ToolOutput { call_id, text, .. } => {
+                if let Some(t) = self.tool_calls.get_mut(&call_id) {
+                    t.output.push_str(&text);
+                    if t.output.len() > LIVE_OUTPUT_CAP {
+                        let mut cut = t.output.len() - LIVE_OUTPUT_CAP / 2;
+                        while !t.output.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        t.output.drain(..cut);
+                    }
+                }
+            }
+            Event::ToolFinished {
+                conversation,
+                call_id,
+                output,
+            } => {
+                if let Some(c) = self.loaded.get_mut(&conversation) {
+                    c.messages.push(void_core::model::Message::new(
+                        void_core::model::Role::Tool,
+                        vec![void_core::model::Part::ToolResult {
+                            call_id: call_id.clone(),
+                            content: output.content.clone(),
+                        }],
+                    ));
+                }
+                if let Some(t) = self.tool_calls.get_mut(&call_id) {
+                    t.done = Some(output);
+                }
+            }
+            Event::ApprovalNeeded(req) => self.approvals.push(req),
+            Event::ApprovalResolved { id } => self.approvals.retain(|a| a.id != id),
+            Event::Changes {
+                conversation,
+                changes,
+            } => {
+                if !changes.is_empty() && self.reviewed.insert(conversation) {
+                    self.review_request = true;
+                }
+                self.changes.insert(conversation, changes);
+            }
+            Event::Diff {
+                conversation,
+                path,
+                hunks,
+            } => {
+                self.diffs.insert((conversation, path), hunks);
+            }
+            Event::ReviewError { error, .. } => self.error(error),
+            Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
         }
     }
 
@@ -162,6 +248,11 @@ impl UiState {
 
     pub fn take_layout(&mut self) -> Option<Option<String>> {
         self.layout.take()
+    }
+
+    #[allow(dead_code)] // used by the Review panel (milestone 2, task 9)
+    pub fn take_review_request(&mut self) -> bool {
+        std::mem::take(&mut self.review_request)
     }
 
     pub fn take_created(&mut self) -> Option<ConversationId> {
@@ -304,5 +395,85 @@ mod tests {
         });
         assert_eq!(s.take_layout(), Some(Some("{}".into())));
         assert_eq!(s.take_layout(), None);
+    }
+
+    #[test]
+    fn ui_state_tracks_tool_calls() {
+        let mut s = UiState::default();
+        let c = Conversation::new(Workspace::scratch().id);
+        let id = c.id;
+        s.apply(Event::Conversation(c));
+        s.apply(Event::ToolStarted {
+            conversation: id,
+            call_id: "c1".into(),
+            name: "bash".into(),
+            summary: "ls".into(),
+        });
+        s.apply(Event::ToolOutput {
+            conversation: id,
+            call_id: "c1".into(),
+            text: "a\n".into(),
+        });
+        s.apply(Event::ToolOutput {
+            conversation: id,
+            call_id: "c1".into(),
+            text: "b\n".into(),
+        });
+        assert_eq!(s.tool_calls["c1"].output, "a\nb\n");
+        assert!(s.tool_calls["c1"].done.is_none());
+        let out = void_core::tools::ToolOutput::ok("exit code: 0\na\nb");
+        s.apply(Event::ToolFinished {
+            conversation: id,
+            call_id: "c1".into(),
+            output: out.clone(),
+        });
+        assert_eq!(s.tool_calls["c1"].done, Some(out));
+        // The result is mirrored into the conversation like the engine stores it.
+        let last = s.loaded[&id].messages.last().unwrap();
+        assert_eq!(last.role, Role::Tool);
+    }
+
+    #[test]
+    fn approval_added_and_resolved() {
+        let mut s = UiState::default();
+        let req = void_core::permissions::ApprovalRequest {
+            id: 7,
+            conversation: void_core::model::ConversationId::new(),
+            tool: "bash".into(),
+            summary: "rm -rf build".into(),
+            command: Some("rm -rf build".into()),
+        };
+        s.apply(Event::ApprovalNeeded(req.clone()));
+        assert_eq!(s.approvals, vec![req]);
+        s.apply(Event::ApprovalResolved { id: 7 });
+        assert!(s.approvals.is_empty());
+    }
+
+    #[test]
+    fn first_pending_changes_ask_for_review() {
+        let mut s = UiState::default();
+        let id = void_core::model::ConversationId::new();
+        let change = void_core::overlay::Change {
+            path: "a.txt".into(),
+            kind: void_core::overlay::ChangeKind::Added,
+            ignored: false,
+            conflict: false,
+        };
+        s.apply(Event::Changes {
+            conversation: id,
+            changes: vec![],
+        });
+        assert!(!s.take_review_request());
+        s.apply(Event::Changes {
+            conversation: id,
+            changes: vec![change.clone()],
+        });
+        assert!(s.take_review_request());
+        s.apply(Event::Changes {
+            conversation: id,
+            changes: vec![change],
+        });
+        assert!(!s.take_review_request(), "only the first time");
+        assert_eq!(s.changes[&id].len(), 1);
     }
 }

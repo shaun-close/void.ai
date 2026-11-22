@@ -778,6 +778,108 @@ mod e2e {
         }
         h.render().unwrap().save(out.join("backends.png")).unwrap();
 
+        // An agent conversation in a folder workspace: tool cards, live bash, an approval.
+        let proj = p.root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let wsp = store.workspace_for(&proj).unwrap();
+        let mut ac = Conversation::new(wsp.id.clone());
+        ac.title = "Fix the flaky SSE test".into();
+        ac.messages.push(Message::user(
+            "The SSE chunking test fails sometimes. Can you look?",
+        ));
+        ac.messages.push(Message::new(
+            R::Assistant,
+            vec![
+                Part::Text("Let me look at the parser first.".into()),
+                Part::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/backend/sse.rs"}"#.into(),
+                },
+                Part::ToolCall {
+                    id: "t2".into(),
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"after_cr"}"#.into(),
+                },
+            ],
+        ));
+        ac.messages.push(Message::new(
+            R::Tool,
+            vec![Part::ToolResult {
+                call_id: "t1".into(),
+                content: "     1\t//! A Server-Sent Events parser…".into(),
+            }],
+        ));
+        ac.messages.push(Message::new(
+            R::Tool,
+            vec![Part::ToolResult {
+                call_id: "t2".into(),
+                content: "src/backend/sse.rs:17:    after_cr: bool,".into(),
+            }],
+        ));
+        ac.messages.push(Message::new(
+            R::Assistant,
+            vec![
+                Part::Text(
+                    "A `\\r` at the end of a chunk loses its state. I'll fix it and run the tests."
+                        .into(),
+                ),
+                Part::ToolCall {
+                    id: "t3".into(),
+                    name: "edit".into(),
+                    arguments: r#"{"path":"src/backend/sse.rs"}"#.into(),
+                },
+                Part::ToolCall {
+                    id: "t4".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"cargo test -p void-core sse"}"#.into(),
+                },
+            ],
+        ));
+        ac.messages.push(Message::new(
+            R::Tool,
+            vec![Part::ToolResult {
+                call_id: "t3".into(),
+                content: "edited src/backend/sse.rs (1 replacement)".into(),
+            }],
+        ));
+        store.save(&ac).unwrap();
+        h.state_mut().open_workspace(Some(proj.clone()));
+        until(&mut h, 10, "proj", |a| a.state.workspace.name == "proj");
+        let aid = ac.id;
+        h.state_mut().apply_action(Action::Show(aid));
+        until(&mut h, 10, "agent conv", |a| {
+            a.state.loaded.contains_key(&aid)
+        });
+        h.state_mut()
+            .state
+            .apply(void_core::engine::Event::ToolStarted {
+                conversation: aid,
+                call_id: "t4".into(),
+                name: "bash".into(),
+                summary: "cargo test -p void-core sse".into(),
+            });
+        h.state_mut().state.apply(void_core::engine::Event::ToolOutput {
+            conversation: aid,
+            call_id: "t4".into(),
+            text: "   Compiling void-core v0.1.0\n    Finished `test` profile\n     Running unittests\n".into(),
+        });
+        h.state_mut()
+            .state
+            .apply(void_core::engine::Event::ApprovalNeeded(
+                void_core::permissions::ApprovalRequest {
+                    id: 9,
+                    conversation: aid,
+                    tool: "bash".into(),
+                    summary: "git stash".into(),
+                    command: Some("git stash && cargo test".into()),
+                },
+            ));
+        for _ in 0..6 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("agent.png")).unwrap();
+
         h.set_size(egui::vec2(560.0, 860.0));
         for _ in 0..5 {
             h.step();
@@ -790,6 +892,41 @@ mod e2e {
             h.step();
         }
         h.render().unwrap().save(out.join("light.png")).unwrap();
+    }
+
+    /// Offline: an approval card's "Allow once" sends Approve; the engine answers with
+    /// ApprovalResolved and the card goes away.
+    #[test]
+    fn approval_card_buttons_send_commands() {
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        h.state().engine.send(Command::NewConversation);
+        until(&mut h, 10, "bound", |a| a.focused_conversation().is_some());
+        let conv = h.state().focused_conversation().unwrap();
+        h.state_mut()
+            .state
+            .apply(void_core::engine::Event::ApprovalNeeded(
+                void_core::permissions::ApprovalRequest {
+                    id: 42,
+                    conversation: conv,
+                    tool: "bash".into(),
+                    summary: "cargo test".into(),
+                    command: Some("cargo test -p void-core".into()),
+                },
+            ));
+        h.step();
+        h.step();
+        assert!(
+            h.query_by_label_contains("Always allow `cargo test`")
+                .is_some()
+        );
+        h.get_by_label_contains("Allow once").click();
+        until(&mut h, 10, "approval resolved", |a| {
+            a.state.approvals.is_empty()
+        });
     }
 
     fn paths_tmp() -> Paths {

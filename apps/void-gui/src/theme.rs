@@ -16,7 +16,19 @@ pub mod icon {
     pub const CHATS: &str = "\u{E17E}";
     pub const CHECK: &str = "\u{E182}";
     pub const COPY: &str = "\u{E1CA}";
+    pub const CHECK_CIRCLE: &str = "\u{E184}";
     pub const CIRCLE: &str = "\u{E18A}";
+    pub const FILE_TEXT: &str = "\u{E23A}";
+    #[allow(dead_code)] // Review panel (task 9)
+    pub const GIT_DIFF: &str = "\u{E27C}";
+    pub const HAND: &str = "\u{E298}";
+    pub const PROHIBIT: &str = "\u{E3DE}";
+    pub const ROBOT: &str = "\u{E762}";
+    pub const SHIELD_CHECK: &str = "\u{E40C}";
+    #[allow(dead_code)] // sandbox pill (task 9)
+    pub const SHIELD_WARNING: &str = "\u{E412}";
+    pub const TERMINAL: &str = "\u{EAE8}";
+    pub const X_CIRCLE: &str = "\u{E4F8}";
     pub const CPU: &str = "\u{E610}";
     pub const FLOPPY: &str = "\u{E248}";
     pub const FOLDER_OPEN: &str = "\u{E256}";
