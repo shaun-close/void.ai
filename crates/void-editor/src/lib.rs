@@ -11,5 +11,7 @@ mod syntax;
 
 pub use buffer::{Buffer, Edit, LineEnding, Point};
 pub use lang::Lang;
-pub use search::{CaseMode, Query, find_all, find_next, find_prev, replace_all, validate};
+pub use search::{
+    CaseMode, Query, captures_in, find_all, find_next, find_prev, replace_all, validate,
+};
 pub use syntax::{Hl, Span, Symbol, SymbolKind, Syntax, Tree};

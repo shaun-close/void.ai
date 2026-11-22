@@ -91,6 +91,36 @@ pub fn find_all(rope: &Rope, query: &Query, limit: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// The non-overlapping matches that start in char range `within` (its end included), each as its
+/// capture groups (`[0]` is the whole match; `None` for a group that did not take part). A match
+/// may run past `within.end`.
+pub fn captures_in(
+    rope: &Rope,
+    query: &Query,
+    within: Range<usize>,
+) -> Vec<Vec<Option<Range<usize>>>> {
+    let Some(re) = compile(query) else {
+        return Vec::new();
+    };
+    let len = rope.len_chars();
+    let end = rope.char_to_byte(within.end.min(len));
+    let mut input = Input::new(rope);
+    input.set_start(rope.char_to_byte(within.start.min(len)));
+    let mut found = Vec::new();
+    for caps in re.captures_iter(input) {
+        let Some(m) = caps.get_match() else { continue };
+        if m.start() > end {
+            break;
+        }
+        found.push(
+            (0..caps.group_len())
+                .map(|i| caps.get_group(i).map(|span| to_chars(rope, span.range())))
+                .collect(),
+        );
+    }
+    found
+}
+
 /// Replace every match as one undo step and return how many were replaced. In regex mode `with`
 /// may use `$1` / `${name}`; otherwise it is inserted literally.
 pub fn replace_all(buffer: &mut Buffer, query: &Query, with: &str) -> usize {
@@ -341,5 +371,32 @@ mod tests {
             ..q("a+")
         };
         assert_eq!(validate(&ok), Ok(()));
+    }
+
+    #[test]
+    fn captures_in_a_range() {
+        let rope = Rope::from_str("a=1 b=2\nc=3 d=4");
+        let re = Query {
+            regex: true,
+            ..q(r"(\w)=(\d)")
+        };
+        let found = captures_in(&rope, &re, 4..8);
+        assert_eq!(
+            found,
+            vec![
+                vec![Some(4..7), Some(4..5), Some(6..7)],
+                vec![Some(8..11), Some(8..9), Some(10..11)],
+            ],
+            "matches starting inside the range, with groups"
+        );
+        let optional = Query {
+            regex: true,
+            ..q(r"(x)?c")
+        };
+        assert_eq!(
+            captures_in(&rope, &optional, 0..16),
+            vec![vec![Some(8..9), None]]
+        );
+        assert!(captures_in(&rope, &q(""), 0..16).is_empty());
     }
 }

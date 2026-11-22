@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/void-core", "crates/void-editor", "crates/void-sandbox", "apps/void-gui"]
+members = [
+    "crates/void-core",
+    "crates/void-editor",
+    "crates/void-sandbox",
+    "crates/void-vim",
+    "apps/void-gui",
+]
 resolver = "3"
 
 [workspace.package]
@@ -13,3 +19,5 @@ repository = "https://github.com/shaun-close/void.ai"
 [workspace.dependencies]
 void-core = { path = "crates/void-core" }
 void-editor = { path = "crates/void-editor" }
+void-vim = { path = "crates/void-vim" }
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
