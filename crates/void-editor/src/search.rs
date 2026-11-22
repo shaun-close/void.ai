@@ -38,6 +38,15 @@ pub struct Query {
     pub whole_word: bool,
 }
 
+/// Check that `query` is a usable pattern. Only an invalid regex is an error; an empty pattern is
+/// valid (it matches nothing).
+pub fn validate(query: &Query) -> Result<(), String> {
+    if query.pattern.is_empty() {
+        return Ok(());
+    }
+    build(query).map(drop)
+}
+
 /// First match starting at or after char `from`; with `wrap`, falls back to the first match in
 /// the buffer. An invalid regex or an empty pattern matches nothing.
 pub fn find_next(rope: &Rope, query: &Query, from: usize, wrap: bool) -> Option<Range<usize>> {
@@ -135,6 +144,10 @@ fn compile(query: &Query) -> Option<Regex> {
     if query.pattern.is_empty() {
         return None;
     }
+    build(query).ok()
+}
+
+fn build(query: &Query) -> Result<Regex, String> {
     let mut pattern = if query.regex {
         query.pattern.clone()
     } else {
@@ -155,7 +168,7 @@ fn compile(query: &Query) -> Option<Regex> {
                 .multi_line(true),
         )
         .build(&pattern)
-        .ok()
+        .map_err(|e| e.to_string())
 }
 
 /// Whether `pattern` has an uppercase letter the user typed; in regex mode escapes such as `\W`
@@ -313,5 +326,20 @@ mod tests {
         };
         assert!(find_all(&rope, &bad, 10).is_empty());
         assert_eq!(find_next(&rope, &bad, 0, true), None);
+    }
+
+    #[test]
+    fn validate_reports_bad_regex() {
+        let bad = Query {
+            regex: true,
+            ..q("(")
+        };
+        assert!(validate(&bad).is_err_and(|e| !e.is_empty()));
+        assert_eq!(validate(&q("(")), Ok(()));
+        let ok = Query {
+            regex: true,
+            ..q("a+")
+        };
+        assert_eq!(validate(&ok), Ok(()));
     }
 }
