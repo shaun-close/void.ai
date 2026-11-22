@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use crate::config::{BackendKind, Profile};
 use crate::model::{Message, Usage};
 
+pub mod anthropic;
 pub mod openai;
 pub mod sse;
 #[cfg(test)]
@@ -70,21 +71,7 @@ pub trait Backend: Send + Sync {
 pub fn make_backend(profile: &Profile, api_key: Option<String>) -> Arc<dyn Backend> {
     match profile.kind {
         BackendKind::OpenAi => Arc::new(openai::OpenAiBackend::new(profile, api_key)),
-        BackendKind::Anthropic => Arc::new(Unsupported("the Anthropic backend")),
-    }
-}
-
-/// Placeholder for a backend kind that isn't built yet.
-struct Unsupported(&'static str);
-
-impl Backend for Unsupported {
-    fn stream(&self, _req: ChatRequest) -> EventStream {
-        let msg = format!("{} isn't available yet", self.0);
-        stream::iter([Err(BackendError::Protocol(msg))]).boxed()
-    }
-    fn list_models(&self) -> BoxFuture<'static, Result<Vec<String>, BackendError>> {
-        let msg = format!("{} isn't available yet", self.0);
-        Box::pin(async move { Err(BackendError::Protocol(msg)) })
+        BackendKind::Anthropic => Arc::new(anthropic::AnthropicBackend::new(profile, api_key)),
     }
 }
 
