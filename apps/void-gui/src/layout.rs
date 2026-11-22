@@ -14,6 +14,7 @@ pub enum Tab {
     Conversations,
     Backends,
     Settings,
+    Review,
 }
 
 impl Tab {
@@ -23,6 +24,7 @@ impl Tab {
             Tab::Conversations => "conversations",
             Tab::Backends => "backends",
             Tab::Settings => "settings",
+            Tab::Review => "review",
         }
     }
 
@@ -42,7 +44,11 @@ pub fn default_layout() -> DockState<Tab> {
         conversation: None,
     }]);
     let tree = d.main_surface_mut();
-    let [chat, _] = tree.split_right(NodeIndex::root(), 0.72, vec![Tab::Backends, Tab::Settings]);
+    let [chat, _] = tree.split_right(
+        NodeIndex::root(),
+        0.72,
+        vec![Tab::Backends, Tab::Settings, Tab::Review],
+    );
     tree.split_left(chat, 0.3, vec![Tab::Conversations]);
     d
 }
@@ -92,7 +98,7 @@ mod tests {
     fn default_layout_has_all_tabs() {
         assert_eq!(
             kinds(&default_layout()),
-            ["backends", "chat", "conversations", "settings"]
+            ["backends", "chat", "conversations", "review", "settings"]
         );
     }
 

@@ -23,4 +23,5 @@ void-core.workspace = true
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "snapshot", "wgpu"] }
+futures-util = "0.3.34"
 tempfile = "3.27.0"

@@ -48,6 +48,8 @@ pub struct UiState {
     pub sandbox: Option<void_core::sandbox::Availability>,
     pub changes: HashMap<ConversationId, Vec<void_core::overlay::Change>>,
     pub diffs: HashMap<(ConversationId, std::path::PathBuf), Vec<void_core::overlay::Hunk>>,
+    /// Bumped whenever diffs are dropped (so panels know to ask again).
+    pub diffs_epoch: u64,
     /// The first pending changes of a chat ask the app to show Review.
     review_request: bool,
     reviewed: std::collections::HashSet<ConversationId>,
@@ -77,6 +79,7 @@ impl Default for UiState {
             sandbox: None,
             changes: HashMap::new(),
             diffs: HashMap::new(),
+            diffs_epoch: 0,
             review_request: false,
             reviewed: Default::default(),
             layout: None,
@@ -219,6 +222,8 @@ impl UiState {
                     self.review_request = true;
                 }
                 self.changes.insert(conversation, changes);
+                self.diffs.retain(|(c, _), _| *c != conversation);
+                self.diffs_epoch += 1;
             }
             Event::Diff {
                 conversation,
@@ -250,7 +255,6 @@ impl UiState {
         self.layout.take()
     }
 
-    #[allow(dead_code)] // used by the Review panel (milestone 2, task 9)
     pub fn take_review_request(&mut self) -> bool {
         std::mem::take(&mut self.review_request)
     }
@@ -475,5 +479,23 @@ mod tests {
         });
         assert!(!s.take_review_request(), "only the first time");
         assert_eq!(s.changes[&id].len(), 1);
+    }
+
+    #[test]
+    fn changes_drop_stale_diffs() {
+        let mut s = UiState::default();
+        let id = void_core::model::ConversationId::new();
+        s.apply(Event::Diff {
+            conversation: id,
+            path: "a".into(),
+            hunks: vec![],
+        });
+        let epoch = s.diffs_epoch;
+        s.apply(Event::Changes {
+            conversation: id,
+            changes: vec![],
+        });
+        assert!(s.diffs.is_empty());
+        assert!(s.diffs_epoch > epoch);
     }
 }

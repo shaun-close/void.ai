@@ -34,6 +34,7 @@ pub struct VoidApp {
     list: crate::panels::conversations::ListUi,
     backends: crate::panels::backends::BackendsUi,
     md: egui_commonmark::CommonMarkCache,
+    review: crate::panels::review::ReviewUi,
     /// A first message waiting for the conversation it asked the engine to create.
     pending_start: Option<(u32, String)>,
 }
@@ -45,14 +46,25 @@ impl VoidApp {
         config_path: PathBuf,
         data_dir: PathBuf,
     ) -> Self {
+        Self::with_factory(cc, open, config_path, data_dir, None)
+    }
+
+    /// `factory` replaces the real backends (tests).
+    pub fn with_factory(
+        cc: &eframe::CreationContext<'_>,
+        open: Option<PathBuf>,
+        config_path: PathBuf,
+        data_dir: PathBuf,
+        factory: Option<void_core::engine::BackendFactory>,
+    ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let store = Store::new(data_dir);
         let ctx = cc.egui_ctx.clone();
-        let engine = Engine::start(
-            config_path,
-            store.clone(),
-            Arc::new(move || ctx.request_repaint()),
-        );
+        let notify: void_core::engine::Notify = Arc::new(move || ctx.request_repaint());
+        let engine = match factory {
+            Some(f) => Engine::start_with(config_path, store.clone(), notify, f),
+            None => Engine::start(config_path, store.clone(), notify),
+        };
         if let Some(p) = open {
             engine.send(Command::OpenWorkspace(Some(p)));
         }
@@ -72,6 +84,7 @@ impl VoidApp {
             list: Default::default(),
             backends: Default::default(),
             md: Default::default(),
+            review: Default::default(),
             pending_start: None,
         }
     }
@@ -116,6 +129,9 @@ impl VoidApp {
                     *conversation = None;
                 }
             }
+        }
+        if self.state.take_review_request() {
+            layout::ensure_tab(&mut self.dock, Tab::Review);
         }
         if let Some(id) = self.state.take_created() {
             match self.pending_start.take() {
@@ -333,6 +349,7 @@ impl VoidApp {
                     (theme::itext(icon::CHATS, "Chats"), Tab::Conversations),
                     (theme::itext(icon::PLUGS, "Backends"), Tab::Backends),
                     (theme::itext(icon::GEAR, "Settings"), Tab::Settings),
+                    (theme::itext(icon::GIT_DIFF, "Review"), Tab::Review),
                 ] {
                     if ui.button(label).clicked() {
                         layout::ensure_tab(&mut self.dock, tab);
@@ -408,6 +425,41 @@ impl VoidApp {
             }
             if let Some(tps) = self.state.last_tps {
                 theme::pill(ui, icon::LIGHTNING, format!("{tps:.1} tok/s"), pal.warn);
+            }
+            let pending = conv
+                .and_then(|c| self.state.changes.get(&c))
+                .map_or(0, Vec::len);
+            if pending > 0
+                && theme::pill(ui, icon::GIT_DIFF, format!("{pending} pending"), pal.accent)
+                    .interact(egui::Sense::click())
+                    .on_hover_text("Open Review")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            {
+                layout::ensure_tab(&mut self.dock, Tab::Review);
+            }
+            if self.state.workspace.root.is_some() {
+                match &self.state.sandbox {
+                    Some(void_core::sandbox::Availability::Ready { landlock: true }) => {
+                        theme::pill(ui, icon::SHIELD_CHECK, "sandboxed", pal.ok).on_hover_text(
+                            "bash runs in bubblewrap + Landlock: the rest of the disk is read-only",
+                        );
+                    }
+                    Some(void_core::sandbox::Availability::Ready { landlock: false }) => {
+                        theme::pill(
+                            ui,
+                            icon::SHIELD_WARNING,
+                            "sandboxed (no landlock)",
+                            pal.warn,
+                        )
+                        .on_hover_text("bash runs in bubblewrap; the Landlock helper isn't active");
+                    }
+                    Some(void_core::sandbox::Availability::Unavailable(why)) => {
+                        theme::pill(ui, icon::SHIELD_WARNING, "no sandbox", pal.err)
+                            .on_hover_text(format!("bash is unavailable: {why}"));
+                    }
+                    None => {}
+                }
             }
             if let (Some(c), Some(p)) = (
                 conv.and_then(|c| self.state.loaded.get(&c)),
@@ -506,6 +558,7 @@ impl VoidApp {
             list: &mut self.list,
             backends: &mut self.backends,
             md: &mut self.md,
+            review: &mut self.review,
             focused,
         };
         DockArea::new(&mut self.dock)
@@ -844,6 +897,25 @@ mod e2e {
             }],
         ));
         store.save(&ac).unwrap();
+        std::fs::create_dir_all(proj.join("src/backend")).unwrap();
+        let sse: String = (1..=30).map(|i| format!("    line {i};\n")).collect();
+        std::fs::write(proj.join("src/backend/sse.rs"), &sse).unwrap();
+        let ov =
+            void_core::overlay::Overlay::open(&store.overlay_dir(&wsp.id, &ac.id), &proj).unwrap();
+        ov.write(
+            std::path::Path::new("src/backend/sse.rs"),
+            sse.replace(
+                "    line 4;\n",
+                "    if self.after_cr && b == b'\\n' {\n        continue;\n    }\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        ov.write(
+            std::path::Path::new("tests/chunking.rs"),
+            b"#[test]\nfn split_crlf() {}\n",
+        )
+        .unwrap();
         h.state_mut().open_workspace(Some(proj.clone()));
         until(&mut h, 10, "proj", |a| a.state.workspace.name == "proj");
         let aid = ac.id;
@@ -879,6 +951,14 @@ mod e2e {
             h.step();
         }
         h.render().unwrap().save(out.join("agent.png")).unwrap();
+
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Review);
+        h.state_mut().review.selected = Some("src/backend/sse.rs".into());
+        until(&mut h, 10, "diff", |a| !a.state.diffs.is_empty());
+        for _ in 0..4 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("review.png")).unwrap();
 
         h.set_size(egui::vec2(560.0, 860.0));
         for _ in 0..5 {
@@ -927,6 +1007,87 @@ mod e2e {
         until(&mut h, 10, "approval resolved", |a| {
             a.state.approvals.is_empty()
         });
+    }
+
+    /// A model that replies with the next scripted stream on each request.
+    struct Scripted(
+        std::sync::Mutex<std::collections::VecDeque<Vec<void_core::backend::StreamEvent>>>,
+    );
+
+    impl void_core::backend::Backend for Scripted {
+        fn stream(&self, _req: void_core::backend::ChatRequest) -> void_core::backend::EventStream {
+            use futures_util::StreamExt;
+            let mut q = self.0.lock().unwrap();
+            let s = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap_or_default()
+            };
+            futures_util::stream::iter(s.into_iter().map(Ok)).boxed()
+        }
+        fn list_models(
+            &self,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<Vec<String>, void_core::backend::BackendError>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    /// Offline: an agent write shows up in Review (opened automatically) and "Accept file"
+    /// puts it in the real workspace.
+    #[test]
+    fn review_accept_file_updates_workspace() {
+        use void_core::backend::{StopReason, StreamEvent};
+        let p = paths_tmp();
+        let proj = p.root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let scripts = vec![
+            vec![
+                StreamEvent::ToolCall {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    arguments: r#"{"path":"notes.txt","content":"banana"}"#.into(),
+                },
+                StreamEvent::Done(StopReason::ToolUse),
+            ],
+            vec![
+                StreamEvent::TextDelta("written".into()),
+                StreamEvent::Done(StopReason::EndTurn),
+            ],
+        ];
+        let backend: Arc<dyn void_core::backend::Backend> =
+            Arc::new(Scripted(std::sync::Mutex::new(scripts.into())));
+        let factory: void_core::engine::BackendFactory = Arc::new(move |_p, _k| backend.clone());
+        let (cfg, data) = (p.root.join("config.toml"), p.root.join("data"));
+        let open = Some(proj.clone());
+        let mut h = Harness::builder()
+            .with_size([1400.0, 860.0])
+            .with_max_steps(10)
+            .with_accessibility_check(false)
+            .build_eframe(move |cc| VoidApp::with_factory(cc, open, cfg, data, Some(factory)));
+        until(&mut h, 10, "proj", |a| a.state.workspace.name == "proj");
+        type_and_send(&mut h, "write the notes");
+        until(&mut h, 10, "changes", |a| {
+            a.state.changes.values().any(|c| !c.is_empty())
+        });
+        until(&mut h, 10, "reply", |a| a.state.streams.is_empty());
+        h.step();
+        assert!(h.state().dock.find_tab(&Tab::Review).is_some());
+        assert!(
+            !proj.join("notes.txt").exists(),
+            "nothing on disk before accepting"
+        );
+        h.get_by_role_and_label(Role::Button, "notes.txt").click();
+        until(&mut h, 10, "diff", |a| !a.state.diffs.is_empty());
+        h.step();
+        h.get_by_label_contains("Accept file").click();
+        until(&mut h, 10, "accepted", |_| proj.join("notes.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(proj.join("notes.txt")).unwrap(),
+            "banana"
+        );
     }
 
     fn paths_tmp() -> Paths {

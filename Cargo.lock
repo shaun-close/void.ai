@@ -4723,6 +4723,7 @@ dependencies = [
  "egui_commonmark",
  "egui_dock",
  "egui_kittest",
+ "futures-util",
  "rfd",
  "ron",
  "serde",

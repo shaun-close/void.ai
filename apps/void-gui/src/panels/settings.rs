@@ -70,6 +70,34 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
             });
             ui.add_space(6.0);
             theme::card(ui, |ui| {
+                ui.label(RichText::new("Sandbox").color(pal.text_dim).small());
+                ui.checkbox(
+                    &mut c.sandbox.network,
+                    "Let sandboxed commands use the network",
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Hidden from the agent: {}",
+                        c.sandbox.hidden.join(", ")
+                    ))
+                    .small()
+                    .color(pal.text_faint),
+                );
+                ui.label(
+                    RichText::new("Edit the hidden, expose and cache lists in config.toml.")
+                        .small()
+                        .color(pal.text_faint),
+                );
+                if ui
+                    .button(theme::itext(icon::TRASH, "Clear sandbox caches"))
+                    .clicked()
+                {
+                    p.engine
+                        .send(void_core::engine::Command::ClearSandboxCaches);
+                }
+            });
+            ui.add_space(6.0);
+            theme::card(ui, |ui| {
                 ui.label(
                     RichText::new("Base system prompt")
                         .color(pal.text_dim)

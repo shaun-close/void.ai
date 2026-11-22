@@ -10,6 +10,7 @@ use void_core::model::ConversationId;
 pub mod backends;
 pub mod chat;
 pub mod conversations;
+pub mod review;
 pub mod settings;
 
 use void_core::engine::Command;
@@ -52,6 +53,7 @@ pub struct Panels<'a> {
     pub list: &'a mut conversations::ListUi,
     pub backends: &'a mut backends::BackendsUi,
     pub md: &'a mut egui_commonmark::CommonMarkCache,
+    pub review: &'a mut review::ReviewUi,
     /// The conversation in the focused Chat tab (highlighted in the list).
     pub focused: Option<ConversationId>,
 }
@@ -87,6 +89,17 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Conversations => theme::itext(icon::CHATS, "Chats"),
             Tab::Backends => theme::itext(icon::PLUGS, "Backends"),
             Tab::Settings => theme::itext(icon::GEAR, "Settings"),
+            Tab::Review => {
+                let n = self
+                    .focused
+                    .and_then(|c| self.state.changes.get(&c))
+                    .map_or(0, Vec::len);
+                if n > 0 {
+                    theme::itext(icon::GIT_DIFF, &format!("Review · {n}"))
+                } else {
+                    theme::itext(icon::GIT_DIFF, "Review")
+                }
+            }
         }
     }
 
@@ -104,6 +117,7 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Conversations => conversations::show(ui, self),
             Tab::Backends => backends::show(ui, self),
             Tab::Settings => settings::show(ui, self),
+            Tab::Review => review::show(ui, self),
         }
     }
 }
