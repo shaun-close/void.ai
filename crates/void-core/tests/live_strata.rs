@@ -78,3 +78,52 @@ async fn live_strata_lists_models() {
         "got {models:?}"
     );
 }
+
+async fn tool_call(id: &str) {
+    let (profile, b) = backend_for(id).await;
+    let req = ChatRequest {
+        model: profile.model.clone(),
+        system: "You are a coding agent. Use tools to answer.".into(),
+        messages: vec![Message::user(
+            "Use the read tool to read hello.txt and tell me what it says.",
+        )],
+        max_output: 2048,
+        extra_body: profile.extra_body.clone(),
+        tools: vec![void_core::backend::ToolSpec {
+            name: "read".into(),
+            description: "Read a text file from the workspace.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        }],
+    };
+    let events: Vec<StreamEvent> = b
+        .stream(req)
+        .map(|r| r.expect("stream error"))
+        .collect()
+        .await;
+    let call = events.iter().find_map(|e| match e {
+        StreamEvent::ToolCall {
+            name, arguments, ..
+        } => Some((name.clone(), arguments.clone())),
+        _ => None,
+    });
+    println!("{id}: {call:?}");
+    let (name, args) = call.expect("no tool call");
+    assert_eq!(name, "read");
+    assert!(args.contains("hello.txt"), "{args}");
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Done(void_core::backend::StopReason::ToolUse))
+    ));
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_strata_openai_tool_call() {
+    tool_call("strata").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_strata_anthropic_tool_call() {
+    tool_call("strata-anthropic").await;
+}

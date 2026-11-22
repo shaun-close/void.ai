@@ -1225,4 +1225,89 @@ mod e2e {
             "scratch layout restored"
         );
     }
+
+    /// Live: the real model writes a file and cats it through the sandbox; the write waits in
+    /// Review and lands on disk only after Accept all.
+    #[test]
+    #[ignore]
+    fn e2e_agent_with_strata() {
+        let p = paths();
+        let proj = p.root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("hello.txt"), "pineapple\n").unwrap();
+        let mut h = harness(&p);
+        until(&mut h, 10, "start", |a| a.state.sandbox.is_some());
+        println!("sandbox: {:?}", h.state().state.sandbox);
+        h.state_mut().open_workspace(Some(proj.clone()));
+        until(&mut h, 10, "proj", |a| a.state.workspace.name == "proj");
+        type_and_send(
+            &mut h,
+            "Create notes.txt containing just the word banana using the write tool, then run `cat notes.txt` with the bash tool. Then stop.",
+        );
+        // Approve each bash call the model makes (and anything else it asks for).
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            h.step();
+            if let Some(req) = h.state().state.approvals.first().cloned() {
+                println!("approving {} {:?}", req.tool, req.command);
+                h.state().engine.send(Command::Approve {
+                    id: req.id,
+                    decision: void_core::permissions::Decision::Once,
+                });
+            }
+            let a = h.state();
+            let busy = !a.state.streams.is_empty()
+                || !a.state.approvals.is_empty()
+                || a.state.tool_calls.values().any(|t| t.done.is_none());
+            let bash_done = a.state.tool_calls.values().any(|t| {
+                t.done
+                    .as_ref()
+                    .is_some_and(|o| o.content.contains("banana"))
+            });
+            if bash_done && !busy {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out; tool calls: {:?}",
+                a.state.tool_calls.keys().collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        for t in h.state().state.tool_calls.values() {
+            println!(
+                "tool: {} → {}",
+                t.summary,
+                t.done
+                    .as_ref()
+                    .map(|o| o.content.lines().take(3).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default()
+            );
+        }
+        assert!(
+            !proj.join("notes.txt").exists(),
+            "nothing on disk before review"
+        );
+        let conv = h.state().focused_conversation().unwrap();
+        until(&mut h, 10, "changes", |a| {
+            a.state.changes.get(&conv).is_some_and(|c| {
+                c.iter()
+                    .any(|x| x.path == std::path::Path::new("notes.txt"))
+            })
+        });
+        assert!(h.state().dock.find_tab(&Tab::Review).is_some());
+        h.step();
+        h.get_by_label_contains("Accept all").click();
+        until(&mut h, 10, "accepted", |_| proj.join("notes.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(proj.join("notes.txt"))
+                .unwrap()
+                .trim(),
+            "banana"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("hello.txt")).unwrap(),
+            "pineapple\n"
+        );
+    }
 }
