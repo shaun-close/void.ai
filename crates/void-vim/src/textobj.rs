@@ -36,7 +36,8 @@ fn word(r: &Rope, cur: usize, n: usize, inner: bool, big: bool) -> Option<Region
     let line = line_of(r, cur);
     let end = line_end(r, line);
     if cur >= end {
-        return None;
+        // An empty line: an empty object, so `ciw` still starts Insert mode.
+        return Some(Region::Chars(cur..cur));
     }
     let blank_at = |p: usize| p < end && class(r.char(p), big) == 0;
     let (s, mut e) = run(r, cur, big);
@@ -115,12 +116,17 @@ fn block(r: &Rope, cur: usize, n: usize, inner: bool, open: char, close: char) -
         && s <= close_bol
         && (close_bol..end).all(|p| is_blank(r.char(p)))
     {
-        // The block's inner lines, whole (`:help i{`).
         let first = line_of(r, s);
         if first >= close_line {
             return Some(Region::Chars(s..s));
         }
-        return Some(Region::Lines(first, close_line - 1));
+        // The closing bracket's indent is left out. When the inner text starts at or before the
+        // first non-blank of its line, it is whole lines (`:help i{`, like `:help exclusive`);
+        // otherwise it ends at the end of the line before the closing bracket.
+        if s <= line_start(r, first) + indent_len(r, first) {
+            return Some(Region::Lines(first, close_line - 1));
+        }
+        return Some(Region::Chars(s..line_end(r, close_line - 1)));
     }
     Some(Region::Chars(s.min(end)..end))
 }

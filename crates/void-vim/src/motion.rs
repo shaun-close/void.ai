@@ -174,7 +174,9 @@ impl Engine {
                 } else {
                     line_last(r, line)
                 };
-                (cur < end).then_some(())?;
+                // With an operator, `l` at the end of the line covers nothing rather than
+                // failing, so `x` / `s` on an empty line do not stop a macro.
+                (op || cur < end).then_some(())?;
                 Reach::new((cur + n).min(end), Kind::Exclusive)
             }
             Motion::BackWrap | Motion::ForwardWrap => {

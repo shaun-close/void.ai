@@ -1214,3 +1214,50 @@ fn vim_macro_with_search_and_put_register() {
     feed(&mut e, &mut h, "0dT ");
     assert_eq!(h.text(), "onee", "T to nothing fails");
 }
+
+#[test]
+fn vim_inner_block_keeps_opening_line() {
+    let (mut e, mut h) = vim("let o = { a: 1,\n  b: 2,\n};");
+    h.set_cursor(1, 2);
+    feed(&mut e, &mut h, "di{");
+    assert_eq!(
+        h.text(),
+        "let o = {\n};",
+        "text after {{ stays outside, the opening line stays"
+    );
+    let (mut e, mut h) = vim("f(a,\n  b\n)");
+    h.set_cursor(1, 2);
+    feed(&mut e, &mut h, "ci(x<Esc>");
+    assert_eq!(h.text(), "f(x\n)");
+    // A brace that ends its line still makes the inner lines linewise.
+    let (mut e, mut h) = vim("if x {\n  a;\n}");
+    h.set_cursor(1, 2);
+    feed(&mut e, &mut h, "di{");
+    assert_eq!(h.text(), "if x {\n}");
+}
+
+#[test]
+fn vim_empty_line_operators() {
+    for keys in ["s", "cl", "ciw"] {
+        let (mut e, mut h) = vim("ab\n\ncd");
+        h.set_cursor(1, 0);
+        feed(&mut e, &mut h, keys);
+        assert_eq!(e.state().mode, Mode::Insert, "{keys} on an empty line");
+        feed(&mut e, &mut h, "x<Esc>");
+        assert_eq!(h.text(), "ab\nx\ncd", "{keys}");
+    }
+    for keys in ["x", "dl", "diw"] {
+        let (mut e, mut h) = vim("ab\n\ncd");
+        h.set_cursor(1, 0);
+        feed(&mut e, &mut h, keys);
+        assert_eq!(h.text(), "ab\n\ncd", "{keys} on an empty line does nothing");
+        assert_eq!(e.state().mode, Mode::Normal);
+    }
+}
+
+#[test]
+fn vim_macro_survives_empty_line() {
+    let (mut e, mut h) = vim("ab\n\ncd\nef\ngh");
+    feed(&mut e, &mut h, "qaxjq5@a");
+    assert_eq!(h.text(), "b\n\nd\nf\nh");
+}
