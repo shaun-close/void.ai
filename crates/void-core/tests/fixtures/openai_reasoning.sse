@@ -1,0 +1,16 @@
+data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user wants"},"finish_reason":null}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" a greeting — ok."},"finish_reason":null}]}
+
+: ping
+
+data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" there."},"finish_reason":null}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":11,"total_tokens":41}}
+
+data: [DONE]
+

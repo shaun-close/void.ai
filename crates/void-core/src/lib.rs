@@ -1,5 +1,6 @@
 //! void.ai core: the UI-agnostic harness (backends, conversations, context, storage, engine).
 
+pub mod backend;
 pub mod config;
 pub mod fsutil;
 pub mod model;
