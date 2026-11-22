@@ -795,7 +795,10 @@ impl Overlay {
             fs::remove_file(&up)?;
         }
         self.clear_base(rel);
-        self.note(format!("The user rejected your changes to {}", rel.display()))
+        self.note(format!(
+            "The user rejected your changes to {}",
+            rel.display()
+        ))
     }
 
     /// Apply one hunk to the real file.
