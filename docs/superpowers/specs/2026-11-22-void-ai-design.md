@@ -5,7 +5,7 @@ Status: approved by the user (2026-11-22).
 ## Intent
 
 void.ai is the user's own AI coding assistant, built as an **AI-first IDE and editor**. Existing tools (opencode, IDE
-plugins) aren't to his taste. He works in JetBrains IDEs with IdeaVim today, so Vim emulation is a must (macros and
+plugins) aren't to their taste. They work in JetBrains IDEs with IdeaVim today, so Vim emulation is a must (macros and
 movement matter most; gaps are acceptable). It should be **modular**: panels, backends, tools and agent behaviour plug
 into a core instead of being wired into the app. Modular means **compile-time** (decided): Rust traits and
 registries, with new backends, tools and panels added as code in this workspace, and agent profiles and prompts in
@@ -66,10 +66,9 @@ llama.cpp `llama-server` and Ollama, with hosted Anthropic-style APIs possible l
 | GPUI (Zed) 0.2 | Best text rendering; no docking (would have to be built); young, churning API. | Rejected. |
 | iced, floem | No docking; layout-centric style. | Dropped early. |
 
-Vim: **own editor + Vim engine in Rust**, porting the design (and tests) of the reference editor's DOM-free Vim engine
-(`a private reference editor`, 1,253 lines; host interface + key strings), then filling
-its gaps (marks, visual-block, jump list). Embedding Neovim was rejected by the user. The user suggested reusing the reference editor's
-code; it's a a private project repo and he has said it's fine to draw on.
+Vim: **own editor + Vim engine in Rust**, written clean-room from Vim's documented behaviour behind a host
+interface, including marks, visual-block and the jump list. Embedding Neovim was rejected by the user. Because
+void.ai is open source, no code or tests are taken from other editors.
 
 ## Decided
 
@@ -102,8 +101,8 @@ code; it's a a private project repo and he has said it's fine to draw on.
   keeps repos clean; can be revisited).
   A profile's API key is either the key, an environment variable name, or a command whose stdout is the key (e.g.
   `strata launch --show-key --preset daily`).
-- **Location:** `~/Projects/void.ai`, a new git repo. **Private, no licence** (decided). Because it's private, the
-  Vim port may follow the reference editor's design and tests closely.
+- **Location:** `~/Projects/void.ai`, a git repo published at github.com/shaun-close/void.ai under
+  **MIT OR Apache-2.0** (originally private; changed before the first push).
 
 ## Architecture
 

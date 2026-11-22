@@ -4,15 +4,15 @@ Status: approved by the user (2026-11-23). Builds on milestones 1–2.
 
 ## Intent
 
-The user wants void.ai to become his **daily IDE, replacing JetBrains** (he uses RustRover, WebStorm, IDEA… with
+The user wants void.ai to become their **daily IDE, replacing JetBrains** (they use RustRover, WebStorm, IDEA… with
 IdeaVim). Milestone 3 lays the foundation for that: an editor that feels right with Vim keys and stays fast, plus the
-two features he named as "first hour" needs that don't depend on a language server:
+two features they named as "first hour" needs that don't depend on a language server:
 
 - the **Shift+Shift palette** (Search Everywhere), and
-- **run configurations**, rebuilt around moon (which he always uses) because JetBrains' run configs end up as a long,
-  badly organised list. He wants **task chains**, **groups**, and an **environment switcher** (named sets of env vars).
+- **run configurations**, rebuilt around moon (which they always use) because JetBrains' run configs end up as a long,
+  badly organised list. They want **task chains**, **groups**, and an **environment switcher** (named sets of env vars).
 
-Jump to definition and find usages (his other two) come in milestone 4 with LSP.
+Jump to definition and find usages (their other two) come in milestone 4 with LSP.
 
 ## Roadmap (agreed order)
 
@@ -37,8 +37,8 @@ Jump to definition and find usages (his other two) come in milestone 4 with LSP.
      open read-only with a notice);
    - files changed on disk (by another program or by accepting agent changes) reload automatically when the buffer
      has no unsaved edits, otherwise a banner offers Reload / Keep mine.
-2. **Vim emulation** ported from the reference editor's engine (`a private reference editor`, its 10
-   tests ported too) behind a `VimHost` trait, then extended with **marks** (`m`, `'`, `` ` ``), **visual-block**
+2. **Vim emulation**, a clean-room engine written from Vim's documented behaviour (`:help`), behind a `VimHost`
+   trait — no code or tests copied from other editors — with **marks** (`m`, `'`, `` ` ``), **visual-block**
    (Ctrl+V), a **jump list** (Ctrl+O / Ctrl+I), and ex commands for tabs (`:e`, `:q`, `:wa`, `:qa`). Macros and
    motions must be solid — they're what the user uses most. The system clipboard backs the `+`/`*` registers. A setting
    turns Vim off (plain editing) for anyone else.
@@ -67,7 +67,7 @@ Jump to definition and find usages (his other two) come in milestone 4 with LSP.
    - **Runs**: each run gets a dockable output panel with live output (ANSI colours rendered), the exit status and
      duration; `path:line:col` locations (rustc, tsc, generic) are clickable and open the file there. Stop, Re-run,
      and **Re-run last** (a global key). Several runs can go at once.
-   - The user's runs are **not sandboxed** — they're his, like a terminal.
+   - The user's runs are **not sandboxed** — they're theirs, like a terminal.
 7. **Environment profiles**: named sets of variables per workspace (e.g. dev, staging), one active at a time, shown in
    the status bar and switched from it or the palette. A value is literal, from an environment variable, or the output
    of a command (like API keys), so secrets needn't sit in a file. Profiles apply to runs (and the terminal in M5),
@@ -101,7 +101,7 @@ Jump to definition and find usages (his other two) come in milestone 4 with LSP.
 
 | Option | Trade-offs | Outcome |
 |---|---|---|
-| **A. Own editor**: ropey buffer, custom egui drawing of visible lines, tree-sitter highlighting (syntect fallback), Vim engine ported from the reference editor | Full control of Vim feel, speed and agent integration; we build every editing feature ourselves | **Chosen by the user** |
+| **A. Own editor**: ropey buffer, custom egui drawing of visible lines, tree-sitter highlighting (syntect fallback), clean-room Vim engine | Full control of Vim feel, speed and agent integration; we build every editing feature ourselves | **Chosen by the user** |
 | B. Reuse Helix's internals (buffers, syntax, LSP client) | Saves work (especially LSP); Helix crates are git-only (placeholders on crates.io), unstable API, and a selection-first model that fights Vim | Rejected |
 | C. egui's text-box-based code editor widget (`egui_code_editor`) | Quick start; no large-file performance, no Vim, a ceiling for an IDE | Rejected |
 
@@ -120,7 +120,7 @@ crates/
   void-editor/     NEW, UI-agnostic: Buffer (ropey), edits + undo/redo (grouped), selections, line endings,
                    tree-sitter syntax (incremental parse, highlight spans per visible range, outline symbols),
                    search, file load/save/watch, Disk vs Overlay backing
-  void-vim/        NEW, UI-agnostic: Vim engine over a VimHost trait (port of the reference editor + marks, visual-block, jumps)
+  void-vim/        NEW, UI-agnostic: Vim engine over a VimHost trait (clean-room, from Vim's docs; marks, visual-block, jumps)
 apps/void-gui/
   panels/editor.rs        editor tab: drawing, input → Vim/plain, status line, banners, view switch
   panels/files.rs         file tree
@@ -132,7 +132,7 @@ apps/void-gui/
 - **Buffers** are owned by the GUI-side `Workspace` editor state (one per path per view), shared by tabs on the same
   file and view. The engine (void-core) stays the owner of conversations; overlays are opened through `Store`.
 - **Vim host**: `void-vim` asks its host for text, selection, edits, undo, scrolling, prompts (ex / search), and
-  clipboard — the `VimHost` interface from the reference editor, in Rust. `void-editor`'s buffer implements it; the GUI feeds keys.
+  clipboard — the `VimHost` interface. `void-editor`'s buffer implements it; the GUI feeds keys.
 - **Highlighting**: tree-sitter grammars as crates (`tree-sitter-rust`, `-typescript`, …) with their `highlights.scm`
   queries; parse incrementally on edit; highlight only visible lines; theme colours from the void palette.
 - **Runner**: `moon query tasks` (JSON) for discovery; runs via `tokio::process` in the engine runtime with the active
@@ -143,7 +143,7 @@ apps/void-gui/
 ## Done means (M3)
 
 1. Open a 100 000-line Rust file from the tree: appears in < 200 ms, highlighted; scrolling and typing stay smooth.
-2. Vim: the reference editor's 10 tests pass on the port, plus tests for marks, visual-block, jumps, macros over several lines,
+2. Vim: tests for the core behaviours (motions, operators, registers, search, ex), plus marks, visual-block, jumps, macros over several lines,
    counts with operators and text objects, dot-repeat. Editing a real file with Vim keys and `:w` works.
 3. A tab switches between Disk and a chat's view; saving in a chat view shows the change in Review; the Disk tab of a
    file with pending changes shows the banner.
@@ -165,7 +165,7 @@ apps/void-gui/
   shortly after (target: under ~1 s for 100 000 lines / a few MB). The bar is a 100 000-line Rust file.
 - **moon discovery:** `moon query tasks` prints JSON already in moon 2.5.0 (no `--json` flag; checked).
 
-- **Ctrl keys belong to Vim** in the editor when Vim is on (chosen by the user, knowingly departing from his IdeaVim
+- **Ctrl keys belong to Vim** in the editor when Vim is on (chosen by the user, knowingly departing from their IdeaVim
   setup, which gives all 43 to the IDE): Ctrl+V visual-block, Ctrl+R redo, Ctrl+D/U/F/B/E/Y scrolling, Ctrl+O/I
   jumps, Ctrl+A/X increment/decrement, Ctrl+W window-free (no-op), Ctrl+[ as Esc, Ctrl+C as cancel. App shortcuts
   that don't clash with Vim stay global: Shift+Shift and Ctrl+Shift+P (palette), Ctrl+S (save), Ctrl+Shift+C /

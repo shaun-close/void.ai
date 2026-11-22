@@ -6,3 +6,23 @@
 .DS_Store
 *.swp
 *.swo
+
+# Local secrets and credentials — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.bundle
+secrets.toml
+credentials.json
+
+# Editor and agent state
+/.claude/
+.idea/
+.vscode/
+*.log

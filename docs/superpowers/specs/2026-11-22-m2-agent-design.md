@@ -6,8 +6,8 @@ Status: approved by the user (2026-11-22). Builds on `2026-11-22-void-ai-design.
 
 Milestone 2 turns void.ai from a chat into the user's coding agent. The agent reads the project, edits files and runs commands, in the spirit of opencode. Two things matter to the user beyond "it works":
 
-- **He reviews changes in a panel, not in a stream of prompts.** Edits pile up as pending changes he accepts or rejects, per file or per hunk, while the agent keeps going.
-- **The protection is robust, not best-effort.** A confused model must not be able to `rm -rf` his disk, whatever it types. Later he wants an *auto mode*, where a second model audits each action instead of him. Milestone 2 doesn't build auto mode, but it must leave a clean slot for it.
+- **They review changes in a panel, not in a stream of prompts.** Edits pile up as pending changes they accept or rejects, per file or per hunk, while the agent keeps going.
+- **The protection is robust, not best-effort.** A confused model must not be able to `rm -rf` their disk, whatever it types. Later they want an *auto mode*, where a second model audits each action instead of them. Milestone 2 doesn't build auto mode, but it must leave a clean slot for it.
 
 ## Goals
 
@@ -227,7 +227,7 @@ bwrap --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts
   - **Accepted consequence:** in the sandbox, the agent can't use docker/podman, the keyring, gh's stored login, or git over SSH. Pushing and publishing stay with the user. The hidden list is configurable, with an "expose" list for deliberate exceptions.
 - **`.git`:** the workspace's real `.git` is bind-mounted **read-only** over the overlay (`--ro-bind <ws>/.git <ws>/.git`).
   - The agent can run `git status`, `git diff` and `git log`. Commands that write fail, and the agent's prompt says so.
-  - `.git` never shows up in review. Committing is the user's job after he accepts.
+  - `.git` never shows up in review. Committing is the user's job after they accept.
 - **File tools** (read, list, glob, grep, edit, write) **refuse any path outside the workspace**, including symlinks whose target is outside, and they honour the hidden list. This replaces both the milestone 1 "ask first" rule and the milestone 2 "allowed for read" rule.
 - **Build output:**
   - In the sandbox, `CARGO_TARGET_DIR` points to a read-write **per-workspace** `sandbox-target/` under the void.ai data directory. It's shared by that workspace's chats (cargo's lock serialises builds) and stays warm across chats.
