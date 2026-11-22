@@ -1,0 +1,8 @@
+/target/
+/.moon/cache/
+/.moon/docker/
+/.moon/workspace-graph.*
+/.superpowers/
+.DS_Store
+*.swp
+*.swo
