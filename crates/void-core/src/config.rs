@@ -149,7 +149,6 @@ pub struct Config {
     pub profiles: Vec<Profile>,
 }
 
-const STRATA_KEY_CMD: &str = "strata launch --show-key --preset daily";
 const STRATA_MODEL: &str = "qwen3.8-flash-next-iq3_xxs";
 
 impl Default for Config {
@@ -183,7 +182,7 @@ impl Default for Config {
                     name: "Strata (OpenAI)".into(),
                     kind: BackendKind::OpenAi,
                     base_url: "http://127.0.0.1:8080/v1".into(),
-                    api_key: ApiKeySource::Command(STRATA_KEY_CMD.into()),
+                    api_key: ApiKeySource::None,
                     model: STRATA_MODEL.into(),
                     context_limit: 262144,
                     max_output: 32768,
@@ -194,7 +193,7 @@ impl Default for Config {
                     name: "Strata (Anthropic)".into(),
                     kind: BackendKind::Anthropic,
                     base_url: "http://127.0.0.1:8080".into(),
-                    api_key: ApiKeySource::Command(STRATA_KEY_CMD.into()),
+                    api_key: ApiKeySource::None,
                     model: STRATA_MODEL.into(),
                     context_limit: 262144,
                     max_output: 32768,
@@ -339,10 +338,8 @@ mod tests {
         assert_eq!(p.model, "qwen3.8-flash-next-iq3_xxs");
         assert_eq!(p.context_limit, 262144);
         assert_eq!(p.max_output, 32768);
-        assert_eq!(
-            p.api_key,
-            ApiKeySource::Command("strata launch --show-key --preset daily".into())
-        );
+        // The daily preset serves this computer only and has no key.
+        assert_eq!(p.api_key, ApiKeySource::None);
         assert_eq!(
             p.extra_body["chat_template_kwargs"]["enable_thinking"],
             true
@@ -359,7 +356,9 @@ mod tests {
 
     #[test]
     fn key_fields_serialize_as_optional_profile_fields() {
-        let s = toml::to_string(&Config::default()).unwrap();
+        let mut c = Config::default();
+        c.profiles[0].api_key = ApiKeySource::Command("strata launch --show-key --preset daily".into());
+        let s = toml::to_string(&c).unwrap();
         assert!(s.contains("api_key_cmd = \"strata launch --show-key --preset daily\""));
         let bad = r#"
             id = "x"
