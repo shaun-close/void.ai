@@ -2,6 +2,7 @@ mod app;
 mod layout;
 mod panels;
 mod state;
+mod theme;
 
 use std::path::PathBuf;
 

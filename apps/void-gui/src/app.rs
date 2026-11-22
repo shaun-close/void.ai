@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use egui_dock::{DockArea, DockState, Style};
+use egui_dock::{DockArea, DockState};
 use void_core::config::Theme;
 use void_core::context::context_used;
 use void_core::engine::{Command, Engine, EngineHandle};
@@ -15,6 +15,8 @@ use void_core::store::Store;
 use crate::layout::{self, Tab};
 use crate::panels::{Action, Panels};
 use crate::state::UiState;
+use crate::theme::{self, icon};
+use egui::RichText;
 
 pub struct VoidApp {
     engine: EngineHandle,
@@ -31,6 +33,7 @@ pub struct VoidApp {
     title: String,
     list: crate::panels::conversations::ListUi,
     backends: crate::panels::backends::BackendsUi,
+    md: egui_commonmark::CommonMarkCache,
     /// A first message waiting for the conversation it asked the engine to create.
     pending_start: Option<(u32, String)>,
 }
@@ -42,6 +45,7 @@ impl VoidApp {
         config_path: PathBuf,
         data_dir: PathBuf,
     ) -> Self {
+        theme::install_fonts(&cc.egui_ctx);
         let store = Store::new(data_dir);
         let ctx = cc.egui_ctx.clone();
         let engine = Engine::start(
@@ -67,6 +71,7 @@ impl VoidApp {
             title: String::new(),
             list: Default::default(),
             backends: Default::default(),
+            md: Default::default(),
             pending_start: None,
         }
     }
@@ -249,40 +254,20 @@ impl VoidApp {
             return;
         }
         self.applied_style = Some(want);
-        ctx.set_visuals(match self.state.config.theme {
-            Theme::Dark => egui::Visuals::dark(),
-            Theme::Light => egui::Visuals::light(),
-        });
         let size = crate::panels::settings::clamp_font(self.state.config.font_size);
-        ctx.global_style_mut(|style| {
-            use egui::{FontFamily, FontId, TextStyle};
-            style.text_styles = [
-                (
-                    TextStyle::Small,
-                    FontId::new(size - 3.0, FontFamily::Proportional),
-                ),
-                (TextStyle::Body, FontId::new(size, FontFamily::Proportional)),
-                (
-                    TextStyle::Button,
-                    FontId::new(size, FontFamily::Proportional),
-                ),
-                (
-                    TextStyle::Heading,
-                    FontId::new(size + 5.0, FontFamily::Proportional),
-                ),
-                (
-                    TextStyle::Monospace,
-                    FontId::new(size - 1.0, FontFamily::Monospace),
-                ),
-            ]
-            .into();
-        });
+        theme::apply(ctx, self.state.config.theme, size);
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
+            ui.add_space(2.0);
+            theme::wordmark(ui, 17.0);
+            ui.add_space(12.0);
             ui.menu_button("File", |ui| {
-                if ui.button("Open Folder…").clicked() {
+                if ui
+                    .button(theme::itext(icon::FOLDER_OPEN, "Open Folder…"))
+                    .clicked()
+                {
                     let tx = self.folders.0.clone();
                     let ctx = ui.ctx().clone();
                     std::thread::spawn(move || {
@@ -292,7 +277,7 @@ impl VoidApp {
                         }
                     });
                 }
-                ui.menu_button("Recent", |ui| {
+                ui.menu_button(theme::itext(icon::FOLDER_OPEN, "Recent"), |ui| {
                     let recent: Vec<_> = self
                         .state
                         .recent
@@ -317,20 +302,23 @@ impl VoidApp {
                         }
                     }
                 });
-                if ui.button("Scratch").clicked() {
+                if ui.button(theme::itext(icon::PLANET, "Scratch")).clicked() {
                     self.open_workspace(None);
                 }
                 ui.separator();
-                if ui.button("New chat").clicked() {
+                if ui.button(theme::itext(icon::PLUS, "New chat")).clicked() {
                     self.engine.send(Command::NewConversation);
                 }
                 ui.separator();
-                if ui.button("Quit").clicked() {
+                if ui.button(theme::itext(icon::SIGN_OUT, "Quit")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
             ui.menu_button("View", |ui| {
-                if ui.button("New chat tab").clicked() {
+                if ui
+                    .button(theme::itext(icon::CHAT, "New chat tab"))
+                    .clicked()
+                {
                     let id = layout::next_chat_id(&self.dock);
                     layout::ensure_tab(
                         &mut self.dock,
@@ -342,16 +330,19 @@ impl VoidApp {
                     self.focused_chat = Some(id);
                 }
                 for (label, tab) in [
-                    ("Conversations", Tab::Conversations),
-                    ("Backends", Tab::Backends),
-                    ("Settings", Tab::Settings),
+                    (theme::itext(icon::CHATS, "Chats"), Tab::Conversations),
+                    (theme::itext(icon::PLUGS, "Backends"), Tab::Backends),
+                    (theme::itext(icon::GEAR, "Settings"), Tab::Settings),
                 ] {
                     if ui.button(label).clicked() {
                         layout::ensure_tab(&mut self.dock, tab);
                     }
                 }
                 ui.separator();
-                if ui.button("Reset layout").clicked() {
+                if ui
+                    .button(theme::itext(icon::LAYOUT, "Reset layout"))
+                    .clicked()
+                {
                     self.dock = layout::default_layout();
                     self.focused_chat = None;
                 }
@@ -371,47 +362,92 @@ impl VoidApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::palette_of(ui);
         let conv = self.focused_conversation();
         ui.horizontal(|ui| {
-            ui.label(&self.state.workspace.name);
-            ui.separator();
-            match self.state.profile_for(conv) {
-                Some(p) => ui.label(format!("{} · {}", p.name, p.model)),
-                None => ui.label("no profile"),
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let ws_icon = if self.state.workspace.root.is_some() {
+                icon::FOLDER_OPEN
+            } else {
+                icon::PLANET
             };
-            ui.separator();
+            theme::pill(ui, ws_icon, self.state.workspace.name.clone(), pal.accent).on_hover_text(
+                self.state
+                    .workspace
+                    .root
+                    .as_ref()
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_else(|| "Scratch: chats not tied to a folder".into()),
+            );
+            match self.state.profile_for(conv) {
+                Some(p) => {
+                    let color = match p.kind {
+                        void_core::config::BackendKind::OpenAi => pal.accent2,
+                        void_core::config::BackendKind::Anthropic => pal.accent3,
+                    };
+                    theme::pill(ui, icon::PLUGS, format!("{} · {}", p.name, p.model), color)
+                        .on_hover_text(&p.base_url);
+                }
+                None => {
+                    theme::pill(ui, icon::WARNING, "no profile", pal.err);
+                }
+            };
             let streaming = conv.is_some_and(|c| self.state.streams.contains_key(&c));
             if streaming {
-                ui.spinner();
-                ui.label("streaming…");
+                let t = ((ui.input(|i| i.time) * 3.0).sin() as f32 + 1.0) / 2.0;
+                theme::pill(
+                    ui,
+                    icon::CIRCLE,
+                    "streaming",
+                    theme::lerp(pal.accent, pal.accent2, t),
+                );
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
             } else {
-                ui.label("idle");
+                theme::pill(ui, icon::CIRCLE, "idle", pal.text_faint);
             }
             if let Some(tps) = self.state.last_tps {
-                ui.separator();
-                ui.label(format!("{tps:.1} tok/s"));
+                theme::pill(ui, icon::LIGHTNING, format!("{tps:.1} tok/s"), pal.warn);
             }
             if let (Some(c), Some(p)) = (
                 conv.and_then(|c| self.state.loaded.get(&c)),
                 self.state.profile_for(conv),
             ) {
-                ui.separator();
                 let used = context_used(c);
-                ui.label(format!(
-                    "context {} / {}",
-                    fmt_k(used),
-                    fmt_k(p.context_limit)
-                ))
-                .on_hover_text(format!("{used} of {} tokens", p.context_limit));
+                let frac = theme::context_fraction(used, p.context_limit);
+                let color = theme::meter_color(&pal, frac);
+                ui.add_space(4.0);
+                ui.label(theme::ico(icon::GAUGE).color(color));
+                theme::meter(ui, 90.0, frac, color);
+                ui.label(
+                    RichText::new(format!(
+                        "context {} / {}",
+                        fmt_k(used),
+                        fmt_k(p.context_limit)
+                    ))
+                    .small()
+                    .color(pal.text_dim),
+                )
+                .on_hover_text(format!(
+                    "{used} of {} tokens ({:.1}%)",
+                    p.context_limit,
+                    frac * 100.0
+                ));
             }
             if let Some(st) = &self.state.status {
-                ui.separator();
-                let color = if st.error {
-                    ui.visuals().error_fg_color
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                ui.colored_label(color, &st.text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (ic, color) = if st.error {
+                        (icon::WARNING, pal.err)
+                    } else {
+                        (icon::CHECK, pal.ok)
+                    };
+                    ui.label(theme::itext_styled(
+                        ic,
+                        &st.text,
+                        theme::small_size(),
+                        color,
+                    ));
+                });
             }
         });
     }
@@ -436,8 +472,29 @@ impl eframe::App for VoidApp {
             self.title = title;
         }
 
-        egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        let pal = theme::palette(self.state.config.theme);
+        let bar = egui::Frame::new()
+            .fill(pal.bg_deep)
+            .inner_margin(egui::Margin::symmetric(8, 5));
+        egui::Panel::top("menu_bar")
+            .frame(bar)
+            .show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::bottom("status_bar")
+            .frame(bar)
+            .show(ui, |ui| self.status_bar(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(pal.bg_deep))
+            .show(ui, |ui| self.dock_area(ui));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_layout_now();
+    }
+}
+
+impl VoidApp {
+    fn dock_area(&mut self, ui: &mut egui::Ui) {
+        let pal = theme::palette(self.state.config.theme);
 
         let mut actions = Vec::new();
         let focused = self.focused_conversation();
@@ -448,10 +505,11 @@ impl eframe::App for VoidApp {
             actions: &mut actions,
             list: &mut self.list,
             backends: &mut self.backends,
+            md: &mut self.md,
             focused,
         };
         DockArea::new(&mut self.dock)
-            .style(Style::from_egui(ui.style().as_ref()))
+            .style(theme::dock_style(ui.style().as_ref(), &pal))
             .show_leaf_close_all_buttons(false)
             .show_inside(ui, &mut panels);
 
@@ -462,10 +520,6 @@ impl eframe::App for VoidApp {
             self.apply_action(a);
         }
         self.maybe_save_layout();
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_layout_now();
     }
 }
 
@@ -642,6 +696,102 @@ mod e2e {
         });
     }
 
+    /// Offline: render the app with a seeded conversation to PNGs, for eyeballing the look.
+    /// `VOID_AI_SHOT_DIR=/some/dir cargo test -p void-gui render_screenshots -- --ignored`
+    #[test]
+    #[ignore]
+    fn render_screenshots() {
+        use void_core::model::{Conversation, Message, Part, Role as R, Usage};
+        let Some(out) = std::env::var_os("VOID_AI_SHOT_DIR").map(PathBuf::from) else {
+            eprintln!("set VOID_AI_SHOT_DIR");
+            return;
+        };
+        std::fs::create_dir_all(&out).unwrap();
+        let p = paths_tmp();
+        let store = Store::new(p.root.join("data"));
+        let ws = void_core::model::Workspace::scratch();
+        let mut c = Conversation::new(ws.id.clone());
+        c.title = "Borrow checker vs. my HashMap".into();
+        c.messages.push(Message::user(
+            "Why does this fail to compile?\n\n```rust\nlet v = map.get(&k);\nmap.insert(k2, 1);\nprintln!(\"{v:?}\");\n```",
+        ));
+        let mut a = Message::new(
+            R::Assistant,
+            vec![
+                Part::Reasoning("The user holds an immutable borrow from `get` across a mutable call. Explain NLL and suggest cloning or reordering.".into()),
+                Part::Text("`map.get(&k)` returns a **reference into the map**, so `v` keeps an immutable borrow alive until its last use in `println!`. `insert` needs `&mut map` while that borrow is still live:\n\n1. Copy the value out first, or\n2. Move the `println!` above the `insert`.\n\n```rust\nlet v = map.get(&k).copied();\nmap.insert(k2, 1);\nprintln!(\"{v:?}\");\n```\n\n> Since Rust 2018 the borrow ends at its *last use* (non-lexical lifetimes), not at the end of the scope.".into()),
+            ],
+        );
+        a.usage = Some(Usage {
+            prompt_tokens: 812,
+            completion_tokens: 164,
+        });
+        c.messages.push(a);
+        store.save(&c).unwrap();
+        let mut other = Conversation::new(ws.id.clone());
+        other.title = "moon task for cargo nextest".into();
+        other.updated -= chrono::Duration::hours(3);
+        store.save(&other).unwrap();
+        let mut third = Conversation::new(ws.id);
+        third.title = "Explain SSE chunking".into();
+        third.updated -= chrono::Duration::days(2);
+        store.save(&third).unwrap();
+
+        let (cfg, data) = (p.root.join("config.toml"), p.root.join("data"));
+        let mut h = Harness::builder()
+            .with_size([1400.0, 860.0])
+            .with_max_steps(10)
+            .with_accessibility_check(false)
+            .wgpu()
+            .build_eframe(move |cc| VoidApp::new(cc, None, cfg, data));
+        until(&mut h, 10, "list", |a| a.state.conversations.len() == 3);
+        let id = c.id;
+        h.state_mut().apply_action(Action::Show(id));
+        until(&mut h, 10, "loaded", |a| a.state.loaded.contains_key(&id));
+        h.state_mut().state.last_tps = Some(58.4);
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("chat.png")).unwrap();
+
+        // Empty chat in a fresh tab.
+        let tab = layout::next_chat_id(&h.state().dock);
+        layout::ensure_tab(
+            &mut h.state_mut().dock,
+            Tab::Chat {
+                id: tab,
+                conversation: None,
+            },
+        );
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("empty.png")).unwrap();
+
+        // Settings tab in front.
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Settings);
+        let first = h.state().state.config.profiles[0].clone();
+        h.state_mut().backends.select(first);
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Backends);
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("backends.png")).unwrap();
+
+        h.set_size(egui::vec2(560.0, 860.0));
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("narrow.png")).unwrap();
+        h.set_size(egui::vec2(1400.0, 860.0));
+
+        h.state_mut().state.config.theme = void_core::config::Theme::Light;
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("light.png")).unwrap();
+    }
+
     fn paths_tmp() -> Paths {
         let t = tempfile::tempdir().unwrap();
         Paths {
@@ -697,7 +847,7 @@ mod e2e {
                 .values()
                 .any(|s| s.text.len() + s.reasoning.len() > 20)
         });
-        h.get_by_label("Stop").click();
+        h.get_by_label_contains("Stop").click();
         until(&mut h, 10, "stopped", idle);
         let stopped = last_assistant(h.state()).unwrap();
         println!(

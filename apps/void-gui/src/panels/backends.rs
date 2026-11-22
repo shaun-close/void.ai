@@ -6,6 +6,7 @@ use void_core::config::{ApiKeySource, BackendKind, Config, Profile};
 use void_core::engine::Command;
 
 use super::Panels;
+use crate::theme::{self, icon};
 
 /// Editing state: the profile being edited (a copy until Save) and its `extra_body` text.
 #[derive(Debug, Default)]
@@ -61,6 +62,14 @@ pub fn with_profile(c: &Config, p: Profile) -> Config {
     c
 }
 
+#[cfg(test)]
+impl BackendsUi {
+    /// Start editing a profile.
+    pub fn select(&mut self, p: Profile) {
+        edit(self, p);
+    }
+}
+
 fn edit(ui: &mut BackendsUi, p: Profile) {
     ui.extra_text = if p.extra_body.is_empty() {
         String::new()
@@ -72,31 +81,20 @@ fn edit(ui: &mut BackendsUi, p: Profile) {
 }
 
 pub fn show(ui: &mut Ui, p: &mut Panels) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| show_inner(ui, p));
+}
+
+fn show_inner(ui: &mut Ui, p: &mut Panels) {
     let active = p.state.saved_config.active_profile.clone();
     let profiles = p.state.saved_config.profiles.clone();
     let selected = p.backends.draft.as_ref().map(|d| d.id.clone());
 
+    let pal = theme::palette_of(ui);
+    theme::heading(ui, icon::PLUGS, "Backend profiles");
     ui.horizontal_wrapped(|ui| {
-        for prof in &profiles {
-            let mut label = RichText::new(&prof.name);
-            if prof.id == active {
-                label = label.strong();
-            }
-            if ui
-                .selectable_label(selected.as_deref() == Some(prof.id.as_str()), label)
-                .on_hover_text(if prof.id == active {
-                    "active profile"
-                } else {
-                    ""
-                })
-                .clicked()
-            {
-                edit(p.backends, prof.clone());
-            }
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Add").clicked() {
+        if theme::primary_button(ui, icon::PLUS, "Add").clicked() {
             let id = profile_slug("New profile", &profiles);
             edit(
                 p.backends,
@@ -114,198 +112,283 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
             );
         }
         if let Some(d) = p.backends.draft.clone()
-            && ui.button("Duplicate").clicked()
+            && ui.button(theme::itext(icon::COPY, "Duplicate")).clicked()
         {
             let name = format!("{} copy", d.name);
             let id = profile_slug(&name, &profiles);
             edit(p.backends, Profile { id, name, ..d });
         }
     });
-    ui.separator();
+    ui.add_space(4.0);
+    for prof in &profiles {
+        let sel = selected.as_deref() == Some(prof.id.as_str());
+        let resp = egui::Frame::new()
+            .fill(if sel {
+                theme::lerp(pal.bg_raised, pal.accent, 0.16)
+            } else {
+                pal.bg_raised
+            })
+            .stroke(egui::Stroke::new(
+                1.0,
+                if sel { pal.accent } else { pal.border },
+            ))
+            .corner_radius(egui::CornerRadius::same(9))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&prof.name)
+                            .family(egui::FontFamily::Name(theme::BOLD.into()))
+                            .color(pal.text),
+                    );
+                    if prof.id == active {
+                        ui.label(theme::ico(icon::STAR).color(pal.warn))
+                            .on_hover_text("default profile");
+                    }
+                    let (name, color) = match prof.kind {
+                        BackendKind::OpenAi => ("OpenAI API", pal.accent2),
+                        BackendKind::Anthropic => ("Anthropic API", pal.accent3),
+                    };
+                    theme::pill(ui, icon::CPU, name, color);
+                });
+                let host = prof
+                    .base_url
+                    .split("//")
+                    .nth(1)
+                    .unwrap_or(&prof.base_url)
+                    .trim_end_matches('/')
+                    .to_string();
+                ui.label(
+                    RichText::new(format!("{} · {host}", prof.model))
+                        .small()
+                        .color(pal.text_faint),
+                );
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            edit(p.backends, prof.clone());
+        }
+        ui.add_space(2.0);
+    }
+    ui.add_space(6.0);
 
     let Some(mut draft) = p.backends.draft.take() else {
-        ui.label(RichText::new("Pick a profile to edit it.").weak());
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("Pick a profile to edit it").color(pal.text_faint));
+        });
         return;
     };
     let d = &mut draft;
     let mut keep = true;
     let saved = profiles.iter().any(|x| x.id == d.id);
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("profile-editor")
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut d.name);
-                    ui.end_row();
+    ui.vertical(|ui| {
+        theme::heading(ui, icon::PENCIL, "Edit profile");
+        ui.add_space(2.0);
+        egui::Grid::new("profile-editor")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut d.name);
+                ui.end_row();
 
-                    ui.label("API");
-                    egui::ComboBox::from_id_salt("profile-kind")
-                        .selected_text(match d.kind {
-                            BackendKind::OpenAi => "OpenAI-compatible",
-                            BackendKind::Anthropic => "Anthropic",
-                        })
+                ui.label("API");
+                egui::ComboBox::from_id_salt("profile-kind")
+                    .selected_text(match d.kind {
+                        BackendKind::OpenAi => "OpenAI-compatible",
+                        BackendKind::Anthropic => "Anthropic",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.kind, BackendKind::OpenAi, "OpenAI-compatible");
+                        ui.selectable_value(&mut d.kind, BackendKind::Anthropic, "Anthropic");
+                    });
+                ui.end_row();
+
+                ui.label("Base URL");
+                ui.add(TextEdit::singleline(&mut d.base_url).desired_width(f32::INFINITY));
+                ui.end_row();
+
+                ui.label("API key");
+                ui.vertical(|ui| {
+                    let labels = ["None", "Key", "Environment variable", "Command"];
+                    let current = match d.api_key {
+                        ApiKeySource::None => 0,
+                        ApiKeySource::Literal(_) => 1,
+                        ApiKeySource::Env(_) => 2,
+                        ApiKeySource::Command(_) => 3,
+                    };
+                    let mut k = current;
+                    egui::ComboBox::from_id_salt("profile-key")
+                        .selected_text(labels[k])
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut d.kind,
-                                BackendKind::OpenAi,
-                                "OpenAI-compatible",
-                            );
-                            ui.selectable_value(&mut d.kind, BackendKind::Anthropic, "Anthropic");
+                            for (i, l) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut k, i, *l);
+                            }
                         });
-                    ui.end_row();
-
-                    ui.label("Base URL");
-                    ui.add(TextEdit::singleline(&mut d.base_url).desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("API key");
-                    ui.vertical(|ui| {
-                        let labels = ["None", "Key", "Environment variable", "Command"];
-                        let current = match d.api_key {
-                            ApiKeySource::None => 0,
-                            ApiKeySource::Literal(_) => 1,
-                            ApiKeySource::Env(_) => 2,
-                            ApiKeySource::Command(_) => 3,
+                    if k != current {
+                        d.api_key = match k {
+                            1 => ApiKeySource::Literal(String::new()),
+                            2 => ApiKeySource::Env(String::new()),
+                            3 => ApiKeySource::Command(String::new()),
+                            _ => ApiKeySource::None,
                         };
-                        let mut k = current;
-                        egui::ComboBox::from_id_salt("profile-key")
-                            .selected_text(labels[k])
+                    }
+                    match &mut d.api_key {
+                        ApiKeySource::Literal(s) => {
+                            ui.add(
+                                TextEdit::singleline(s)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        ApiKeySource::Env(s) => {
+                            ui.add(TextEdit::singleline(s).hint_text("VARIABLE_NAME"));
+                        }
+                        ApiKeySource::Command(s) => {
+                            ui.add(
+                                TextEdit::singleline(s)
+                                    .hint_text("command that prints the key")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        ApiKeySource::None => {}
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Model");
+                ui.vertical(|ui| {
+                    ui.add(TextEdit::singleline(&mut d.model).desired_width(f32::INFINITY));
+                    if let Some(Ok(models)) = p.state.tests.get(&d.id)
+                        && !models.is_empty()
+                    {
+                        egui::ComboBox::from_id_salt("profile-models")
+                            .selected_text(format!("{} models available", models.len()))
                             .show_ui(ui, |ui| {
-                                for (i, l) in labels.iter().enumerate() {
-                                    ui.selectable_value(&mut k, i, *l);
+                                for m in models {
+                                    ui.selectable_value(&mut d.model, m.clone(), m);
                                 }
                             });
-                        if k != current {
-                            d.api_key = match k {
-                                1 => ApiKeySource::Literal(String::new()),
-                                2 => ApiKeySource::Env(String::new()),
-                                3 => ApiKeySource::Command(String::new()),
-                                _ => ApiKeySource::None,
-                            };
-                        }
-                        match &mut d.api_key {
-                            ApiKeySource::Literal(s) => {
-                                ui.add(
-                                    TextEdit::singleline(s)
-                                        .password(true)
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                            ApiKeySource::Env(s) => {
-                                ui.add(TextEdit::singleline(s).hint_text("VARIABLE_NAME"));
-                            }
-                            ApiKeySource::Command(s) => {
-                                ui.add(
-                                    TextEdit::singleline(s)
-                                        .hint_text("command that prints the key")
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                            ApiKeySource::None => {}
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Model");
-                    ui.vertical(|ui| {
-                        ui.add(TextEdit::singleline(&mut d.model).desired_width(f32::INFINITY));
-                        if let Some(Ok(models)) = p.state.tests.get(&d.id)
-                            && !models.is_empty()
-                        {
-                            egui::ComboBox::from_id_salt("profile-models")
-                                .selected_text(format!("{} models available", models.len()))
-                                .show_ui(ui, |ui| {
-                                    for m in models {
-                                        ui.selectable_value(&mut d.model, m.clone(), m);
-                                    }
-                                });
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Context limit");
-                    ui.add(
-                        DragValue::new(&mut d.context_limit)
-                            .range(512..=10_000_000)
-                            .speed(256),
-                    );
-                    ui.end_row();
-
-                    ui.label("Max output");
-                    ui.add(
-                        DragValue::new(&mut d.max_output)
-                            .range(16..=1_000_000)
-                            .speed(64),
-                    );
-                    ui.end_row();
+                    }
                 });
+                ui.end_row();
 
-            ui.label("Extra request fields (JSON object, merged into every request)");
-            ui.add(
-                TextEdit::multiline(&mut p.backends.extra_text)
-                    .code_editor()
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
-            let extra = parse_extra_body(&p.backends.extra_text);
-            if let Err(e) = &extra {
+                ui.label("Context limit");
+                ui.add(
+                    DragValue::new(&mut d.context_limit)
+                        .range(512..=10_000_000)
+                        .speed(256),
+                );
+                ui.end_row();
+
+                ui.label("Max output");
+                ui.add(
+                    DragValue::new(&mut d.max_output)
+                        .range(16..=1_000_000)
+                        .speed(64),
+                );
+                ui.end_row();
+            });
+
+        ui.label("Extra request fields (JSON object, merged into every request)");
+        ui.add(
+            TextEdit::multiline(&mut p.backends.extra_text)
+                .code_editor()
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
+        let extra = parse_extra_body(&p.backends.extra_text);
+        if let Err(e) = &extra {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+
+        match p.state.tests.get(&d.id) {
+            Some(Ok(models)) => {
+                ui.label(RichText::new(format!("Connected: {} models", models.len())).weak());
+            }
+            Some(Err(e)) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
+            None => {}
+        }
 
-            match p.state.tests.get(&d.id) {
-                Some(Ok(models)) => {
-                    ui.label(RichText::new(format!("Connected: {} models", models.len())).weak());
+        ui.horizontal(|ui| {
+            if ui
+                .button(theme::itext(icon::LIGHTNING, "Test connection"))
+                .clicked()
+            {
+                let mut test = d.clone();
+                if let Ok(m) = &extra {
+                    test.extra_body = m.clone();
                 }
-                Some(Err(e)) => {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                }
-                None => {}
+                p.state.tests.remove(&d.id);
+                p.engine.send(Command::TestProfile(test));
             }
-
-            ui.horizontal(|ui| {
-                if ui.button("Test connection").clicked() {
-                    let mut test = d.clone();
-                    if let Ok(m) = &extra {
-                        test.extra_body = m.clone();
+            if ui
+                .add_enabled(
+                    extra.is_ok(),
+                    egui::Button::new(theme::itext_styled(
+                        icon::FLOPPY,
+                        "Save",
+                        theme::body_size(),
+                        egui::Color32::WHITE,
+                    ))
+                    .fill(pal.accent),
+                )
+                .clicked()
+                && let Ok(m) = &extra
+            {
+                d.extra_body = m.clone();
+                let prof = d.clone();
+                super::save_change(p.state, p.engine, |c| *c = with_profile(c, prof.clone()));
+            }
+            if ui
+                .add_enabled(
+                    saved && d.id != active,
+                    egui::Button::new(theme::itext(icon::STAR, "Make default")),
+                )
+                .clicked()
+            {
+                let id = d.id.clone();
+                super::save_change(p.state, p.engine, |c| c.active_profile = id.clone());
+            }
+            if saved && d.id != active {
+                if !p.backends.confirm_delete {
+                    if ui
+                        .button(theme::itext_styled(
+                            icon::TRASH,
+                            "Delete",
+                            theme::body_size(),
+                            pal.err,
+                        ))
+                        .clicked()
+                    {
+                        p.backends.confirm_delete = true;
                     }
-                    p.state.tests.remove(&d.id);
-                    p.engine.send(Command::TestProfile(test));
-                }
-                if ui
-                    .add_enabled(extra.is_ok(), egui::Button::new("Save"))
-                    .clicked()
-                    && let Ok(m) = &extra
-                {
-                    d.extra_body = m.clone();
-                    let prof = d.clone();
-                    super::save_change(p.state, p.engine, |c| *c = with_profile(c, prof.clone()));
-                }
-                if ui
-                    .add_enabled(saved && d.id != active, egui::Button::new("Set active"))
+                } else if ui
+                    .add(
+                        egui::Button::new(theme::itext_styled(
+                            icon::TRASH,
+                            "Really delete?",
+                            theme::body_size(),
+                            egui::Color32::WHITE,
+                        ))
+                        .fill(pal.err),
+                    )
                     .clicked()
                 {
                     let id = d.id.clone();
-                    super::save_change(p.state, p.engine, |c| c.active_profile = id.clone());
+                    super::save_change(p.state, p.engine, |c| c.profiles.retain(|x| x.id != id));
+                    keep = false;
+                    p.backends.confirm_delete = false;
                 }
-                if saved && d.id != active {
-                    if !p.backends.confirm_delete {
-                        if ui.button("Delete").clicked() {
-                            p.backends.confirm_delete = true;
-                        }
-                    } else if ui.button("Really delete?").clicked() {
-                        let id = d.id.clone();
-                        super::save_change(p.state, p.engine, |c| {
-                            c.profiles.retain(|x| x.id != id)
-                        });
-                        keep = false;
-                        p.backends.confirm_delete = false;
-                    }
-                }
-            });
+            }
         });
+    });
     // Put the draft back unless it was deleted or replaced (a profile was picked meanwhile).
     if keep && p.backends.draft.is_none() {
         p.backends.draft = Some(draft);

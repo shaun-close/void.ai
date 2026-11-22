@@ -16,6 +16,7 @@ use void_core::engine::Command;
 
 use crate::layout::Tab;
 use crate::state::UiState;
+use crate::theme::{self, icon};
 
 /// Persist the whole draft config (Settings' Save) and remember it as the saved version.
 pub fn save_config(state: &mut UiState, engine: &EngineHandle) {
@@ -50,6 +51,7 @@ pub struct Panels<'a> {
     pub actions: &'a mut Vec<Action>,
     pub list: &'a mut conversations::ListUi,
     pub backends: &'a mut backends::BackendsUi,
+    pub md: &'a mut egui_commonmark::CommonMarkCache,
     /// The conversation in the focused Chat tab (highlighted in the list).
     pub focused: Option<ConversationId>,
 }
@@ -80,15 +82,23 @@ impl egui_dock::TabViewer for Panels<'_> {
                                 .map(|m| m.title.clone())
                         })
                 });
-                chat::tab_title(title.as_deref()).into()
+                theme::itext(icon::CHAT, &chat::tab_title(title.as_deref()))
             }
-            Tab::Conversations => "Conversations".into(),
-            Tab::Backends => "Backends".into(),
-            Tab::Settings => "Settings".into(),
+            Tab::Conversations => theme::itext(icon::CHATS, "Chats"),
+            Tab::Backends => theme::itext(icon::PLUGS, "Backends"),
+            Tab::Settings => theme::itext(icon::GEAR, "Settings"),
         }
     }
 
+    /// Panels scroll themselves; the dock's own scroll areas would stop text from wrapping.
+    fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
+        [false, false]
+    }
+
     fn ui(&mut self, ui: &mut Ui, tab: &mut Tab) {
+        // Keep anything too wide for a narrow panel inside that panel.
+        let clip = ui.clip_rect().intersect(ui.max_rect());
+        ui.set_clip_rect(clip);
         match tab {
             Tab::Chat { id, conversation } => chat::show(ui, self, *id, *conversation),
             Tab::Conversations => conversations::show(ui, self),
