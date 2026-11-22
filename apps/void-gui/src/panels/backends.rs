@@ -72,8 +72,8 @@ fn edit(ui: &mut BackendsUi, p: Profile) {
 }
 
 pub fn show(ui: &mut Ui, p: &mut Panels) {
-    let active = p.state.config.active_profile.clone();
-    let profiles = p.state.config.profiles.clone();
+    let active = p.state.saved_config.active_profile.clone();
+    let profiles = p.state.saved_config.profiles.clone();
     let selected = p.backends.draft.as_ref().map(|d| d.id.clone());
 
     ui.horizontal_wrapped(|ui| {
@@ -280,15 +280,15 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
                     && let Ok(m) = &extra
                 {
                     d.extra_body = m.clone();
-                    p.state.config = with_profile(&p.state.config, d.clone());
-                    super::save_config(p.state, p.engine);
+                    let prof = d.clone();
+                    super::save_change(p.state, p.engine, |c| *c = with_profile(c, prof.clone()));
                 }
                 if ui
                     .add_enabled(saved && d.id != active, egui::Button::new("Set active"))
                     .clicked()
                 {
-                    p.state.config.active_profile = d.id.clone();
-                    super::save_config(p.state, p.engine);
+                    let id = d.id.clone();
+                    super::save_change(p.state, p.engine, |c| c.active_profile = id.clone());
                 }
                 if saved && d.id != active {
                     if !p.backends.confirm_delete {
@@ -297,8 +297,9 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
                         }
                     } else if ui.button("Really delete?").clicked() {
                         let id = d.id.clone();
-                        p.state.config.profiles.retain(|x| x.id != id);
-                        super::save_config(p.state, p.engine);
+                        super::save_change(p.state, p.engine, |c| {
+                            c.profiles.retain(|x| x.id != id)
+                        });
                         keep = false;
                         p.backends.confirm_delete = false;
                     }

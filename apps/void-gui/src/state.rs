@@ -37,6 +37,8 @@ pub struct UiState {
     layout: Option<Option<String>>,
     /// A conversation the engine just created, for the app to put in a Chat tab.
     created: Option<ConversationId>,
+    /// Conversations deleted since the app last looked (their tabs need clearing).
+    deleted: Vec<ConversationId>,
 }
 
 impl Default for UiState {
@@ -54,6 +56,7 @@ impl Default for UiState {
             status: None,
             layout: None,
             created: None,
+            deleted: Vec::new(),
         }
     }
 }
@@ -86,11 +89,17 @@ impl UiState {
                 }
             }
             Event::ConversationList(list) => self.conversations = list,
-            Event::Conversation(c) => {
-                if c.messages.is_empty() && !self.loaded.contains_key(&c.id) {
-                    self.created = Some(c.id);
-                }
+            Event::ConversationCreated(c) => {
+                self.created = Some(c.id);
                 self.loaded.insert(c.id, c);
+            }
+            Event::Conversation(c) => {
+                self.loaded.insert(c.id, c);
+            }
+            Event::ConversationDeleted(id) => {
+                self.loaded.remove(&id);
+                self.streams.remove(&id);
+                self.deleted.push(id);
             }
             Event::StreamStarted(id) => {
                 self.streams.insert(id, Streaming::default());
@@ -156,13 +165,26 @@ impl UiState {
         self.created.take()
     }
 
-    /// The profile a conversation uses (its own, else the active one).
+    pub fn take_deleted(&mut self) -> Vec<ConversationId> {
+        std::mem::take(&mut self.deleted)
+    }
+
+    /// Apply one change to the saved config (and the draft), returning the config to persist,
+    /// so unsaved Settings edits aren't saved along with it.
+    pub fn save_change(&mut self, change: impl Fn(&mut Config)) -> Config {
+        change(&mut self.saved_config);
+        change(&mut self.config);
+        self.saved_config.clone()
+    }
+
+    /// The profile a conversation uses (its own, else the saved active one): what the engine
+    /// will actually send to, whatever unsaved Settings say.
     pub fn profile_for(&self, id: Option<ConversationId>) -> Option<&void_core::config::Profile> {
         let pid = id
             .and_then(|id| self.loaded.get(&id))
             .and_then(|c| c.profile_id.clone())
-            .unwrap_or_else(|| self.config.active_profile.clone());
-        self.config.profile(&pid)
+            .unwrap_or_else(|| self.saved_config.active_profile.clone());
+        self.saved_config.profile(&pid)
     }
 }
 
@@ -212,15 +234,49 @@ mod tests {
     }
 
     #[test]
-    fn new_empty_conversation_is_reported_once() {
+    fn only_created_conversations_are_reported() {
+        let mut s = UiState::default();
+        let old = Conversation::new(Workspace::scratch().id);
+        // An empty conversation from an earlier session, updated (e.g. renamed): not new.
+        s.apply(Event::Conversation(old));
+        assert_eq!(s.take_created(), None);
+        let c = Conversation::new(Workspace::scratch().id);
+        let id = c.id;
+        s.apply(Event::ConversationCreated(c));
+        assert_eq!(s.take_created(), Some(id));
+        assert_eq!(s.take_created(), None);
+    }
+
+    #[test]
+    fn deleted_conversation_is_forgotten() {
         let mut s = UiState::default();
         let c = Conversation::new(Workspace::scratch().id);
         let id = c.id;
-        s.apply(Event::Conversation(c.clone()));
-        assert_eq!(s.take_created(), Some(id));
-        assert_eq!(s.take_created(), None);
-        s.apply(Event::Conversation(c));
-        assert_eq!(s.take_created(), None);
+        s.apply(Event::ConversationCreated(c));
+        s.apply(Event::StreamStarted(id));
+        s.apply(Event::ConversationDeleted(id));
+        assert!(!s.loaded.contains_key(&id));
+        assert!(!s.streams.contains_key(&id));
+        assert_eq!(s.take_deleted(), vec![id]);
+    }
+
+    #[test]
+    fn unsaved_settings_do_not_change_the_backend_in_use() {
+        let mut s = UiState::default();
+        s.config.active_profile = "ollama".into();
+        assert_eq!(s.profile_for(None).unwrap().id, "strata");
+    }
+
+    #[test]
+    fn saving_one_change_leaves_other_drafts_unsaved() {
+        let mut s = UiState::default();
+        s.config.base_system_prompt = "half-typed".into();
+        let sent = s.save_change(|c| c.active_profile = "ollama".into());
+        assert_eq!(sent.active_profile, "ollama");
+        assert_ne!(sent.base_system_prompt, "half-typed");
+        assert_eq!(s.saved_config, sent);
+        assert_eq!(s.config.active_profile, "ollama");
+        assert_eq!(s.config.base_system_prompt, "half-typed");
     }
 
     #[test]

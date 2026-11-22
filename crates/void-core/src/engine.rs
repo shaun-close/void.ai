@@ -67,8 +67,11 @@ pub enum Event {
         warnings: Vec<String>,
     },
     ConversationList(Vec<ConversationMeta>),
+    /// A conversation made by `NewConversation`.
+    ConversationCreated(Conversation),
     /// The full, current state of one conversation.
     Conversation(Conversation),
+    ConversationDeleted(ConversationId),
     StreamStarted(ConversationId),
     Delta {
         conversation: ConversationId,
@@ -160,6 +163,11 @@ impl EngineHandle {
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
+        // Let in-flight replies be saved as stopped before the runtime goes away.
+        let (ack, done) = std_mpsc::channel();
+        if self.tx.send(Msg::Shutdown(ack)).is_ok() {
+            let _ = done.recv_timeout(Duration::from_secs(2));
+        }
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(1));
         }
@@ -168,6 +176,8 @@ impl Drop for EngineHandle {
 
 enum Msg {
     Cmd(Command),
+    /// Stop every stream (keeping partial replies), then acknowledge.
+    Shutdown(std_mpsc::Sender<()>),
     SaveLayout(WorkspaceId, String),
     Stream {
         conversation: ConversationId,
@@ -217,6 +227,16 @@ impl State {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Cmd(cmd) => self.command(cmd),
+                Msg::Shutdown(ack) => {
+                    let ids: Vec<_> = self.streams.keys().copied().collect();
+                    for id in ids {
+                        if let Some(s) = self.streams.get(&id) {
+                            s.abort.abort();
+                        }
+                        self.finish(id, true);
+                    }
+                    let _ = ack.send(());
+                }
                 Msg::SaveLayout(ws, json) => {
                     if let Err(e) = self.store.save_layout(&ws, &json) {
                         self.emit(Event::Error(format!("Couldn't save the layout: {e}")));
@@ -250,7 +270,7 @@ impl State {
                 let c = Conversation::new(self.workspace.id.clone());
                 self.save(&c);
                 self.convs.insert(c.id, c.clone());
-                self.emit(Event::Conversation(c));
+                self.emit(Event::ConversationCreated(c));
                 self.emit_list();
             }
             Command::OpenConversation(id) => {
@@ -279,6 +299,7 @@ impl State {
                         "Couldn't delete the conversation: {e}"
                     )));
                 }
+                self.emit(Event::ConversationDeleted(id));
                 self.emit_list();
             }
             Command::SetConversationProfile(id, profile) => {
@@ -289,11 +310,20 @@ impl State {
                 if self.streams.contains_key(&id) {
                     return;
                 }
-                if let Some(c) = self.conversation(id).cloned()
-                    && c.messages.iter().any(|m| m.role == Role::User)
-                {
-                    self.start_stream(c);
+                let Some(c) = self.conversation(id) else {
+                    return;
+                };
+                if !c.messages.iter().any(|m| m.role == Role::User) {
+                    return;
                 }
+                // A retry replaces the replies after the last user message.
+                while c.messages.last().is_some_and(|m| m.role == Role::Assistant) {
+                    c.messages.pop();
+                }
+                let c = c.clone();
+                self.save(&c);
+                self.emit(Event::Conversation(c.clone()));
+                self.start_stream(c);
             }
             Command::Stop(id) => {
                 if let Some(s) = self.streams.get(&id) {
@@ -749,8 +779,8 @@ mod tests {
 
         fn new_conversation(&mut self) -> ConversationId {
             self.handle.send(Command::NewConversation);
-            match self.until(|e| matches!(e, Event::Conversation(_))) {
-                Event::Conversation(c) => c.id,
+            match self.until(|e| matches!(e, Event::ConversationCreated(_))) {
+                Event::ConversationCreated(c) => c.id,
                 _ => unreachable!(),
             }
         }
@@ -929,7 +959,102 @@ mod tests {
             .filter(|m| m.role == crate::model::Role::User)
             .count();
         assert_eq!(users, 1);
-        assert_eq!(saved.messages.len(), 3);
+        // The failed reply is replaced by the new one.
+        assert_eq!(saved.messages.len(), 2);
+        assert!(saved.messages[1].error.is_none());
+    }
+
+    #[test]
+    fn delete_while_streaming_reports_deletion() {
+        let mut r = rig();
+        r.started();
+        let c = r.new_conversation();
+        r.profile(c, "slow");
+        r.send(c, "go");
+        r.until(|e| matches!(e, Event::Delta { .. }));
+        r.handle.send(Command::DeleteConversation(c));
+        match r.until(|e| {
+            matches!(
+                e,
+                Event::ConversationDeleted(_) | Event::StreamFinished { .. }
+            )
+        }) {
+            Event::ConversationDeleted(id) => assert_eq!(id, c),
+            e => panic!("unexpected {e:?}"),
+        }
+        assert!(r.store.load(&Workspace::scratch().id, &c).is_err());
+    }
+
+    #[test]
+    fn retry_after_stop_replaces_the_partial_reply() {
+        let mut r = rig();
+        r.started();
+        let c = r.new_conversation();
+        r.profile(c, "slow");
+        r.send(c, "go");
+        let mut deltas = 0;
+        r.until(|e| {
+            if matches!(e, Event::Delta { .. }) {
+                deltas += 1;
+            }
+            deltas == 2
+        });
+        r.handle.send(Command::Stop(c));
+        r.until(|e| matches!(e, Event::StreamFinished { .. }));
+        r.profile(c, "fast");
+        r.handle.send(Command::Retry(c));
+        r.until(
+            |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == "Hello"),
+        );
+        let saved = r.store.load(&Workspace::scratch().id, &c).unwrap();
+        let texts: Vec<_> = saved.messages.iter().map(|m| m.text()).collect();
+        assert_eq!(texts, ["go", "Hello"]);
+    }
+
+    #[test]
+    fn new_conversation_is_reported_as_created() {
+        let mut r = rig();
+        r.started();
+        r.handle.send(Command::NewConversation);
+        let id = match r
+            .until(|e| matches!(e, Event::ConversationCreated(_) | Event::Conversation(_)))
+        {
+            Event::ConversationCreated(c) => c.id,
+            e => panic!("unexpected {e:?}"),
+        };
+        // Changing it later is a plain update, not a creation.
+        r.handle.send(Command::RenameConversation(id, "x".into()));
+        assert!(matches!(
+            r.until(|e| matches!(e, Event::ConversationCreated(_) | Event::Conversation(_))),
+            Event::Conversation(_)
+        ));
+    }
+
+    #[test]
+    fn dropping_the_handle_keeps_partial_replies() {
+        let mut r = rig();
+        r.started();
+        let c = r.new_conversation();
+        r.profile(c, "slow");
+        r.send(c, "go");
+        let mut deltas = 0;
+        r.until(|e| {
+            if matches!(e, Event::Delta { .. }) {
+                deltas += 1;
+            }
+            deltas == 2
+        });
+        let Rig {
+            handle,
+            store,
+            _dir,
+            ..
+        } = r;
+        drop(handle);
+        let saved = store.load(&Workspace::scratch().id, &c).unwrap();
+        let last = saved.messages.last().unwrap();
+        assert!(last.stopped, "partial reply saved as stopped");
+        assert!(last.text().starts_with("ab"));
     }
 
     #[test]

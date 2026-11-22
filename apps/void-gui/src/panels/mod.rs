@@ -17,10 +17,19 @@ use void_core::engine::Command;
 use crate::layout::Tab;
 use crate::state::UiState;
 
-/// Persist the UI's config and remember it as the saved version.
+/// Persist the whole draft config (Settings' Save) and remember it as the saved version.
 pub fn save_config(state: &mut UiState, engine: &EngineHandle) {
     state.saved_config = state.config.clone();
     engine.send(Command::SaveConfig(state.config.clone()));
+}
+
+/// Persist one change on top of the saved config, leaving other unsaved drafts alone.
+pub fn save_change(
+    state: &mut UiState,
+    engine: &EngineHandle,
+    change: impl Fn(&mut void_core::config::Config),
+) {
+    engine.send(Command::SaveConfig(state.save_change(change)));
 }
 
 /// Dock changes a panel asks for.

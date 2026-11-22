@@ -168,8 +168,8 @@ pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, conv: Option<ConversationId>)
                 None => format!(
                     "Active profile ({})",
                     p.state
-                        .config
-                        .profile(&p.state.config.active_profile)
+                        .saved_config
+                        .profile(&p.state.saved_config.active_profile)
                         .map(|p| p.name.as_str())
                         .unwrap_or("?")
                 ),
@@ -184,7 +184,7 @@ pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, conv: Option<ConversationId>)
                 .selected_text(label(&current))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut chosen, None, label(&None));
-                    for prof in &p.state.config.profiles {
+                    for prof in &p.state.saved_config.profiles {
                         ui.selectable_value(&mut chosen, Some(prof.id.clone()), &prof.name);
                     }
                 });

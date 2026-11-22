@@ -103,6 +103,15 @@ impl VoidApp {
             }
             self.saved_layout = layout::to_text(&self.dock);
         }
+        for gone in self.state.take_deleted() {
+            for (_, tab) in self.dock.iter_all_tabs_mut() {
+                if let Tab::Chat { conversation, .. } = tab
+                    && *conversation == Some(gone)
+                {
+                    *conversation = None;
+                }
+            }
+        }
         if let Some(id) = self.state.take_created() {
             match self.pending_start.take() {
                 Some((tab, text)) => {
@@ -348,13 +357,14 @@ impl VoidApp {
                 }
             });
             ui.menu_button("Backend", |ui| {
-                let mut active = self.state.config.active_profile.clone();
-                for p in &self.state.config.profiles {
+                let mut active = self.state.saved_config.active_profile.clone();
+                for p in &self.state.saved_config.profiles {
                     ui.radio_value(&mut active, p.id.clone(), &p.name);
                 }
-                if active != self.state.config.active_profile {
-                    self.state.config.active_profile = active;
-                    crate::panels::save_config(&mut self.state, &self.engine);
+                if active != self.state.saved_config.active_profile {
+                    crate::panels::save_change(&mut self.state, &self.engine, |c| {
+                        c.active_profile = active.clone()
+                    });
                 }
             });
         });
@@ -613,6 +623,23 @@ mod e2e {
             Some(None),
             "missing conversation cleared from its tab"
         );
+    }
+
+    /// Offline: deleting the conversation a Chat tab shows empties that tab.
+    #[test]
+    fn deleting_a_shown_conversation_clears_its_tab() {
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        h.state().engine.send(Command::NewConversation);
+        until(&mut h, 10, "bound", |a| a.focused_conversation().is_some());
+        let id = h.state().focused_conversation().unwrap();
+        h.state().engine.send(Command::DeleteConversation(id));
+        until(&mut h, 10, "tab cleared", |a| {
+            a.focused_conversation().is_none() && !a.state.loaded.contains_key(&id)
+        });
     }
 
     fn paths_tmp() -> Paths {

@@ -2,7 +2,13 @@
 
 use crate::backend::ChatRequest;
 use crate::config::{Config, Profile};
-use crate::model::{Conversation, Part, Role};
+use crate::model::{Conversation, Message, Part, Role};
+
+fn text_only(m: &Message) -> bool {
+    m.parts
+        .iter()
+        .all(|p| matches!(p, Part::Text(_) | Part::Reasoning(_)))
+}
 
 /// The request for the conversation's next reply. Failed replies, and stopped ones that never
 /// produced text, are left out.
@@ -19,7 +25,22 @@ pub fn build_request(conv: &Conversation, profile: &Profile, cfg: &Config) -> Ch
                 })
         })
         .cloned()
-        .collect();
+        .fold(Vec::<Message>::new(), |mut out, m| {
+            // Strict chat templates need alternating turns: merge a run of one role's text.
+            match out.last_mut() {
+                Some(prev)
+                    if prev.role == m.role
+                        && matches!(m.role, Role::User | Role::Assistant)
+                        && text_only(prev)
+                        && text_only(&m) =>
+                {
+                    let joined = format!("{}\n\n{}", prev.text(), m.text());
+                    prev.parts = vec![Part::Text(joined)];
+                }
+                _ => out.push(m),
+            }
+            out
+        });
     ChatRequest {
         model: profile.model.clone(),
         system: cfg.base_system_prompt.clone(),
@@ -72,11 +93,28 @@ mod tests {
         c.messages.push(Message::user("two"));
         let req = build_request(&c, profile, &cfg);
         let texts: Vec<_> = req.messages.iter().map(|m| m.text()).collect();
-        assert_eq!(texts, ["one", "two"]);
+        // The failed and empty replies are left out; the two user turns then merge.
+        assert_eq!(texts, ["one\n\ntwo"]);
         assert_eq!(req.system, cfg.base_system_prompt);
         assert_eq!(req.model, "qwen3.8-flash-next-iq3_xxs");
         assert_eq!(req.max_output, 32768);
         assert_eq!(req.extra_body, profile.extra_body);
+    }
+
+    #[test]
+    fn adjacent_turns_of_one_role_are_merged() {
+        let cfg = Config::default();
+        let profile = cfg.profile("strata").unwrap();
+        let mut c = Conversation::new(Workspace::scratch().id);
+        c.messages.push(Message::user("first"));
+        let mut failed = Message::new(Role::Assistant, vec![Part::Text("x".into())]);
+        failed.error = Some("down".into());
+        c.messages.push(failed);
+        c.messages.push(Message::user("second"));
+        let req = build_request(&c, profile, &cfg);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].text(), "first\n\nsecond");
     }
 
     #[test]
