@@ -1,0 +1,13 @@
+[package]
+name = "void-sandbox"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "void-sandbox-exec"
+path = "src/main.rs"
+
+[dependencies]
+landlock = "0.4.8"

@@ -7,6 +7,7 @@ pub mod engine;
 pub mod fsutil;
 pub mod model;
 pub mod overlay;
+pub mod sandbox;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testutil;
