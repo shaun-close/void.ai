@@ -5,19 +5,25 @@ use std::path::Path;
 use void_core::fsutil::atomic_write;
 
 impl Buffer {
-    /// Load `path`. Invalid UTF-8 opens lossily, read-only, with a notice, so saving cannot
+    /// Load `path`. Invalid UTF-8 or a NUL in the first 8 KiB opens lossily, read-only, with a notice, so saving cannot
     /// corrupt the file.
     pub fn from_file(path: &Path) -> io::Result<Buffer> {
         let bytes = fs::read(path)?;
-        match String::from_utf8(bytes) {
-            Ok(text) => Ok(Buffer::new(&text)),
-            Err(e) => {
-                let mut b = Buffer::new(&String::from_utf8_lossy(e.as_bytes()));
-                b.read_only = true;
-                b.notice = Some("Not valid UTF-8: opened read-only".to_string());
-                Ok(b)
-            }
+        let has_nul = bytes.iter().take(8192).any(|&b| b == 0);
+        let (text, valid) = match String::from_utf8(bytes) {
+            Ok(text) => (text, true),
+            Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
+        };
+        let mut b = Buffer::new(&text);
+        if has_nul || !valid {
+            b.read_only = true;
+            b.notice = Some(if valid {
+                "Binary file (contains NUL): opened read-only".to_string()
+            } else {
+                "Not valid UTF-8: opened read-only".to_string()
+            });
         }
+        Ok(b)
     }
 
     /// Write atomically, restoring the file's line ending and final newline, then mark saved.
@@ -115,6 +121,17 @@ mod tests {
         assert!(b.rope().to_string().starts_with("ok "));
         assert!(b.save(&p).is_err());
         assert_eq!(fs::read(&p).unwrap(), b"ok \xff\xfe end");
+    }
+
+    #[test]
+    fn binary_with_nul_opens_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("elf");
+        fs::write(&p, b"ELF\0\x01abc").unwrap();
+        let mut b = Buffer::from_file(&p).unwrap();
+        assert!(b.read_only);
+        assert!(b.notice.is_some());
+        assert!(b.save(&p).is_err());
     }
 
     #[test]
