@@ -151,6 +151,8 @@ pub struct Syntax {
     lang: Lang,
     tree: Option<Tree>,
     version: u64,
+    /// Newest buffer version reported through [`Syntax::edit`]; older trees are refused.
+    latest: u64,
     stale: bool,
 }
 
@@ -160,6 +162,7 @@ impl Syntax {
             lang,
             tree: None,
             version: 0,
+            latest: 0,
             stale: false,
         }
     }
@@ -197,14 +200,25 @@ impl Syntax {
         )
     }
 
-    pub fn set_tree(&mut self, tree: Tree, version: u64) {
+    /// Install a finished parse of buffer `version`. A tree older than the newest version
+    /// seen by [`Syntax::edit`] is dropped (returns `false`): its positions no longer match the
+    /// text and the caller should re-parse.
+    pub fn set_tree(&mut self, tree: Tree, version: u64) -> bool {
+        if version < self.latest {
+            return false;
+        }
         self.tree = Some(tree);
         self.version = version;
+        self.latest = version;
         self.stale = false;
+        true
     }
 
     /// Keep the current tree's positions in step with a buffer edit until a fresh parse lands.
-    pub fn edit(&mut self, edit: &Edit) {
+    /// `version` is the buffer version after the edit; it makes [`Syntax::set_tree`] refuse
+    /// parses of older text.
+    pub fn edit(&mut self, edit: &Edit, version: u64) {
+        self.latest = self.latest.max(version);
         if let Some(tree) = &mut self.tree {
             let point = |p: crate::buffer::Point| tree_sitter::Point {
                 row: p.row,
@@ -258,7 +272,7 @@ impl Syntax {
         cursor.set_byte_range(from..to);
         let text = |node: Node| {
             let r = node.byte_range();
-            rope.byte_slice(r.start.min(len)..r.end.min(len))
+            rope.byte_slice(clamp_byte(rope, r.start)..clamp_byte(rope, r.end))
                 .chunks()
                 .map(str::as_bytes)
         };
@@ -269,8 +283,9 @@ impl Syntax {
             let capture = m.captures()[*idx];
             if let Some(hl) = config.hl[capture.index as usize] {
                 let r = capture.node.byte_range();
-                if r.start < r.end {
-                    found.push((r.start, r.end.min(len), m.pattern_index, hl));
+                let (start, end) = (clamp_byte(rope, r.start), clamp_byte(rope, r.end));
+                if start < end {
+                    found.push((start, end, m.pattern_index, hl));
                 }
             }
         }
@@ -313,6 +328,12 @@ impl Syntax {
         }
         out
     }
+}
+
+/// Clamp `byte` into the rope and back to the start of the char it falls in, so it is always
+/// a valid slice boundary even when a stale tree disagrees with the text.
+fn clamp_byte(rope: &Rope, byte: usize) -> usize {
+    rope.char_to_byte(rope.byte_to_char(byte.min(rope.len_bytes())))
 }
 
 /// Chars in `row` excluding its line break.
@@ -453,9 +474,8 @@ fn syntect_rows(name: &str, rope: &Rope, rows: Range<usize>) -> Vec<Vec<Span>> {
 const MAX_DEPTH: usize = 200;
 
 fn text_of(rope: &Rope, node: Node) -> String {
-    let len = rope.len_bytes();
     let r = node.byte_range();
-    rope.byte_slice(r.start.min(len)..r.end.min(len))
+    rope.byte_slice(clamp_byte(rope, r.start)..clamp_byte(rope, r.end))
         .to_string()
 }
 
@@ -518,7 +538,7 @@ fn classify(
         (Lang::TypeScript | Lang::Tsx, "internal_module") => (Module, name("name")?, true),
         (Lang::Python, "function_definition") => (func, name("name")?, false),
         (Lang::Python, "class_definition") => (Class, name("name")?, true),
-        (Lang::Bash, "function_definition") => (Function, text_of(rope, node.child(0)?), false),
+        (Lang::Bash, "function_definition") => (Function, field_text(rope, node, "name")?, false),
         (Lang::C | Lang::Cpp, "function_definition") => (func, declarator_name(rope, node)?, false),
         (Lang::C | Lang::Cpp, "struct_specifier" | "union_specifier") => {
             node.child_by_field_name("body")?;
@@ -568,7 +588,12 @@ fn collect_symbols(
         if !container {
             return;
         }
-        descend_container = true;
+        // Only impls, traits and classes make the functions inside them methods.
+        descend_container = in_container
+            || matches!(
+                kind,
+                SymbolKind::Impl | SymbolKind::Trait | SymbolKind::Class | SymbolKind::Struct
+            );
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -637,21 +662,124 @@ mod tests {
 
     #[test]
     fn incremental_edit_then_reparse_matches_full() {
-        let mut buf = Buffer::new("fn a() {}\nfn b() {}\n");
+        let mut buf = Buffer::new("fn a() {}\nfn b() {}\nfn c() { \"s\" }\n");
         let mut s = Syntax::new(Lang::Rust);
-        s.set_tree(s.parse_full(buf.rope()).unwrap(), buf.version());
-        let edit = buf.replace(3..4, "été");
-        s.edit(&edit);
+        assert!(s.set_tree(s.parse_full(buf.rope()).unwrap(), buf.version()));
+        // A multibyte, multi-line insert on line 0 shifts every later line.
+        let edit = buf.replace(3..4, "été() {}\nfn z");
+        s.edit(&edit, buf.version());
+        assert!(s.is_stale());
         let rope = buf.rope();
-        let stale = s.highlight(rope, 0..2);
+        let fresh = spans_of(Lang::Rust, &rope.to_string());
+        let stale = s.highlight(rope, 0..rope.len_lines() + 3);
+        assert_eq!(stale.len(), rope.len_lines() + 3);
+        // Lines the edit did not touch keep their (shifted) spans from the stale tree.
+        assert_eq!(stale[2], fresh[2]);
+        assert_eq!(stale[3], fresh[3]);
+        assert!(s.set_tree(s.parse_full(rope).unwrap(), buf.version()));
+        assert!(!s.is_stale());
+        assert_eq!(s.highlight(rope, 0..rope.len_lines()), fresh);
+    }
+
+    #[test]
+    fn set_tree_ignores_trees_older_than_the_latest_edit() {
+        let mut buf = Buffer::new("fn a() {}");
+        let mut s = Syntax::new(Lang::Rust);
+        assert!(s.set_tree(s.parse_full(buf.rope()).unwrap(), buf.version()));
+        let old = s.parse_full(buf.rope()).unwrap();
+        let old_version = buf.version();
+        let edit = buf.replace(0..0, "// c\n");
+        s.edit(&edit, buf.version());
+        assert!(!s.set_tree(old, old_version), "older parse must be refused");
+        assert!(s.is_stale());
+        assert_eq!(s.version(), old_version);
+        let rope = buf.rope();
+        assert!(s.set_tree(s.parse_full(rope).unwrap(), buf.version()));
+        assert!(!s.is_stale());
+    }
+
+    #[test]
+    fn stale_tree_with_shrunk_text_does_not_panic() {
+        let mut s = Syntax::new(Lang::Rust);
+        let long = Rope::from_str("fn é() { let s = \"🦀🦀\"; }\nfn b() {}\n");
+        s.set_tree(s.parse_full(&long).unwrap(), 0);
+        // Text changed without telling the syntax: offsets are out of range or mid-char.
+        for text in ["", "é", "🦀", "fn"] {
+            let rope = Rope::from_str(text);
+            s.highlight(&rope, 0..3);
+            s.outline(&rope);
+        }
+    }
+
+    #[test]
+    fn outline_functions_in_modules_are_not_methods() {
+        let rope = Rope::from_str("mod tests { fn t() {} }\ntrait T { fn m(); }\n");
+        let mut s = Syntax::new(Lang::Rust);
+        s.set_tree(s.parse_full(&rope).unwrap(), 0);
+        let o: Vec<_> = s
+            .outline(&rope)
+            .into_iter()
+            .map(|x| (x.name, x.kind))
+            .collect();
         assert_eq!(
-            stale[1],
-            spans_of(Lang::Rust, &rope.to_string())[1],
-            "untouched line keeps spans through a stale tree"
+            o,
+            vec![
+                ("tests".into(), SymbolKind::Module),
+                ("t".into(), SymbolKind::Function),
+                ("T".into(), SymbolKind::Trait),
+                ("m".into(), SymbolKind::Method),
+            ]
         );
-        s.set_tree(s.parse_full(rope).unwrap(), buf.version());
-        let full = spans_of(Lang::Rust, &rope.to_string());
-        assert_eq!(s.highlight(rope, 0..rope.len_lines()), full);
+    }
+
+    #[test]
+    fn outline_bash_both_function_forms() {
+        let rope = Rope::from_str("foo() {\n  echo a\n}\nfunction bar {\n  echo b\n}\n");
+        let mut s = Syntax::new(Lang::Bash);
+        s.set_tree(s.parse_full(&rope).unwrap(), 0);
+        let o: Vec<_> = s
+            .outline(&rope)
+            .into_iter()
+            .map(|x| (x.name, x.line))
+            .collect();
+        assert_eq!(o, vec![("foo".into(), 0), ("bar".into(), 3)]);
+    }
+
+    #[test]
+    fn outline_python_and_typescript() {
+        let py = Rope::from_str("class A:\n    def m(self):\n        pass\n\ndef f():\n    pass\n");
+        let mut s = Syntax::new(Lang::Python);
+        s.set_tree(s.parse_full(&py).unwrap(), 0);
+        let o: Vec<_> = s
+            .outline(&py)
+            .into_iter()
+            .map(|x| (x.name, x.kind))
+            .collect();
+        assert_eq!(
+            o,
+            vec![
+                ("A".into(), SymbolKind::Class),
+                ("m".into(), SymbolKind::Method),
+                ("f".into(), SymbolKind::Function)
+            ]
+        );
+        let ts = Rope::from_str("class C { m() {} }\nfunction g() {}\ninterface I {}\n");
+        let mut s = Syntax::new(Lang::TypeScript);
+        s.set_tree(s.parse_full(&ts).unwrap(), 0);
+        let o: Vec<_> = s
+            .outline(&ts)
+            .into_iter()
+            .map(|x| (x.name, x.kind))
+            .collect();
+        assert_eq!(
+            o,
+            vec![
+                ("C".into(), SymbolKind::Class),
+                ("m".into(), SymbolKind::Method),
+                ("g".into(), SymbolKind::Function),
+                ("I".into(), SymbolKind::Interface)
+            ]
+        );
     }
 
     #[test]

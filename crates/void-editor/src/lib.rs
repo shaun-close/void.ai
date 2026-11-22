@@ -10,4 +10,4 @@ mod syntax;
 
 pub use buffer::{Buffer, Edit, LineEnding, Point};
 pub use lang::Lang;
-pub use syntax::{Hl, Span, Symbol, SymbolKind, Syntax};
+pub use syntax::{Hl, Span, Symbol, SymbolKind, Syntax, Tree};
