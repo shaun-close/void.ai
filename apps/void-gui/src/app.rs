@@ -29,6 +29,9 @@ pub struct VoidApp {
     folders: (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>),
     applied_style: Option<(Theme, u32)>,
     title: String,
+    list: crate::panels::conversations::ListUi,
+    /// A first message waiting for the conversation it asked the engine to create.
+    pending_start: Option<(u32, String)>,
 }
 
 impl VoidApp {
@@ -57,6 +60,8 @@ impl VoidApp {
             folders: mpsc::channel(),
             applied_style: None,
             title: String::new(),
+            list: Default::default(),
+            pending_start: None,
         }
     }
 
@@ -73,7 +78,19 @@ impl VoidApp {
             self.focused_chat = None;
         }
         if let Some(id) = self.state.take_created() {
-            self.apply_action(Action::Show(id));
+            match self.pending_start.take() {
+                Some((tab, text)) => {
+                    match self.chat_tab_mut(tab) {
+                        Some(slot) => *slot = Some(id),
+                        None => self.apply_action(Action::Show(id)),
+                    }
+                    self.engine.send(Command::SendMessage {
+                        conversation: id,
+                        text,
+                    });
+                }
+                None => self.apply_action(Action::Show(id)),
+            }
         }
         while let Ok(folder) = self.folders.1.try_recv() {
             self.open_workspace(Some(folder));
@@ -119,6 +136,11 @@ impl VoidApp {
         let (conv, new_tab) = match action {
             Action::Show(c) => (c, false),
             Action::ShowInNewTab(c) => (c, true),
+            Action::StartChat { tab, text } => {
+                self.pending_start = Some((tab, text));
+                self.engine.send(Command::NewConversation);
+                return;
+            }
         };
         if !self.state.loaded.contains_key(&conv) {
             self.engine.send(Command::OpenConversation(conv));
@@ -380,11 +402,14 @@ impl eframe::App for VoidApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
 
         let mut actions = Vec::new();
+        let focused = self.focused_conversation();
         let mut panels = Panels {
             state: &mut self.state,
             engine: &self.engine,
             inputs: &mut self.inputs,
             actions: &mut actions,
+            list: &mut self.list,
+            focused,
         };
         DockArea::new(&mut self.dock)
             .style(Style::from_egui(ui.style().as_ref()))

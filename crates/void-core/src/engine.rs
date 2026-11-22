@@ -40,6 +40,8 @@ pub enum Command {
         conversation: ConversationId,
         text: String,
     },
+    /// Ask again for the reply to the last user message (after a failed or stopped reply).
+    Retry(ConversationId),
     Stop(ConversationId),
     SaveConfig(Config),
     TestProfile(Profile),
@@ -283,6 +285,16 @@ impl State {
                 self.update(id, |c| c.profile_id = profile);
             }
             Command::SendMessage { conversation, text } => self.send_message(conversation, text),
+            Command::Retry(id) => {
+                if self.streams.contains_key(&id) {
+                    return;
+                }
+                if let Some(c) = self.conversation(id).cloned()
+                    && c.messages.iter().any(|m| m.role == Role::User)
+                {
+                    self.start_stream(c);
+                }
+            }
             Command::Stop(id) => {
                 if let Some(s) = self.streams.get(&id) {
                     s.abort.abort();
@@ -385,7 +397,6 @@ impl State {
             ));
             return;
         }
-        let active = self.config.active_profile.clone();
         let Some(c) = self.conversation(id) else {
             return;
         };
@@ -398,12 +409,20 @@ impl State {
         }
         c.messages.push(Message::user(text));
         c.updated = Utc::now();
-        let profile_id = c.profile_id.clone().unwrap_or(active);
         let c = c.clone();
         self.save(&c);
         self.emit(Event::Conversation(c.clone()));
         self.emit_list();
+        self.start_stream(c);
+    }
 
+    /// Ask the conversation's backend for the next reply.
+    fn start_stream(&mut self, c: Conversation) {
+        let id = c.id;
+        let profile_id = c
+            .profile_id
+            .clone()
+            .unwrap_or_else(|| self.config.active_profile.clone());
         let generation = self.next_gen;
         self.next_gen += 1;
         let profile = self.config.profile(&profile_id).cloned();
@@ -887,6 +906,30 @@ mod tests {
             Event::StreamFinished { message, .. } => assert_eq!(message.text(), "Hello"),
             e => panic!("unexpected {e:?}"),
         }
+    }
+
+    #[test]
+    fn retry_streams_without_adding_a_user_message() {
+        let mut r = rig();
+        r.started();
+        let c = r.new_conversation();
+        r.profile(c, "dead");
+        r.send(c, "hello?");
+        r.until(|e| matches!(e, Event::StreamFailed { .. }));
+        r.profile(c, "fast");
+        r.handle.send(Command::Retry(c));
+        match r.until(|e| matches!(e, Event::StreamFinished { .. } | Event::Error(_))) {
+            Event::StreamFinished { message, .. } => assert_eq!(message.text(), "Hello"),
+            e => panic!("unexpected {e:?}"),
+        }
+        let saved = r.store.load(&Workspace::scratch().id, &c).unwrap();
+        let users = saved
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::model::Role::User)
+            .count();
+        assert_eq!(users, 1);
+        assert_eq!(saved.messages.len(), 3);
     }
 
     #[test]

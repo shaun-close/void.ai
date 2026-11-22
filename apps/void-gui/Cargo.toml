@@ -10,6 +10,7 @@ name = "void-ai"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11", "persistence"] }
 egui = "0.37"
 egui_dock = { version = "0.22", features = ["serde"] }
