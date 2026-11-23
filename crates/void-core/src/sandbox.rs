@@ -3,6 +3,7 @@
 //! a scrubbed environment, and (when the helper is present) Landlock as a second layer.
 
 use std::ffi::OsString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -130,6 +131,98 @@ pub struct RunPlan {
     pub timeout_secs: Option<u64>,
 }
 
+/// The chat overlay mounts a process gets (as in [`RunPlan`]).
+#[derive(Clone, Debug)]
+pub struct OverlayMounts {
+    pub workspace: PathBuf,
+    pub upper: PathBuf,
+    pub work: PathBuf,
+    /// Read-write CARGO_TARGET_DIR (per workspace, outside the overlay).
+    pub target_dir: PathBuf,
+}
+
+/// A read-write bind for a spawned process. A missing target is created first so the bind
+/// has something to mount; a present one is never touched (not even read).
+#[derive(Clone, Debug)]
+pub enum RwBind {
+    /// Created (with parents) as an empty directory when absent.
+    Dir(PathBuf),
+    /// Created with `if_missing` as its contents when absent.
+    File { path: PathBuf, if_missing: String },
+}
+
+impl RwBind {
+    pub fn path(&self) -> &Path {
+        match self {
+            RwBind::Dir(p) | RwBind::File { path: p, .. } => p,
+        }
+    }
+}
+
+/// A long-lived process (a coding agent CLI for one chat turn). Besides what [`RunPlan`]
+/// gives a command, `$HOME` gets a throwaway writable layer (bwrap `--tmp-overlay`, gone when
+/// the process exits) so the program can keep lock and temp files next to its state;
+/// `rw_binds` sit on top of that layer and are written through to the host.
+#[derive(Clone, Debug)]
+pub struct SpawnPlan {
+    /// `None` for Scratch: a read-only view, plus `rw_binds` and `cwd` bound writable.
+    pub overlay: Option<OverlayMounts>,
+    pub argv: Vec<OsString>,
+    /// Set on top of the scrubbed environment.
+    pub env: Vec<(OsString, OsString)>,
+    pub rw_binds: Vec<RwBind>,
+    /// Paths dropped from the effective hidden list for this process only.
+    pub unhide: Vec<PathBuf>,
+    /// Working directory: inside the workspace, or (Scratch) a void.ai-owned directory that is
+    /// created if missing.
+    pub cwd: PathBuf,
+}
+
+/// A running [`Sandbox::spawn`] process. Dropping it kills the sandbox (SIGKILL).
+///
+/// The cache lock (when there are caches) is held until the sandbox is really gone, which is
+/// later than bwrap's exit: bwrap returns as soon as the program does, while the kernel is
+/// still tearing down the PID namespace and its overlays, and mounting the same layers again
+/// in that window fails with EBUSY. A watcher thread waits on the namespace's init (from
+/// bwrap's `--info-fd`, via a pidfd) and releases the lock then.
+pub struct Spawned {
+    /// bwrap itself, leader of its own process group; stdin, stdout and stderr are piped.
+    pub child: tokio::process::Child,
+    /// Turns true once the sandbox is gone and the cache lock released.
+    gone: tokio::sync::watch::Receiver<bool>,
+}
+
+const KILL_GRACE: Duration = Duration::from_secs(3);
+
+impl Spawned {
+    /// Wait for the program to exit and the sandbox to be torn down.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        let _ = self.gone.wait_for(|g| *g).await;
+        status
+    }
+
+    /// SIGTERM to the sandboxed process group, then SIGKILL to the whole sandbox after 3 s.
+    pub async fn kill(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let Some(pid) = self.child.id().map(|p| p as i32) else {
+            return self.child.wait().await;
+        };
+        // bwrap dies on SIGTERM without passing it on, so signal the sandboxed program's own
+        // group (bwrap's --new-session made it a session leader). If it hasn't started yet,
+        // SIGTERM to bwrap's group tears the sandbox down.
+        let group = sandboxed_group(pid).unwrap_or(pid);
+        // SAFETY: plain kill(2) on a process group we started.
+        unsafe { libc::kill(-group, libc::SIGTERM) };
+        if let Ok(status) = tokio::time::timeout(KILL_GRACE, self.wait()).await {
+            return status;
+        }
+        // SAFETY: as above; the PID namespace dies with bwrap.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let _ = self.child.start_kill();
+        self.wait().await
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecResult {
     pub exit: Option<i32>,
@@ -176,6 +269,20 @@ fn current_uid() -> u32 {
     std::fs::metadata("/proc/self")
         .map(|m| m.uid())
         .unwrap_or(0)
+}
+
+/// A bwrap argument list under construction.
+#[derive(Default)]
+struct Args(Vec<OsString>);
+
+impl Args {
+    fn push(&mut self, xs: &[&std::ffi::OsStr]) {
+        self.0.extend(xs.iter().map(|x| x.to_os_string()));
+    }
+
+    fn extend(&mut self, xs: &[OsString]) {
+        self.0.extend_from_slice(xs);
+    }
 }
 
 /// Keep the tail of the output; returns (text, bytes cut from the front).
@@ -299,11 +406,9 @@ impl Sandbox {
         Availability::Ready { landlock }
     }
 
-    /// The full bwrap argument list for one command.
-    pub fn bwrap_args(&self, plan: &RunPlan) -> Vec<OsString> {
-        let mut a: Vec<OsString> = Vec::new();
-        let mut push = |xs: &[&std::ffi::OsStr]| a.extend(xs.iter().map(|x| x.to_os_string()));
-        push(&[
+    /// Namespaces, the read-only root, /dev, /proc and an empty /tmp.
+    fn args_base(&self, a: &mut Args) {
+        a.push(&[
             "--die-with-parent".as_ref(),
             "--new-session".as_ref(),
             "--unshare-pid".as_ref(),
@@ -311,9 +416,9 @@ impl Sandbox {
             "--unshare-uts".as_ref(),
         ]);
         if !self.settings.network {
-            push(&["--unshare-net".as_ref()]);
+            a.push(&["--unshare-net".as_ref()]);
         }
-        push(&[
+        a.push(&[
             "--ro-bind".as_ref(),
             "/".as_ref(),
             "/".as_ref(),
@@ -324,10 +429,12 @@ impl Sandbox {
             "--tmpfs".as_ref(),
             "/tmp".as_ref(),
         ]);
-        let caches = self.caches();
-        for (cache, layer) in &caches {
+    }
+
+    fn args_caches(&self, a: &mut Args, caches: &[(PathBuf, PathBuf)]) {
+        for (cache, layer) in caches {
             let (up, work) = (layer.join("upper"), layer.join("work"));
-            push(&[
+            a.push(&[
                 "--overlay-src".as_ref(),
                 cache.as_os_str(),
                 "--overlay".as_ref(),
@@ -336,69 +443,230 @@ impl Sandbox {
                 cache.as_os_str(),
             ]);
         }
-        let ws = plan.workspace.as_os_str();
-        push(&[
+    }
+
+    /// The chat's overlay on the workspace, with `.git` read-only on top.
+    fn args_overlay(&self, a: &mut Args, workspace: &Path, upper: &Path, work: &Path) {
+        let ws = workspace.as_os_str();
+        a.push(&[
             "--overlay-src".as_ref(),
             ws,
             "--overlay".as_ref(),
-            plan.upper.as_os_str(),
-            plan.work.as_os_str(),
+            upper.as_os_str(),
+            work.as_os_str(),
             ws,
         ]);
-        let git = plan.workspace.join(".git");
+        let git = workspace.join(".git");
         if git.exists() {
-            push(&["--ro-bind".as_ref(), git.as_os_str(), git.as_os_str()]);
+            a.push(&["--ro-bind".as_ref(), git.as_os_str(), git.as_os_str()]);
         }
-        let target = plan.target_dir.as_os_str();
-        push(&["--bind".as_ref(), target, target]);
-        // Hidden paths last, so they also cover anything inside the workspace or caches.
-        // Mount over the real location (bwrap can't mount through symlinks such as
-        // /var/run → /run): directories get an empty tmpfs, files and sockets /dev/null.
+    }
+
+    /// Hidden paths, minus `unhide`. Mount over the real location (bwrap can't mount through
+    /// symlinks such as /var/run → /run): directories get an empty tmpfs, files and sockets
+    /// /dev/null.
+    fn args_hidden(&self, a: &mut Args, unhide: &[PathBuf]) {
+        let unhide: Vec<PathBuf> = unhide
+            .iter()
+            .flat_map(|u| {
+                [
+                    u.clone(),
+                    std::fs::canonicalize(u).unwrap_or_else(|_| u.clone()),
+                ]
+            })
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for h in self.hidden_paths() {
             let Ok(real) = std::fs::canonicalize(&h) else {
                 continue;
             };
-            if !seen.insert(real.clone()) {
+            if unhide.contains(&h) || unhide.contains(&real) || !seen.insert(real.clone()) {
                 continue;
             }
             if real.is_dir() {
-                push(&["--tmpfs".as_ref(), real.as_os_str()]);
+                a.push(&["--tmpfs".as_ref(), real.as_os_str()]);
             } else {
-                push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), real.as_os_str()]);
+                a.push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), real.as_os_str()]);
             }
         }
-        push(&["--clearenv".as_ref()]);
+    }
+
+    /// The scrubbed environment.
+    fn args_env(&self, a: &mut Args, target: Option<&std::ffi::OsStr>) {
+        a.push(&["--clearenv".as_ref()]);
         for k in ENV_PASS {
             if let Some(v) = std::env::var_os(k) {
-                push(&["--setenv".as_ref(), k.as_ref(), v.as_os_str()]);
+                a.push(&["--setenv".as_ref(), k.as_ref(), v.as_os_str()]);
             }
         }
-        push(&["--setenv".as_ref(), "HOME".as_ref(), self.home.as_os_str()]);
-        push(&["--setenv".as_ref(), "TERM".as_ref(), "dumb".as_ref()]);
-        push(&["--setenv".as_ref(), "CARGO_TARGET_DIR".as_ref(), target]);
-        push(&["--chdir".as_ref(), ws, "--".as_ref()]);
+        a.push(&["--setenv".as_ref(), "HOME".as_ref(), self.home.as_os_str()]);
+        a.push(&["--setenv".as_ref(), "TERM".as_ref(), "dumb".as_ref()]);
+        if let Some(t) = target {
+            a.push(&["--setenv".as_ref(), "CARGO_TARGET_DIR".as_ref(), t]);
+        }
+    }
+
+    /// The Landlock helper (when present), allowed to write only beneath `writes`.
+    fn args_helper(&self, a: &mut Args, writes: &[&std::ffi::OsStr]) {
         if let Some(helper) = &self.helper {
-            push(&[helper.as_os_str()]);
-            let mut writes: Vec<&std::ffi::OsStr> =
-                vec![ws, "/tmp".as_ref(), "/dev".as_ref(), target];
-            for (cache, _) in &caches {
-                writes.push(cache.as_os_str());
-            }
+            a.push(&[helper.as_os_str()]);
             for w in writes {
-                push(&["--write".as_ref(), w]);
+                a.push(&["--write".as_ref(), w]);
             }
-            push(&["--".as_ref()]);
+            a.push(&["--".as_ref()]);
         }
+    }
+
+    /// The full bwrap argument list for one command.
+    pub fn bwrap_args(&self, plan: &RunPlan) -> Vec<OsString> {
+        let mut a = Args::default();
+        self.args_base(&mut a);
+        let caches = self.caches();
+        self.args_caches(&mut a, &caches);
+        self.args_overlay(&mut a, &plan.workspace, &plan.upper, &plan.work);
+        let target = plan.target_dir.as_os_str();
+        a.push(&["--bind".as_ref(), target, target]);
+        // Hidden paths last, so they also cover anything inside the workspace or caches.
+        self.args_hidden(&mut a, &[]);
+        self.args_env(&mut a, Some(target));
+        let ws = plan.workspace.as_os_str();
+        a.push(&["--chdir".as_ref(), ws, "--".as_ref()]);
+        let mut writes: Vec<&std::ffi::OsStr> = vec![ws, "/tmp".as_ref(), "/dev".as_ref(), target];
+        writes.extend(caches.iter().map(|(c, _)| c.as_os_str()));
+        self.args_helper(&mut a, &writes);
         // No profile or rc files: the environment is exactly what's set above.
-        push(&[
+        a.push(&[
             "bash".as_ref(),
             "--noprofile".as_ref(),
             "--norc".as_ref(),
             "-c".as_ref(),
             plan.command.as_ref(),
         ]);
-        a
+        a.0
+    }
+
+    /// The bwrap argument list for a long-lived process (see [`SpawnPlan`]). Mount order, from
+    /// the bottom: the read-only root, the throwaway home layer, package caches, the chat's
+    /// workspace overlay, `rw_binds`, the hidden paths (minus `unhide`), then void.ai's own
+    /// writable directories (target dir, Scratch cwd), which live under its hidden data dir.
+    pub fn spawn_args(&self, plan: &SpawnPlan) -> Vec<OsString> {
+        let mut a = Args::default();
+        self.args_base(&mut a);
+        // Throwaway writable home: writes land in an invisible tmpfs, gone with the process.
+        let home = std::fs::canonicalize(&self.home).ok();
+        if let Some(h) = &home {
+            let h = h.as_os_str();
+            a.push(&["--overlay-src".as_ref(), h, "--tmp-overlay".as_ref(), h]);
+        }
+        let caches = self.caches();
+        self.args_caches(&mut a, &caches);
+        if let Some(o) = &plan.overlay {
+            self.args_overlay(&mut a, &o.workspace, &o.upper, &o.work);
+        }
+        let binds: Vec<PathBuf> = plan
+            .rw_binds
+            .iter()
+            .filter_map(|b| std::fs::canonicalize(b.path()).ok())
+            .collect();
+        for b in &binds {
+            a.push(&["--bind".as_ref(), b.as_os_str(), b.as_os_str()]);
+        }
+        self.args_hidden(&mut a, &plan.unhide);
+        let target = plan.overlay.as_ref().map(|o| o.target_dir.as_os_str());
+        if let Some(t) = target {
+            a.push(&["--bind".as_ref(), t, t]);
+        }
+        let cwd = plan.cwd.as_os_str();
+        if plan.overlay.is_none() {
+            a.push(&["--bind".as_ref(), cwd, cwd]);
+        }
+        self.args_env(&mut a, target);
+        for (k, v) in &plan.env {
+            a.push(&["--setenv".as_ref(), k.as_os_str(), v.as_os_str()]);
+        }
+        a.push(&["--chdir".as_ref(), cwd, "--".as_ref()]);
+        let mut writes: Vec<&std::ffi::OsStr> = vec!["/tmp".as_ref(), "/dev".as_ref()];
+        match &plan.overlay {
+            Some(o) => writes.extend([o.workspace.as_os_str(), o.target_dir.as_os_str()]),
+            None => writes.push(cwd),
+        }
+        writes.extend(caches.iter().map(|(c, _)| c.as_os_str()));
+        writes.extend(home.iter().map(|h| h.as_os_str()));
+        writes.extend(binds.iter().map(|b| b.as_os_str()));
+        self.args_helper(&mut a, &writes);
+        a.extend(&plan.argv);
+        a.0
+    }
+
+    /// Start a long-lived process in the sandbox (no timeout; stdio piped; own process
+    /// group). Holds the cache lock for as long as the returned [`Spawned`] lives, so other
+    /// commands wait; when the lock is taken, `on_wait` is called once before waiting for it
+    /// (the caller's "waiting for sandbox" signal).
+    pub async fn spawn(
+        &self,
+        plan: SpawnPlan,
+        on_wait: impl FnOnce() + Send,
+    ) -> Result<Spawned, String> {
+        let Some(bwrap) = &self.bwrap else {
+            return Err("bubblewrap (bwrap) isn't installed".into());
+        };
+        if plan.argv.is_empty() {
+            return Err("nothing to run".into());
+        }
+        let caches = self.caches();
+        let lock = if caches.is_empty() {
+            None
+        } else {
+            Some(match self.lock.clone().try_lock_owned() {
+                Ok(g) => g,
+                Err(_) => {
+                    on_wait();
+                    self.lock.clone().lock_owned().await
+                }
+            })
+        };
+        let mut dirs: Vec<&Path> = Vec::new();
+        match &plan.overlay {
+            Some(o) => dirs.extend([o.target_dir.as_path(), &o.upper, &o.work]),
+            None => dirs.push(&plan.cwd),
+        }
+        for dir in dirs {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("can't prepare {}: {e}", dir.display()))?;
+        }
+        for (_, layer) in &caches {
+            let _ = std::fs::create_dir_all(layer.join("upper"));
+            let _ = std::fs::create_dir_all(layer.join("work"));
+        }
+        prepare_rw_binds(&plan.rw_binds)?;
+        let (info_r, info_w) =
+            cloexec_pipe().map_err(|e| format!("can't start bubblewrap: {e}"))?;
+        let w = info_w.as_raw_fd();
+        let mut cmd = tokio::process::Command::new(bwrap);
+        cmd.arg("--info-fd")
+            .arg(w.to_string())
+            .args(self.spawn_args(&plan))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        // SAFETY: only fcntl(2) between fork and exec, so bwrap inherits the info fd.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(w, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("can't start bubblewrap: {e}"))?;
+        drop(info_w);
+        let (tx, gone) = tokio::sync::watch::channel(false);
+        watch_teardown(info_r, lock, tx);
+        Ok(Spawned { child, gone })
     }
 
     /// Run one command; output streams to `stream` as it arrives.
@@ -505,6 +773,133 @@ impl Sandbox {
             cut_bytes: cut + dropped,
         }
     }
+}
+
+/// Create missing bind targets (directories, or files with their initial contents). Present
+/// targets are left alone; `create_new` makes sure an existing file is never overwritten.
+pub fn prepare_rw_binds(binds: &[RwBind]) -> Result<(), String> {
+    for b in binds {
+        let res = match b {
+            RwBind::Dir(p) => std::fs::create_dir_all(p),
+            RwBind::File { path, if_missing } => {
+                if path.symlink_metadata().is_ok() {
+                    continue;
+                }
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .and_then(|mut f| f.write_all(if_missing.as_bytes()))
+                    .or_else(|e| match e.kind() {
+                        std::io::ErrorKind::AlreadyExists => Ok(()),
+                        _ => Err(e),
+                    })
+            }
+        };
+        res.map_err(|e| format!("can't prepare {}: {e}", b.path().display()))?;
+    }
+    Ok(())
+}
+
+fn cloexec_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2(2) fills both fds on success; each is owned exactly once below.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fresh fds from pipe2.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// `"child-pid": N` from bwrap's `--info-fd` JSON.
+fn info_child_pid(info: &str) -> Option<i32> {
+    let rest = &info[info.find("\"child-pid\"")? + "\"child-pid\"".len()..];
+    let digits: String = rest
+        .trim_start_matches([':', ' ', '\n', '\t'])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// See [`Spawned`]: release `lock` and report `gone` once the sandbox's PID-namespace init has
+/// exited (by then the kernel has dropped its mounts). If its pid can't be learned or opened,
+/// it is already gone.
+fn watch_teardown(
+    info: OwnedFd,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    gone: tokio::sync::watch::Sender<bool>,
+) {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::from(info);
+        let (mut text, mut buf) = (Vec::new(), [0u8; 512]);
+        while !text.contains(&b'}') {
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => text.extend_from_slice(&buf[..n]),
+            }
+        }
+        drop(file);
+        if let Some(pid) = info_child_pid(&String::from_utf8_lossy(&text)) {
+            // SAFETY: pidfd_open(2); a negative result means the process is already gone.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+            if fd >= 0 {
+                // SAFETY: fresh fd from pidfd_open.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                let mut p = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // A pidfd turns readable when the process has exited.
+                // SAFETY: poll(2) on one valid pollfd.
+                while unsafe { libc::poll(&mut p, 1, -1) } == -1
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                }
+            }
+        }
+        drop(lock);
+        let _ = gone.send(true);
+    });
+}
+
+/// `(comm, ppid, pgrp)` from /proc/<pid>/stat.
+fn proc_stat(pid: i32) -> Option<(String, i32, i32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+    let comm = stat.get(open + 1..close)?.to_string();
+    let mut rest = stat.get(close + 1..)?.split_whitespace().skip(1);
+    let ppid = rest.next()?.parse().ok()?;
+    let pgrp = rest.next()?.parse().ok()?;
+    Some((comm, ppid, pgrp))
+}
+
+/// The process group of the program bwrap runs: the first descendant of `bwrap` that isn't
+/// bwrap itself (its PID-namespace init is).
+fn sandboxed_group(bwrap: i32) -> Option<i32> {
+    let procs: Vec<(i32, String, i32, i32)> = std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(|pid| proc_stat(pid).map(|(c, pp, pg)| (pid, c, pp, pg)))
+        .collect();
+    let mut frontier = vec![bwrap];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (pid, comm, ppid, pgrp) in &procs {
+            if frontier.contains(ppid) {
+                if comm != "bwrap" {
+                    return Some(*pgrp);
+                }
+                next.push(*pid);
+            }
+        }
+        frontier = next;
+    }
+    None
 }
 
 fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut r: R, tx: UnboundedSender<Vec<u8>>) {
@@ -796,6 +1191,182 @@ mod tests {
         assert_eq!(
             &a[a.len() - 5..],
             ["bash", "--noprofile", "--norc", "-c", "true"]
+        );
+    }
+
+    /// A home with Claude Code state, an SSH dir and a Claude desktop dir, all hidden by
+    /// default; the plan unhides and binds only `~/.claude` and `~/.claude.json`.
+    fn claude_rig(tmp: &Path) -> (Sandbox, PathBuf, SpawnPlan) {
+        let home = tmp.join("home");
+        let ws = home.join("proj");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude.json"), "{}").unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(home.join(".config/Claude")).unwrap();
+        fs::create_dir_all(home.join(".cargo/registry")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let settings = SandboxSettings {
+            hidden: vec![
+                "~/.ssh".into(),
+                "~/.claude".into(),
+                "~/.claude.json".into(),
+                "~/.config/Claude".into(),
+            ],
+            caches: vec!["~/.cargo/registry".into()],
+            ..SandboxSettings::default()
+        };
+        let sb = Sandbox::with_paths(
+            Some("/usr/bin/bwrap".into()),
+            None,
+            tmp.join("data"),
+            home.clone(),
+            settings,
+        );
+        let plan = SpawnPlan {
+            overlay: Some(OverlayMounts {
+                workspace: ws.clone(),
+                upper: tmp.join("ovl/upper"),
+                work: tmp.join("ovl/work"),
+                target_dir: tmp.join("target"),
+            }),
+            argv: vec!["claude".into(), "-p".into()],
+            env: vec![("VOID_TEST_ENV".into(), "1".into())],
+            rw_binds: vec![
+                RwBind::Dir(home.join(".claude")),
+                RwBind::File {
+                    path: home.join(".claude.json"),
+                    if_missing: "{}".into(),
+                },
+            ],
+            unhide: vec![home.join(".claude"), home.join(".claude.json")],
+            cwd: ws,
+        };
+        (sb, home, plan)
+    }
+
+    #[test]
+    fn spawn_args_unhide_and_bind_claude_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, home, plan) = claude_rig(tmp.path());
+        let a = strs(&sb.spawn_args(&plan));
+        let p = |x: &Path| x.canonicalize().unwrap().to_string_lossy().into_owned();
+        let (h, claude, cj) = (
+            p(&home),
+            p(&home.join(".claude")),
+            p(&home.join(".claude.json")),
+        );
+        let layer = pos(&a, &["--overlay-src", &h, "--tmp-overlay", &h]).expect("home layer");
+        let cache = pos(&a, &["--overlay-src", &p(&home.join(".cargo/registry"))]).unwrap();
+        let ovl = pos(&a, &["--overlay-src", &p(&home.join("proj"))]).unwrap();
+        let b1 = pos(&a, &["--bind", &claude, &claude]).expect("~/.claude rw");
+        let b2 = pos(&a, &["--bind", &cj, &cj]).expect("~/.claude.json rw");
+        assert!(
+            layer < cache && layer < ovl,
+            "home layer goes under everything else"
+        );
+        assert!(
+            layer < b1 && layer < b2,
+            "claude state binds sit on the home layer"
+        );
+        assert!(pos(&a, &["--tmpfs", &claude]).is_none());
+        assert!(pos(&a, &["--ro-bind", "/dev/null", &cj]).is_none());
+        let ssh = pos(&a, &["--tmpfs", &p(&home.join(".ssh"))]).expect("~/.ssh hidden");
+        let desk = pos(&a, &["--tmpfs", &p(&home.join(".config/Claude"))]).unwrap();
+        assert!(ssh > b2 && desk > b2 && ssh > ovl, "hidden mounts on top");
+        let t = tmp.path().join("target");
+        let tb = pos(&a, &["--bind", &t.to_string_lossy(), &t.to_string_lossy()]).unwrap();
+        assert!(
+            tb > ssh,
+            "void's own target dir is bound after the hidden mounts"
+        );
+        assert!(a.iter().any(|x| x == "--clearenv"));
+        assert!(pos(&a, &["--setenv", "VOID_TEST_ENV", "1"]).is_some());
+        assert!(pos(&a, &["--setenv", "HOME", &home.to_string_lossy()]).is_some());
+        assert!(pos(&a, &["--chdir", &home.join("proj").to_string_lossy()]).is_some());
+        assert_eq!(&a[a.len() - 3..], ["--", "claude", "-p"]);
+        assert!(!a.iter().any(|x| x == "bash"));
+    }
+
+    #[test]
+    fn spawn_keeps_void_agent_hiding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, home, plan) = claude_rig(tmp.path());
+        let _ = sb.spawn_args(&plan);
+        let ov = plan.overlay.unwrap();
+        let run = RunPlan {
+            workspace: ov.workspace,
+            upper: ov.upper,
+            work: ov.work,
+            target_dir: ov.target_dir,
+            command: "true".into(),
+            timeout_secs: None,
+        };
+        let a = strs(&sb.bwrap_args(&run));
+        let p = |x: &Path| x.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(pos(&a, &["--tmpfs", &p(&home.join(".claude"))]).is_some());
+        assert!(
+            pos(
+                &a,
+                &["--ro-bind", "/dev/null", &p(&home.join(".claude.json"))]
+            )
+            .is_some()
+        );
+        assert!(!a.iter().any(|x| x == "--tmp-overlay"));
+        assert!(!a.iter().any(|x| x == "VOID_TEST_ENV"));
+    }
+
+    #[test]
+    fn spawn_scratch_without_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, _home, mut plan) = claude_rig(tmp.path());
+        let scratch = tmp.path().join("data/scratch/chat1");
+        plan.overlay = None;
+        plan.cwd = scratch.clone();
+        let a = strs(&sb.spawn_args(&plan));
+        let s = scratch.to_string_lossy().into_owned();
+        let ws = tmp.path().join("home/proj").canonicalize().unwrap();
+        assert!(
+            pos(&a, &["--overlay-src", &ws.to_string_lossy()]).is_none(),
+            "no workspace overlay"
+        );
+        assert!(!a.iter().any(|x| x == "CARGO_TARGET_DIR"));
+        let ssh_dir = tmp.path().join("home/.ssh").canonicalize().unwrap();
+        let ssh = pos(&a, &["--tmpfs", &ssh_dir.to_string_lossy()]).unwrap();
+        let cwd = pos(&a, &["--bind", &s, &s]).expect("cwd bound writable");
+        assert!(cwd > ssh);
+        assert!(pos(&a, &["--chdir", &s]).is_some());
+        // With the Landlock helper, the cwd and the claude state are writable too.
+        let ll = Sandbox::with_paths(
+            Some("/usr/bin/bwrap".into()),
+            Some("/x/void-sandbox-exec".into()),
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            sb.settings().clone(),
+        );
+        let b = strs(&ll.spawn_args(&plan));
+        let h = pos(&b, &["/x/void-sandbox-exec"]).unwrap();
+        assert!(pos(&b[h..], &["--write", &s]).is_some());
+        assert!(pos(&b[h..], &["--write", "/tmp"]).is_some());
+        let home = tmp.path().join("home").canonicalize().unwrap();
+        assert!(pos(&b[h..], &["--write", &home.to_string_lossy()]).is_some());
+        assert_eq!(&b[b.len() - 3..], ["--", "claude", "-p"]);
+    }
+
+    #[test]
+    fn spawn_prepares_missing_claude_state_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_sb, home, plan) = claude_rig(tmp.path());
+        fs::remove_dir_all(home.join(".claude")).unwrap();
+        fs::remove_file(home.join(".claude.json")).unwrap();
+        prepare_rw_binds(&plan.rw_binds).unwrap();
+        assert!(home.join(".claude").is_dir());
+        assert_eq!(fs::read_to_string(home.join(".claude.json")).unwrap(), "{}");
+        // Present targets are left exactly as they are (dummy content in a temp home).
+        fs::write(home.join(".claude.json"), "dummy").unwrap();
+        prepare_rw_binds(&plan.rw_binds).unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join(".claude.json")).unwrap(),
+            "dummy"
         );
     }
 }

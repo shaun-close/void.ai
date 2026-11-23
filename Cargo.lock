@@ -5089,6 +5089,7 @@ dependencies = [
  "globset",
  "hex",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",
