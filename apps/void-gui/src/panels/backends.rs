@@ -14,6 +14,8 @@ pub struct BackendsUi {
     draft: Option<Profile>,
     extra_text: String,
     confirm_delete: bool,
+    /// The kind each profile was last tested as: a result for another kind is dropped.
+    tested: std::collections::HashMap<String, BackendKind>,
 }
 
 /// A profile id from its name: lowercase ASCII words joined by `-`, made unique with `-2`, `-3`….
@@ -67,6 +69,11 @@ impl BackendsUi {
     /// Start editing a profile.
     pub fn select(&mut self, p: Profile) {
         edit(self, p);
+    }
+
+    /// A Test of profile `id` was started as `kind`.
+    pub fn tested(&mut self, id: &str, kind: BackendKind) {
+        self.tested.insert(id.to_string(), kind);
     }
 }
 
@@ -343,6 +350,11 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
             extra
         };
 
+        // A result from a Test of another kind (shown or still on its way) answers a
+        // different question: not shown while the kind differs.
+        if p.backends.tested.get(&d.id).is_some_and(|k| *k != d.kind) {
+            p.state.tests.remove(&d.id);
+        }
         match p.state.tests.get(&d.id) {
             Some(Ok(v)) if claude_code => {
                 ui.label(RichText::new(format!("Found Claude Code {}", v.join(" "))).weak());
@@ -373,6 +385,7 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
                     test.extra_body = m.clone();
                 }
                 p.state.tests.remove(&d.id);
+                p.backends.tested.insert(d.id.clone(), d.kind);
                 p.engine.send(Command::TestProfile(test));
             }
             if ui

@@ -7,7 +7,7 @@
 //! The engine owns the pending prompts (they sit with void's own approvals, so Stop, Delete and
 //! the turn's end close them the same way); [`HostBridge`] only carries requests to it.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
@@ -81,11 +81,35 @@ pub fn offers_always(suggestions: Option<&Value>) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// `path` relative to the workspace when it's inside it.
-fn relative(path: &str, base: Option<&Path>) -> String {
-    match base.and_then(|b| Path::new(path).strip_prefix(b).ok()) {
+/// `path` with `.` and `..` resolved lexically (symlinks aren't followed: this is for display).
+/// A `..` that would climb above the root stays at the root; one that leads a relative path is
+/// kept.
+fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A path as the approval dialog and tool cards show it: relative to the workspace (`base`)
+/// when it's inside it, else absolute. Normalised first, so a path that leaves the workspace
+/// through `..` shows where it really goes rather than as `../…` or under the workspace.
+pub fn display_path(path: &str, base: Option<&Path>) -> String {
+    let full = normalise(Path::new(path));
+    match base.and_then(|b| full.strip_prefix(normalise(b)).ok()) {
         Some(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
-        _ => path.to_string(),
+        _ => full.display().to_string(),
     }
 }
 
@@ -102,10 +126,10 @@ fn cap(s: String, max: usize) -> String {
 }
 
 /// What the request is about, readably: the command, file, URL, query or pattern; else the
-/// input as JSON. Paths are relative to `base` (the workspace) when inside it.
+/// input as JSON. Paths are shown by [`display_path`].
 pub fn summary(tool: &str, input: &Value, base: Option<&Path>) -> String {
     let field = |k: &str| input.get(k).and_then(Value::as_str);
-    let path = |k: &str| field(k).map(|p| relative(p, base));
+    let path = |k: &str| field(k).map(|p| display_path(p, base));
     let known = match tool {
         "Bash" => field("command").map(str::to_string),
         "Edit" | "Write" | "MultiEdit" | "Read" => path("file_path"),
@@ -144,7 +168,7 @@ pub fn approval_request(
             always_allow: offers_always(ask.suggestions.as_ref()),
             title: ask.title.clone(),
             description: ask.description.clone(),
-            blocked_path: ask.blocked_path.clone(),
+            blocked_path: ask.blocked_path.as_deref().map(|p| display_path(p, base)),
         },
     }
 }
@@ -239,6 +263,38 @@ mod tests {
             summary("Edit", &json!({"file_path": "/home/u/proj/a"}), None),
             "/home/u/proj/a"
         );
+    }
+
+    /// A path that leaves the workspace through `..` is shown absolute and normalised, never as
+    /// a misleading `../…` relative path (or with the workspace prefix hiding where it goes).
+    #[test]
+    fn dotdot_paths_shown_absolute() {
+        let base = Some(Path::new("/home/u/proj"));
+        assert_eq!(
+            display_path("/home/u/proj/../other/x.rs", base),
+            "/home/u/other/x.rs"
+        );
+        assert_eq!(display_path("/home/u/proj/src/../a.rs", base), "a.rs");
+        assert_eq!(display_path("/home/u/proj/./src/a.rs", base), "src/a.rs");
+        assert_eq!(display_path("/a/../../etc/passwd", None), "/etc/passwd");
+        assert_eq!(display_path("rel/../x", base), "x");
+        assert_eq!(display_path("../x", base), "../x");
+        assert_eq!(
+            summary(
+                "Edit",
+                &json!({"file_path": "/home/u/proj/../.ssh/k"}),
+                base
+            ),
+            "/home/u/.ssh/k"
+        );
+        let mut a = ask("Read", json!({"file_path": "/home/u/proj/a"}), None);
+        a.blocked_path = Some("/home/u/proj/../secrets".into());
+        match approval_request(ConversationId::new(), &a, base).kind {
+            ApprovalKind::ClaudeCode { blocked_path, .. } => {
+                assert_eq!(blocked_path.as_deref(), Some("/home/u/secrets"))
+            }
+            k => panic!("{k:?}"),
+        }
     }
 
     #[test]

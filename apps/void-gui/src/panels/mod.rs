@@ -9,6 +9,7 @@ use void_core::model::ConversationId;
 
 pub mod backends;
 pub mod chat;
+pub mod claude_cards;
 pub mod conversations;
 pub mod files;
 pub mod review;

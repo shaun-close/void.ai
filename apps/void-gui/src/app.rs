@@ -490,15 +490,22 @@ impl VoidApp {
                         void_core::config::BackendKind::Anthropic => pal.accent3,
                         void_core::config::BackendKind::ClaudeCode => pal.accent,
                     };
-                    theme::pill(ui, icon::PLUGS, format!("{} · {}", p.name, p.model), color)
-                        .on_hover_text(&p.base_url);
+                    let reported = conv
+                        .and_then(|c| self.state.claude_models.get(&c))
+                        .map(String::as_str);
+                    let (label, hover) = profile_pill(p, reported);
+                    theme::pill(ui, icon::PLUGS, label, color).on_hover_text(hover);
                 }
                 None => {
                     theme::pill(ui, icon::WARNING, "no profile", pal.err);
                 }
             };
             let streaming = conv.is_some_and(|c| self.state.streams.contains_key(&c));
-            if streaming {
+            let turn_status = conv.and_then(|c| self.state.turn_status.get(&c));
+            if let Some(st) = turn_status {
+                // Waiting (for the sandbox, an API retry…): say so instead of "streaming".
+                theme::pill(ui, icon::ARROW_CLOCKWISE, shorten(st, 48), pal.warn).on_hover_text(st);
+            } else if streaming {
                 let t = ((ui.input(|i| i.time) * 3.0).sin() as f32 + 1.0) / 2.0;
                 theme::pill(
                     ui,
@@ -554,25 +561,40 @@ impl VoidApp {
                 self.state.profile_for(conv),
             ) {
                 let used = context_used(c);
-                let frac = theme::context_fraction(used, p.context_limit);
-                let color = theme::meter_color(&pal, frac);
                 ui.add_space(4.0);
-                ui.label(theme::ico(icon::GAUGE).color(color));
-                theme::meter(ui, 90.0, frac, color);
-                ui.label(
-                    RichText::new(format!(
-                        "context {} / {}",
-                        fmt_k(used),
-                        fmt_k(p.context_limit)
-                    ))
-                    .small()
-                    .color(pal.text_dim),
-                )
-                .on_hover_text(format!(
-                    "{used} of {} tokens ({:.1}%)",
-                    p.context_limit,
-                    frac * 100.0
-                ));
+                if p.kind == void_core::config::BackendKind::ClaudeCode {
+                    // Claude Code manages its own window; the profile's limit means nothing
+                    // here, so no meter or percentage, just what the latest request used.
+                    ui.label(theme::ico(icon::GAUGE).color(pal.text_dim));
+                    ui.label(
+                        RichText::new(format!("context {}", fmt_k(used)))
+                            .small()
+                            .color(pal.text_dim),
+                    )
+                    .on_hover_text(format!(
+                        "About {used} tokens in this chat's latest request. Claude Code manages \
+                         (and compacts) its own context window."
+                    ));
+                } else {
+                    let frac = theme::context_fraction(used, p.context_limit);
+                    let color = theme::meter_color(&pal, frac);
+                    ui.label(theme::ico(icon::GAUGE).color(color));
+                    theme::meter(ui, 90.0, frac, color);
+                    ui.label(
+                        RichText::new(format!(
+                            "context {} / {}",
+                            fmt_k(used),
+                            fmt_k(p.context_limit)
+                        ))
+                        .small()
+                        .color(pal.text_dim),
+                    )
+                    .on_hover_text(format!(
+                        "{used} of {} tokens ({:.1}%)",
+                        p.context_limit,
+                        frac * 100.0
+                    ));
+                }
             }
             if let Some(st) = &self.state.status {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -591,6 +613,62 @@ impl VoidApp {
             }
         });
     }
+}
+
+/// The profile pill's label and hover text. Claude Code profiles have no URL: they show the
+/// model Claude Code reported for this chat (`claude_model`), else the configured one, else
+/// "default model", and the command they run.
+fn profile_pill(p: &void_core::config::Profile, claude_model: Option<&str>) -> (String, String) {
+    let set = |s: &str| !s.trim().is_empty();
+    match p.kind {
+        void_core::config::BackendKind::ClaudeCode => {
+            let name = if set(&p.name) {
+                p.name.as_str()
+            } else {
+                "Claude Code"
+            };
+            let reported = claude_model.filter(|m| set(m));
+            let configured = if set(&p.model) {
+                p.model.as_str()
+            } else {
+                "default model"
+            };
+            let mut hover = format!(
+                "Claude Code: runs `{}` · model: {configured}",
+                p.claude_command()
+            );
+            if let Some(m) = reported {
+                hover.push_str(&format!("\nThis chat's session uses {m}"));
+            }
+            (
+                format!("{name} · {}", reported.unwrap_or(configured)),
+                hover,
+            )
+        }
+        _ => {
+            let label = if set(&p.model) {
+                format!("{} · {}", p.name, p.model)
+            } else {
+                p.name.clone()
+            };
+            let hover = if set(&p.base_url) {
+                p.base_url.clone()
+            } else {
+                "No base URL set".into()
+            };
+            (label, hover)
+        }
+    }
+}
+
+/// At most `max` characters of `s`, with "…" when cut.
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn fmt_k(n: u32) -> String {
@@ -1107,6 +1185,173 @@ mod e2e {
         }
         h.render().unwrap().save(out.join("agent.png")).unwrap();
 
+        // A Claude Code chat: text, a subagent's Task (its work nested, collapsed), an Edit,
+        // a Bash and a pending approval offering "Always allow".
+        let cc = void_core::config::Profile {
+            id: "claude-code".into(),
+            name: "Claude Code".into(),
+            kind: void_core::config::BackendKind::ClaudeCode,
+            base_url: String::new(),
+            model: String::new(),
+            ..h.state().state.saved_config.profiles[0].clone()
+        };
+        h.state_mut().state.saved_config.profiles.push(cc);
+        let sse_path = proj.join("src/backend/sse.rs").display().to_string();
+        let mut cq = Conversation::new(wsp.id.clone());
+        cq.title = "Claude: fix the SSE chunking".into();
+        cq.profile_id = Some("claude-code".into());
+        let tcall = |id: &str, name: &str, args: serde_json::Value| Part::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        let tres = |id: &str, content: &str| {
+            Message::new(
+                R::Tool,
+                vec![Part::ToolResult {
+                    call_id: id.into(),
+                    content: content.into(),
+                }],
+            )
+        };
+        cq.messages.push(Message::user(
+            "The SSE chunking test is flaky. Find the cause, fix it and push.",
+        ));
+        cq.messages.push(Message::new(
+            R::Assistant,
+            vec![
+                Part::Text("I'll have a subagent find the parser first.".into()),
+                tcall(
+                    "cc-t1",
+                    "Task",
+                    serde_json::json!({"description": "Find the SSE parser", "prompt": "Find where SSE chunks are split", "subagent_type": "general-purpose"}),
+                ),
+            ],
+        ));
+        cq.messages.push(tres(
+            "cc-t1",
+            "The parser is src/backend/sse.rs; `after_cr` is reset at every chunk.",
+        ));
+        let mut fix = Message::new(
+            R::Assistant,
+            vec![
+                Part::Text(
+                    "Found it: a `\\r` at the end of one chunk and `\\n` at the start of the next \
+                     count as two line ends. Fixing that and running the tests:"
+                        .into(),
+                ),
+                tcall(
+                    "cc-e1",
+                    "Edit",
+                    serde_json::json!({
+                        "file_path": sse_path,
+                        "old_string": "            self.after_cr = false;",
+                        "new_string": "            if self.after_cr && b == b'\\n' {\n                self.after_cr = false;\n                continue;\n            }",
+                    }),
+                ),
+                tcall(
+                    "cc-b1",
+                    "Bash",
+                    serde_json::json!({"command": "cargo test -p void-core sse", "description": "Run the SSE tests"}),
+                ),
+            ],
+        );
+        fix.usage = Some(Usage {
+            prompt_tokens: 41_870,
+            completion_tokens: 236,
+        });
+        cq.messages.push(fix);
+        cq.messages.push(tres(
+            "cc-e1",
+            "The file src/backend/sse.rs has been updated.",
+        ));
+        cq.messages.push(tres(
+            "cc-b1",
+            "running 12 tests\n............\ntest result: ok. 12 passed; 0 failed",
+        ));
+        store.save(&cq).unwrap();
+        let cid = cq.id;
+        h.state_mut().apply_action(Action::Show(cid));
+        until(&mut h, 10, "claude conv", |a| {
+            a.state.loaded.contains_key(&cid)
+        });
+        {
+            use void_core::engine::Event as E;
+            let st = &mut h.state_mut().state;
+            st.apply(E::ClaudeInit {
+                conversation: cid,
+                model: "claude-opus-4-5".into(),
+            });
+            st.apply(E::ToolStarted {
+                conversation: cid,
+                call_id: "cc-t1".into(),
+                name: "Task".into(),
+                summary: "Find the SSE parser".into(),
+            });
+            for text in [
+                "› Grep after_cr\n",
+                "› Read src/backend/sse.rs\n",
+                "The parser resets after_cr per chunk.",
+            ] {
+                st.apply(E::ToolOutput {
+                    conversation: cid,
+                    call_id: "cc-t1".into(),
+                    text: text.into(),
+                });
+            }
+            st.apply(E::ToolFinished {
+                conversation: cid,
+                call_id: "cc-t1".into(),
+                output: void_core::tools::ToolOutput::ok(
+                    "The parser is src/backend/sse.rs; `after_cr` is reset at every chunk.",
+                ),
+            });
+            // The reply in progress: its Bash waits on the approval below.
+            st.apply(E::StreamStarted(cid));
+            st.apply(E::Delta {
+                conversation: cid,
+                kind: void_core::engine::DeltaKind::Text,
+                text: "All 12 pass. Pushing the fix:".into(),
+            });
+            st.apply(E::ToolStarted {
+                conversation: cid,
+                call_id: "cc-b2".into(),
+                name: "Bash".into(),
+                summary: "git push origin fix-sse-crlf".into(),
+            });
+            st.apply(E::ApprovalNeeded(void_core::permissions::ApprovalRequest {
+                id: 11,
+                conversation: cid,
+                tool: "Bash".into(),
+                summary: "git push origin fix-sse-crlf".into(),
+                command: Some("git push origin fix-sse-crlf".into()),
+                kind: void_core::permissions::ApprovalKind::ClaudeCode {
+                    always_allow: true,
+                    title: Some("Claude wants to push to the remote".into()),
+                    description: Some("Push the fix branch to origin".into()),
+                    blocked_path: None,
+                },
+            }));
+        }
+        h.set_size(egui::vec2(1400.0, 1180.0));
+        for _ in 0..6 {
+            h.step();
+        }
+        h.render()
+            .unwrap()
+            .save(out.join("claude-code-chat.png"))
+            .unwrap();
+        h.set_size(egui::vec2(1400.0, 860.0));
+        {
+            let st = &mut h.state_mut().state;
+            st.apply(void_core::engine::Event::ApprovalResolved { id: 11 });
+            st.streams.remove(&cid);
+        }
+        h.state_mut().apply_action(Action::Show(aid));
+        until(&mut h, 10, "agent conv again", |a| {
+            a.focused_conversation() == Some(aid)
+        });
+
         layout::ensure_tab(&mut h.state_mut().dock, Tab::Review);
         h.state_mut().review.selected = Some("src/backend/sse.rs".into());
         until(&mut h, 10, "diff", |a| !a.state.diffs.is_empty());
@@ -1547,6 +1792,107 @@ impl Parser {
         );
         assert!(h.query_by_label("Command").is_some());
         assert!(h.query_by_label("Model").is_some());
+    }
+
+    /// A Claude Code chat's status bar: the model Claude Code reported at init (else "default
+    /// model", never "Name · "), the turn's status while it lasts, and the context used with no
+    /// made-up limit.
+    #[test]
+    fn status_shows_claude_model() {
+        use void_core::engine::Event;
+        let p = paths_tmp();
+        let base = void_core::config::Config::default();
+        let cc = void_core::config::Profile {
+            id: "cc".into(),
+            name: "Claude Code".into(),
+            kind: void_core::config::BackendKind::ClaudeCode,
+            base_url: String::new(),
+            model: String::new(),
+            ..base.profiles[0].clone()
+        };
+        let cfg = void_core::config::Config {
+            active_profile: "cc".into(),
+            profiles: vec![cc.clone()],
+            ..base
+        };
+        void_core::config::save_config(&p.root.join("config.toml"), &cfg).unwrap();
+        let mut h = harness(&p);
+        until(&mut h, 10, "config", |a| {
+            a.state.config.active_profile == "cc"
+        });
+        h.state().engine.send(Command::NewConversation);
+        until(&mut h, 10, "bound", |a| a.focused_conversation().is_some());
+        let conv = h.state().focused_conversation().unwrap();
+        h.step();
+        assert!(h.query_by_label("Claude Code · default model").is_some());
+        assert!(h.query_by_label("Claude Code · ").is_none());
+        let (label, hover) = profile_pill(&cc, None);
+        assert_eq!(label, "Claude Code · default model");
+        assert!(
+            hover.contains("claude") && !hover.trim().is_empty(),
+            "{hover}"
+        );
+        // No profile limit for Claude Code: tokens used only.
+        use egui_kittest::kittest::NodeT;
+        let ctx = h.get_by_label_contains("context ").accesskit_node().label();
+        assert!(!ctx.unwrap_or_default().contains('/'), "a limit is shown");
+
+        h.state_mut().state.apply(Event::ClaudeInit {
+            conversation: conv,
+            model: "claude-opus-4-5".into(),
+        });
+        h.state_mut().state.apply(Event::TurnStatus {
+            conversation: conv,
+            status: "Waiting for the sandbox — another chat's command is using it…".into(),
+        });
+        h.step();
+        h.step();
+        assert!(h.query_by_label("Claude Code · claude-opus-4-5").is_some());
+        assert!(
+            h.query_by_label_contains("Waiting for the sandbox")
+                .is_some()
+        );
+        // The status lasts until the turn moves on.
+        h.state_mut().state.apply(Event::StreamStarted(conv));
+        h.state_mut().state.apply(Event::Delta {
+            conversation: conv,
+            kind: void_core::engine::DeltaKind::Text,
+            text: "Hi".into(),
+        });
+        h.step();
+        h.step();
+        assert!(
+            h.query_by_label_contains("Waiting for the sandbox")
+                .is_none()
+        );
+        assert!(h.query_by_label("Claude Code · claude-opus-4-5").is_some());
+    }
+
+    /// A Test result from before the profile's kind changed isn't shown for the new kind.
+    #[test]
+    fn stale_test_result_cleared_on_kind_switch() {
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Backends);
+        let api = h.state().state.config.profiles[0].clone();
+        h.state_mut().backends.select(api.clone());
+        h.state_mut().backends.tested(&api.id, api.kind);
+        h.state_mut()
+            .state
+            .tests
+            .insert(api.id.clone(), Ok(vec!["m1".into(), "m2".into()]));
+        h.run();
+        assert!(h.query_by_label_contains("Connected: 2 models").is_some());
+        h.state_mut().backends.select(void_core::config::Profile {
+            kind: void_core::config::BackendKind::ClaudeCode,
+            ..api.clone()
+        });
+        h.run();
+        assert!(h.query_by_label_contains("Found Claude Code").is_none());
+        assert!(!h.state().state.tests.contains_key(&api.id));
     }
 
     fn paths_tmp() -> Paths {

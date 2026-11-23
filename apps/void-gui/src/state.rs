@@ -17,6 +17,10 @@ pub struct Streaming {
 /// A tool call as it runs (live output) and once it's finished.
 #[derive(Clone, Debug)]
 pub struct ToolCallView {
+    pub conversation: ConversationId,
+    pub name: String,
+    /// Start order (cards for calls not yet in a stored message show in this order).
+    pub order: usize,
     pub summary: String,
     pub output: String,
     pub done: Option<void_core::tools::ToolOutput>,
@@ -54,6 +58,11 @@ pub struct UiState {
     pub disk_diffs: HashMap<(ConversationId, std::path::PathBuf), Vec<void_core::overlay::Hunk>>,
     /// Chats with an agent turn in progress.
     pub active_turns: std::collections::HashSet<ConversationId>,
+    /// The model each Claude Code chat's session reported (`ClaudeInit`; empty when unsaid).
+    pub claude_models: HashMap<ConversationId, String>,
+    /// What a running turn is doing while it isn't streaming ("waiting for the sandbox",
+    /// "retrying…"), until the turn moves on.
+    pub turn_status: HashMap<ConversationId, String>,
     /// The first pending changes of a chat ask the app to show Review.
     review_request: bool,
     /// Workspace-relative paths a conversation's pending changes covered before or after the
@@ -107,6 +116,8 @@ impl Default for UiState {
             diffs_epoch: 0,
             disk_diffs: HashMap::new(),
             active_turns: Default::default(),
+            claude_models: HashMap::new(),
+            turn_status: HashMap::new(),
             review_request: false,
             touched: Vec::new(),
             reviewed: Default::default(),
@@ -122,6 +133,27 @@ impl Default for UiState {
 
 impl UiState {
     pub fn apply(&mut self, ev: Event) {
+        // A turn that streams, runs a tool or ends isn't waiting any more.
+        match &ev {
+            Event::Delta { conversation, .. }
+            | Event::ToolStarted { conversation, .. }
+            | Event::ToolOutput { conversation, .. }
+            | Event::ToolFinished { conversation, .. }
+            | Event::StreamFinished { conversation, .. }
+            | Event::StreamFailed { conversation, .. }
+            | Event::ClaudeInit { conversation, .. }
+            | Event::TurnState {
+                conversation,
+                active: false,
+            } => {
+                self.turn_status.remove(conversation);
+            }
+            Event::ConversationDeleted(id) => {
+                self.turn_status.remove(id);
+                self.claude_models.remove(id);
+            }
+            _ => {}
+        }
         match ev {
             Event::ConfigLoaded { config, warning } => {
                 self.saved_config = config.clone();
@@ -207,11 +239,18 @@ impl UiState {
             Event::Info(m) => self.info(m),
             Event::SandboxStatus(a) => self.sandbox = Some(a),
             Event::ToolStarted {
-                call_id, summary, ..
+                conversation,
+                call_id,
+                name,
+                summary,
             } => {
+                let order = self.tool_calls.len();
                 self.tool_calls.insert(
                     call_id,
                     ToolCallView {
+                        conversation,
+                        name,
+                        order,
                         summary,
                         output: String::new(),
                         done: None,
@@ -317,9 +356,18 @@ impl UiState {
                 });
             }
             Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
-            // The status bar's Claude Code model display comes with the GUI task.
-            Event::ClaudeInit { .. } => {}
-            Event::TurnStatus { status, .. } => self.info(status),
+            Event::ClaudeInit {
+                conversation,
+                model,
+            } => {
+                self.claude_models.insert(conversation, model);
+            }
+            Event::TurnStatus {
+                conversation,
+                status,
+            } => {
+                self.turn_status.insert(conversation, status);
+            }
         }
     }
 
@@ -687,6 +735,41 @@ mod tests {
         assert!(!s.busy(id));
         s.apply(Event::StreamStarted(id));
         assert!(s.busy(id));
+    }
+
+    #[test]
+    fn claude_model_and_turn_status_tracked() {
+        let mut s = UiState::default();
+        let id = void_core::model::ConversationId::new();
+        let status = |s: &UiState| s.turn_status.get(&id).cloned();
+        s.apply(Event::TurnStatus {
+            conversation: id,
+            status: "Waiting for the sandbox".into(),
+        });
+        assert_eq!(status(&s).as_deref(), Some("Waiting for the sandbox"));
+        assert!(s.status.is_none(), "not left behind in the status line");
+        s.apply(Event::ClaudeInit {
+            conversation: id,
+            model: "claude-opus-4-5".into(),
+        });
+        assert_eq!(status(&s), None, "claude started: no longer waiting");
+        assert_eq!(s.claude_models[&id], "claude-opus-4-5");
+        s.apply(Event::TurnStatus {
+            conversation: id,
+            status: "retrying…".into(),
+        });
+        s.apply(Event::TurnState {
+            conversation: id,
+            active: true,
+        });
+        assert!(status(&s).is_some());
+        s.apply(Event::TurnState {
+            conversation: id,
+            active: false,
+        });
+        assert_eq!(status(&s), None, "the turn is over");
+        s.apply(Event::ConversationDeleted(id));
+        assert!(!s.claude_models.contains_key(&id));
     }
 
     #[test]
