@@ -165,6 +165,16 @@ unknown tool names (name + pretty JSON arguments + result text), with small spec
   throwaway writable layer (bwrap `--overlay-src $HOME --tmp-overlay $HOME`, discarded when the process exits),
   with the real `~/.claude/` and `~/.claude.json` bound read-write on top (written in place) and the hidden paths
   applied on top of that. Verified with a dummy HOME: `claude mcp add -s user` saved successfully.
+- **Per-folder home layer (the user's decision, 2026-11-23, after the live test).** A single overlay on `$HOME`
+  fails with EINVAL ("overlayfs: failed to clone lowerpath") whenever any mount sits below `$HOME` (e.g. an
+  autofs/NFS share under `~/`): inherited mounts are locked in bwrap's user namespace. So the layer is
+  built per entry, always (one code path): `--tmpfs $HOME`; each top-level directory with no mount below it gets
+  its own `--overlay-src D --tmp-overlay D`; directories containing mounts are recreated (`--dir`) and recursed
+  into the same way; **mount points themselves are skipped** (left as empty directories — never touched by path,
+  so autofs isn't triggered and a dead NFS server can't hang the turn); top-level files are read-only binds
+  (new files at the top of `$HOME` are throwaway; existing ones can't be rewritten); symlinks recreated. Mounts
+  are read from `/proc/self/mountinfo`. `~/.claude/` and `~/.claude.json` rw binds and the hidden paths go on top
+  as before. Entries created in `$HOME` during a turn aren't visible inside it (snapshot at spawn).
 - Accepted caveat: Claude Code's lock file for `~/.claude.json` lands in the throwaway layer, so it isn't shared
   with a `claude` running in a terminal; simultaneous settings saves from both can overwrite each other.
 - `cwd` is the workspace path, so Claude Code's project key in `~/.claude/projects/` is the real workspace path
