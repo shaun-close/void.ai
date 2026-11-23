@@ -627,13 +627,21 @@ mod tests {
         let line = format!(
             r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","content":"{big}"}}]}}}}"#
         );
-        let t = std::time::Instant::now();
-        let ev = parse_line(&line);
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(200),
-            "{:?}",
-            t.elapsed()
-        );
+        // The fastest of a few parses (a loaded machine slows some), against a bound for the
+        // build: an unoptimised debug build is several times slower.
+        let bound =
+            std::time::Duration::from_millis(if cfg!(debug_assertions) { 1000 } else { 200 });
+        let timed = || {
+            let t = std::time::Instant::now();
+            let ev = parse_line(&line);
+            (t.elapsed(), ev)
+        };
+        let (mut best, ev) = timed();
+        for _ in 0..2 {
+            best = best.min(timed().0);
+        }
+        println!("TIMING parse of a 5 MB tool result: {best:?}");
+        assert!(best < bound, "{best:?}");
         match ev {
             CcEvent::ToolResult { content, .. } => {
                 assert!(content.len() <= crate::sandbox::OUTPUT_CAP + 64);

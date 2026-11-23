@@ -871,30 +871,44 @@ mod tests {
         assert!(s.outline(&rope).is_empty());
     }
 
+    /// Highlighting a window costs about the same in a 100k-line file as in a small one.
+    /// Timed against that small-file baseline (each the fastest of several runs, after a
+    /// warm-up that compiles the queries), so a loaded machine slows both alike.
     #[test]
     fn highlight_of_a_huge_file_is_proportional_to_the_window() {
-        let mut src = String::new();
-        for i in 0..100_000 {
-            src.push_str(&format!(
-                "fn f{i}(a: u32) -> u32 {{ let s = \"x\"; a + {i} }}\n"
-            ));
-        }
-        let rope = Rope::from_str(&src);
-        let mut s = Syntax::new(Lang::Rust);
-        let t0 = std::time::Instant::now();
-        s.set_tree(s.parse_full(&rope).unwrap(), 0);
-        let parse = t0.elapsed();
-        let t1 = std::time::Instant::now();
-        let spans = s.highlight(&rope, 50_000..50_060);
-        let took = t1.elapsed();
-        println!(
-            "TIMING full parse of 100k lines: {parse:?}; highlight of 60 lines mid-file: {took:?}"
-        );
+        use std::time::{Duration, Instant};
+        let file = |lines: usize| {
+            let mut src = String::new();
+            for i in 0..lines {
+                src.push_str(&format!(
+                    "fn f{i}(a: u32) -> u32 {{ let s = \"x\"; a + {i} }}\n"
+                ));
+            }
+            Rope::from_str(&src)
+        };
+        let fastest = |lines: usize| -> (Duration, Vec<Vec<Span>>) {
+            let rope = file(lines);
+            let mut s = Syntax::new(Lang::Rust);
+            s.set_tree(s.parse_full(&rope).unwrap(), 0);
+            let at = lines / 2;
+            let mut best = Duration::MAX;
+            let mut spans = Vec::new();
+            for _ in 0..7 {
+                let t = Instant::now();
+                spans = s.highlight(&rope, at..at + 60);
+                best = best.min(t.elapsed());
+            }
+            (best, spans)
+        };
+        let _ = fastest(100); // compiles the highlight queries
+        let (small, _) = fastest(1_000);
+        let (huge, spans) = fastest(100_000);
+        println!("TIMING highlight of 60 lines: 1k-line file {small:?}, 100k-line file {huge:?}");
         assert_eq!(spans.len(), 60);
         assert!(spans.iter().all(|l| !l.is_empty()));
         assert!(
-            took < std::time::Duration::from_millis(50),
-            "highlight took {took:?}"
+            huge < small * 10 + Duration::from_millis(5),
+            "highlight took {huge:?} in a 100k-line file, {small:?} in a 1k-line one"
         );
     }
 }
