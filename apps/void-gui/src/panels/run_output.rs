@@ -622,60 +622,75 @@ fn header(
 ) {
     let status = view.status();
     let (glyph, color) = status_look(pal, status);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(theme::ico(glyph).color(color));
-        ui.label(
-            RichText::new(&view.name)
-                .family(FontFamily::Name(theme::BOLD.into()))
-                .color(pal.text),
-        );
-        ui.label(RichText::new(view.status_text()).color(color).small());
-        if status == RunStatus::Running
-            && let Some(step) = view.current.and_then(|i| view.step_info.get(i))
-        {
+    // One row: the buttons keep their place on the right, the details on the left give way
+    // (the step label is cut short) when the tab is narrow.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(theme::itext(icon::COPY, "Copy"))
+                .on_hover_text("Copy the output")
+                .clicked()
+            {
+                ui.ctx().copy_text(view.term.plain_text());
+            }
+            if status == RunStatus::Running {
+                if ui.button(theme::itext(icon::STOP, "Stop")).clicked() {
+                    engine.send(Command::StopRun(run));
+                }
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            } else {
+                let r = ui.add_enabled(
+                    rerun.is_ok(),
+                    egui::Button::new(theme::itext(icon::ARROW_CLOCKWISE, "Re-run")),
+                );
+                match rerun {
+                    Ok(cmd) => {
+                        if r.on_hover_text("Run it again").clicked() {
+                            engine.send(cmd);
+                        }
+                    }
+                    Err(why) => {
+                        r.on_disabled_hover_text(why);
+                    }
+                }
+            }
             ui.label(
-                RichText::new(&step.label)
-                    .monospace()
+                RichText::new(fmt_duration(view.duration_ms()))
                     .small()
                     .color(pal.text_dim),
             );
-        }
-        ui.label(theme::ico(icon::TIMER).color(pal.text_faint))
-            .on_hover_text("Duration");
-        ui.label(
-            RichText::new(fmt_duration(view.duration_ms()))
-                .small()
-                .color(pal.text_dim),
-        );
-        if status == RunStatus::Running {
-            if ui.button(theme::itext(icon::STOP, "Stop")).clicked() {
-                engine.send(Command::StopRun(run));
-            }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(250));
-        } else {
-            let r = ui.add_enabled(
-                rerun.is_ok(),
-                egui::Button::new(theme::itext(icon::ARROW_CLOCKWISE, "Re-run")),
-            );
-            match rerun {
-                Ok(cmd) => {
-                    if r.on_hover_text("Run it again").clicked() {
-                        engine.send(cmd);
-                    }
+            ui.label(theme::ico(icon::TIMER).color(pal.text_faint))
+                .on_hover_text("Duration");
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(theme::ico(glyph).color(color));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&view.name)
+                            .family(FontFamily::Name(theme::BOLD.into()))
+                            .color(pal.text),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(view.status_text()).color(color).small())
+                        .truncate(),
+                );
+                if status == RunStatus::Running
+                    && let Some(step) = view.current.and_then(|i| view.step_info.get(i))
+                {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&step.label)
+                                .monospace()
+                                .small()
+                                .color(pal.text_dim),
+                        )
+                        .truncate(),
+                    );
                 }
-                Err(why) => {
-                    r.on_disabled_hover_text(why);
-                }
-            }
-        }
-        if ui
-            .button(theme::itext(icon::COPY, "Copy"))
-            .on_hover_text("Copy the output")
-            .clicked()
-        {
-            ui.ctx().copy_text(view.term.plain_text());
-        }
+            });
+        });
     });
 }
 
@@ -691,6 +706,7 @@ fn output(ui: &mut Ui, pal: &Palette, run: RunId, view: &mut RunView, actions: &
     let mut open = None;
     // Rows sit flush (show_rows reads the spacing of the ui it's called on).
     ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().scroll = output_scroll_style();
     egui::ScrollArea::both()
         .id_salt(("run-output", run.0))
         .auto_shrink([false, false])
@@ -718,6 +734,12 @@ fn output(ui: &mut Ui, pal: &Palette, run: RunId, view: &mut RunView, actions: &
     if let Some((path, line)) = open {
         actions.push(Action::OpenAt { path, line });
     }
+}
+
+/// Output lines don't wrap, so a long one scrolls sideways: its bars must always show (egui's
+/// default floating bars are invisible until the pointer is over them).
+fn output_scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle::solid()
 }
 
 /// One line of output; its locations are links. Returns the location clicked.
@@ -885,6 +907,16 @@ pub fn ansi_color(pal: &Palette, c: Color, default: Color32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Long lines scroll sideways: the output's scroll bars are solid (egui's default
+    /// floating bars are invisible until hovered, so cut-off errors looked truncated).
+    #[test]
+    fn output_scroll_bars_are_always_visible() {
+        let s = output_scroll_style();
+        // egui draws a non-floating bar at full opacity whether or not it's hovered, and
+        // gives it its own space beside the text.
+        assert!(!s.floating && s.allocated_width() > 0.0);
+    }
 
     fn spans(l: &Line) -> Vec<(&str, Style)> {
         l.spans().map(|(r, s)| (&l.text[r], s)).collect()

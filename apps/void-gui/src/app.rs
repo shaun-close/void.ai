@@ -1870,7 +1870,7 @@ impl Parser {
             });
             st.apply(E::RunOutput {
                 run: done,
-                text: "running 3 tests\ntest sse::split_crlf ... \x1b[31mFAILED\x1b[0m\n\nthread 'sse::split_crlf' panicked at crates/core/src/lib.rs:17:5:\nassertion failed\n\x1b[31merror\x1b[0m: test failed\n".into(),
+                text: "running 3 tests\ntest sse::split_crlf ... \x1b[31mFAILED\x1b[0m\n\nthread 'sse::split_crlf' panicked at crates/core/src/lib.rs:17:5:\nassertion failed: left == right: left: \"data: {\\\"choices\\\":[{\\\"delta\\\":{\\\"content\\\":\\\"hello\\\"}}]}\\r\\n\\r\\ndata: [DONE]\\r\\n\", right: \"data: {\\\"choices\\\":[{\\\"delta\\\":{\\\"content\\\":\\\"hello\\\"}}]}\\n\\ndata: [DONE]\\n\"\n\x1b[31merror\x1b[0m: test failed\n".into(),
             });
             st.apply(E::RunFinished {
                 run: done,
