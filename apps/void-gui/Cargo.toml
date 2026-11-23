@@ -26,6 +26,8 @@ ropey.workspace = true
 void-core.workspace = true
 void-editor.workspace = true
 void-vim.workspace = true
+trash = "5.4.0"
+ignore = "0.4.34"
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "snapshot", "wgpu"] }

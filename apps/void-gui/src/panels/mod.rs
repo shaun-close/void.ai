@@ -10,6 +10,7 @@ use void_core::model::ConversationId;
 pub mod backends;
 pub mod chat;
 pub mod conversations;
+pub mod files;
 pub mod review;
 pub mod settings;
 
@@ -49,6 +50,11 @@ pub enum Action {
     DuplicateEditor(u32),
     /// The user closed this editor tab.
     CloseEditor(u32),
+    /// The Files panel renamed a file or folder: open editors follow it.
+    Renamed {
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+    },
 }
 
 pub struct Panels<'a> {
@@ -65,6 +71,9 @@ pub struct Panels<'a> {
     pub editors: &'a mut crate::editor::EditorStore,
     /// The editor tab the dock has focused, if it's one.
     pub focused_editor: Option<u32>,
+    pub files: &'a mut files::FilesUi,
+    /// The file in the editor tab focused last (the Files panel highlights and reveals it).
+    pub active_file: Option<std::path::PathBuf>,
 }
 
 impl egui_dock::TabViewer for Panels<'_> {
@@ -99,6 +108,7 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Conversations => theme::itext(icon::CHATS, "Chats"),
             Tab::Backends => theme::itext(icon::PLUGS, "Backends"),
             Tab::Settings => theme::itext(icon::GEAR, "Settings"),
+            Tab::Files => theme::itext(icon::FOLDER, "Files"),
             Tab::Review => {
                 let n = self
                     .focused
@@ -172,6 +182,7 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Backends => backends::show(ui, self),
             Tab::Settings => settings::show(ui, self),
             Tab::Review => review::show(ui, self),
+            Tab::Files => files::show(ui, self),
             Tab::Editor { id, path, view } => crate::editor::show(ui, self, *id, path, view),
         }
     }

@@ -584,3 +584,147 @@ fn copy_paste_round_trips_through_one_clipboard() {
         Some("yanked")
     );
 }
+
+/// A folder workspace (the watcher covers it) holding `a.txt`, opened in an editor tab once the
+/// watcher is up.
+fn watched(
+    text: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Harness<'static, VoidApp>,
+) {
+    let t = tempfile::tempdir().unwrap();
+    let ws = t.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir(&ws).unwrap();
+    let file = ws.join("a.txt");
+    std::fs::write(&file, text).unwrap();
+    let (cfg, data) = (t.path().join("config.toml"), t.path().join("data"));
+    let open = Some(ws.clone());
+    let mut h = Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_max_steps(10)
+        .with_accessibility_check(false)
+        .build_eframe(move |cc| VoidApp::new(cc, open, cfg, data));
+    let want = ws.clone();
+    until(&mut h, "workspace", |a| {
+        a.state.workspace.root.as_deref() == Some(want.as_path())
+    });
+    until(&mut h, "watcher", |a| a.disk.ready());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, Some(3));
+    h.step();
+    h.step();
+    (t, file, h)
+}
+
+/// Wait until the watcher has delivered an event for a file written after everything before
+/// it, so earlier events (own saves) have been handled too.
+fn settle(h: &mut Harness<'_, VoidApp>, dir: &Path) {
+    let sentinel = dir.join(format!("sentinel-{}", rand_suffix()));
+    std::fs::write(&sentinel, "s").unwrap();
+    until(h, "sentinel event", |a| a.disk.saw(&sentinel));
+    h.step();
+}
+
+fn rand_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+#[test]
+fn external_change_reloads_clean_buffer() {
+    let (_t, file, mut h) = watched("one\ntwo\nthree\n");
+    let key = (file.clone(), EditorView::Disk);
+    let dir = file.parent().unwrap().to_path_buf();
+
+    // Our own save is not an outside change: no banner, no reload.
+    let doc = h.state_mut().editors.doc_mut(&key).unwrap();
+    let end = doc.core.len();
+    doc.core.replace(end..end, "!");
+    h.state_mut().editors.save(&key).unwrap();
+    settle(&mut h, &dir);
+    assert!(h.query_by_label_contains("Changed on disk").is_none());
+    assert_eq!(
+        h.state().editors.doc(&key).unwrap().text(),
+        "one\ntwo\nthree!"
+    );
+    assert_eq!(h.state().editors.doc(&key).unwrap().core.line_col().0, 2);
+
+    // Someone else rewrites it: the clean buffer reloads and keeps the cursor line.
+    std::fs::write(&file, "1\n2\n3\n4\n").unwrap();
+    until(&mut h, "reloaded", |a| {
+        a.editors
+            .doc(&key)
+            .is_some_and(|d| d.text() == "1\n2\n3\n4")
+    });
+    let doc = h.state().editors.doc(&key).unwrap();
+    assert!(!doc.core.buffer.is_dirty());
+    assert_eq!(doc.core.line_col().0, 2, "still on line 3");
+    h.step();
+    assert!(h.query_by_label_contains("Changed on disk").is_none());
+    assert!(shown(&h).starts_with("1\n2\n3\n4"), "{:?}", shown(&h));
+}
+
+#[test]
+fn external_change_flags_dirty_buffer() {
+    let (_t, file, mut h) = watched("one\n");
+    let key = (file.clone(), EditorView::Disk);
+    h.state_mut()
+        .editors
+        .doc_mut(&key)
+        .unwrap()
+        .core
+        .replace(0..0, "x");
+
+    // A dirty buffer is never overwritten: it says so and offers Reload / Keep mine.
+    std::fs::write(&file, "theirs\n").unwrap();
+    until(&mut h, "banner", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_changed())
+    });
+    h.step();
+    assert!(h.query_by_label_contains("Changed on disk").is_some());
+    assert_eq!(h.state().editors.doc(&key).unwrap().text(), "xone");
+    assert!(h.state().editors.is_dirty(&key));
+
+    // Keep mine: the banner goes, the text and the file stay as they are.
+    h.get_by_label("Keep mine").click();
+    h.step();
+    h.step();
+    assert!(h.query_by_label_contains("Changed on disk").is_none());
+    assert_eq!(h.state().editors.doc(&key).unwrap().text(), "xone");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+
+    // Another outside change asks again; Reload takes the file.
+    std::fs::write(&file, "newer\n").unwrap();
+    until(&mut h, "banner again", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_changed())
+    });
+    h.step();
+    h.get_by_label("Reload").click();
+    h.step();
+    h.step();
+    let doc = h.state().editors.doc(&key).unwrap();
+    assert_eq!(doc.text(), "newer");
+    assert!(!doc.core.buffer.is_dirty());
+    assert!(h.query_by_label_contains("Changed on disk").is_none());
+
+    // Deleted on disk: the text stays, a banner says so, and saving puts the file back.
+    std::fs::remove_file(&file).unwrap();
+    until(&mut h, "deleted banner", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_deleted())
+    });
+    h.step();
+    assert!(h.query_by_label_contains("Deleted on disk").is_some());
+    assert_eq!(h.state().editors.doc(&key).unwrap().text(), "newer");
+    // `:w`, through Vim.
+    text(&mut h, ":");
+    text(&mut h, "w");
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "newer\n");
+    assert!(h.query_by_label_contains("Deleted on disk").is_none());
+}

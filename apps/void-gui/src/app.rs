@@ -19,6 +19,7 @@ use crate::state::UiState;
 use crate::theme::{self, icon};
 use egui::RichText;
 
+mod disk;
 mod editors;
 
 pub struct VoidApp {
@@ -45,6 +46,12 @@ pub struct VoidApp {
     /// Quitting with unsaved editor buffers: the dialog is up / the user said quit anyway.
     quit_dialog: bool,
     quit_anyway: bool,
+    /// The Files panel's tree and inline edits.
+    pub(crate) files: crate::panels::files::FilesUi,
+    /// Watches the workspace (and files open from elsewhere) for outside changes.
+    pub(crate) disk: disk::DiskWatch,
+    /// The editor tab focused last.
+    last_editor: Option<u32>,
 }
 
 impl VoidApp {
@@ -101,6 +108,9 @@ impl VoidApp {
             pending_start: None,
             quit_dialog: false,
             quit_anyway: false,
+            files: Default::default(),
+            disk: Default::default(),
+            last_editor: None,
         }
     }
 
@@ -231,6 +241,10 @@ impl VoidApp {
                 if let Some((path, view)) = self.editor_key(tab) {
                     self.open_editor_tab(path, view);
                 }
+                return;
+            }
+            Action::Renamed { from, to } => {
+                self.follow_rename(&from, &to);
                 return;
             }
         };
@@ -380,6 +394,7 @@ impl VoidApp {
                 }
                 for (label, tab) in [
                     (theme::itext(icon::CHATS, "Chats"), Tab::Conversations),
+                    (theme::itext(icon::FOLDER, "Files"), Tab::Files),
                     (theme::itext(icon::PLUGS, "Backends"), Tab::Backends),
                     (theme::itext(icon::GEAR, "Settings"), Tab::Settings),
                     (theme::itext(icon::GIT_DIFF, "Review"), Tab::Review),
@@ -558,8 +573,9 @@ impl eframe::App for VoidApp {
         }
 
         self.editors.settings = self.state.config.editor.clone();
-        self.editors.quitting = self.quit_dialog;
+        self.editors.dialog = self.quit_dialog || self.files.confirm_delete.is_some();
         self.editors.focused_widget = None;
+        self.poll_disk(&ctx);
         self.editors.poll(&ctx);
         self.global_save(&ctx);
 
@@ -578,6 +594,7 @@ impl eframe::App for VoidApp {
             .show(ui, |ui| self.dock_area(ui));
         self.close_dialog(&ctx);
         self.quit_dialog(&ctx);
+        crate::panels::files::delete_dialog(&ctx, &mut self.files, &mut self.state);
         // One clipboard for the app: text egui copies (text fields, copy buttons) goes through the
         // same `editor::Clipboard` that pastes and Vim's "+ / "* registers read.
         let clipboard = &self.editors.clipboard;
@@ -619,6 +636,13 @@ impl VoidApp {
             Some((_, Tab::Editor { id, .. })) => Some(*id),
             _ => None,
         };
+        if focused_editor.is_some() {
+            self.last_editor = focused_editor;
+        }
+        let active_file = self
+            .last_editor
+            .and_then(|id| self.editor_key(id))
+            .map(|(path, _)| path);
         let mut panels = Panels {
             state: &mut self.state,
             engine: &self.engine,
@@ -631,6 +655,8 @@ impl VoidApp {
             focused,
             editors: &mut self.editors,
             focused_editor,
+            files: &mut self.files,
+            active_file,
         };
         DockArea::new(&mut self.dock)
             .style(theme::dock_style(ui.style().as_ref(), &pal))
@@ -1114,6 +1140,39 @@ impl Parser {
             h.step();
         }
         h.render().unwrap().save(out.join("editor.png")).unwrap();
+
+        // The Files panel beside the editor, revealing its file; the edited buffer's file
+        // changed on disk behind it.
+        h.key_press(egui::Key::Escape);
+        for (path, text) in [
+            (".gitignore", "target/\n*.log\n"),
+            ("Cargo.toml", "[package]\nname = \"proj\"\n"),
+            ("README.md", "# proj\n"),
+            ("build.log", "ok\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/backend/mod.rs", "pub mod chunk;\npub mod sse;\n"),
+            ("target/debug/proj", "bin"),
+            ("tests/chunking.rs", "#[test]\nfn split_crlf() {}\n"),
+        ] {
+            let f = proj.join(path);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        }
+        until(&mut h, 10, "watcher", |a| a.disk.ready());
+        h.event(egui::Event::Text("O// tidy".into()));
+        h.key_press(egui::Key::Escape);
+        h.step();
+        std::fs::write(&src, "// rewritten by another editor\n").unwrap();
+        let key = (src.clone(), EditorView::Disk);
+        until(&mut h, 10, "changed on disk", |a| {
+            a.editors.doc(&key).is_some_and(|d| d.disk_changed())
+        });
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Files);
+        h.state_mut().files.reveal(&src);
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("files.png")).unwrap();
     }
 
     /// Offline: an approval card's "Allow once" sends Approve; the engine answers with

@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
-use void_editor::{Buffer, Edit, Lang, Span, Syntax, Tree};
+use void_editor::{Buffer, Edit, Fingerprint, Lang, OnDisk, Span, Syntax, Tree};
 use void_vim::{Engine, Mode};
 
 /// How many lines Vim keeps above and below the cursor when the view follows it.
@@ -79,6 +79,10 @@ pub struct Core {
     pub new_file: bool,
     /// When the text last changed (re-parse debounce).
     pub edited: Option<Instant>,
+    /// The file compared with the buffer (banners).
+    pub disk: DiskState,
+    /// The outside version the user chose "Keep mine" over: not asked about again.
+    pub kept: Option<Fingerprint>,
 }
 
 impl Core {
@@ -177,6 +181,9 @@ impl Core {
         match self.buffer.save(path) {
             Ok(()) => {
                 self.new_file = false;
+                // Saved: the file holds the buffer again (it was recreated if it had gone).
+                self.disk = DiskState::InSync;
+                self.kept = None;
                 Ok(format!("\"{name}\" {}L written", self.buffer.line_count()))
             }
             Err(e) => Err(format!("Couldn't save \"{name}\": {e}")),
@@ -227,6 +234,25 @@ impl Core {
             self.view.apply = true;
         }
     }
+}
+
+/// The file compared with the buffer, as far as the last watcher event showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskState {
+    #[default]
+    InSync,
+    /// Someone else changed the file while the buffer had unsaved edits (Reload / Keep mine).
+    Changed,
+    /// The file is gone; the text stays, and saving puts it back.
+    Deleted,
+}
+
+/// What [`Doc::check_disk`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskCheck {
+    Nothing,
+    Reloaded,
+    Flagged,
 }
 
 /// Spans for some rows, as of (buffer version, tree version, rows).
@@ -288,6 +314,8 @@ impl Doc {
                 indent,
                 new_file: false,
                 edited: None,
+                disk: DiskState::InSync,
+                kept: None,
             },
             vim: Engine::new(),
             parse_in_flight: None,
@@ -386,6 +414,83 @@ impl Doc {
         }
     }
 
+    #[cfg(test)]
+    pub fn disk_changed(&self) -> bool {
+        self.core.disk == DiskState::Changed
+    }
+
+    #[cfg(test)]
+    pub fn disk_deleted(&self) -> bool {
+        self.core.disk == DiskState::Deleted
+    }
+
+    /// Compare the file with what the buffer last loaded or saved (a watcher event): our own
+    /// saves and timestamp-only changes do nothing; a clean buffer reloads; a dirty one is
+    /// flagged and never overwritten.
+    pub fn check_disk(&mut self, path: &Path) -> DiskCheck {
+        let last = self.core.buffer.disk;
+        match void_editor::check(path, last.as_ref()) {
+            Ok(OnDisk::Unchanged(fp)) => {
+                self.core.buffer.disk = Some(fp);
+                self.core.disk = DiskState::InSync;
+                DiskCheck::Nothing
+            }
+            // Never on disk (a new `:e` buffer): nothing was deleted.
+            Ok(OnDisk::Missing) if last.is_none() => DiskCheck::Nothing,
+            Ok(OnDisk::Missing) => {
+                let was = std::mem::replace(&mut self.core.disk, DiskState::Deleted);
+                if was == DiskState::Deleted {
+                    DiskCheck::Nothing
+                } else {
+                    DiskCheck::Flagged
+                }
+            }
+            Ok(OnDisk::Changed(fp)) if self.core.kept == Some(fp) => DiskCheck::Nothing,
+            Ok(OnDisk::Changed(_)) if !self.core.buffer.is_dirty() => match self.reload(path) {
+                Ok(()) => {
+                    self.core.message = Some(Msg::info(format!(
+                        "\"{}\" changed on disk: reloaded",
+                        super::file_name(path)
+                    )));
+                    DiskCheck::Reloaded
+                }
+                Err(e) => {
+                    self.core.message = Some(Msg::error(format!("Couldn't reload: {e}")));
+                    DiskCheck::Nothing
+                }
+            },
+            Ok(OnDisk::Changed(_)) => {
+                let was = std::mem::replace(&mut self.core.disk, DiskState::Changed);
+                if was == DiskState::Changed {
+                    DiskCheck::Nothing
+                } else {
+                    DiskCheck::Flagged
+                }
+            }
+            Err(_) => DiskCheck::Nothing,
+        }
+    }
+
+    /// "Keep mine": stop asking about the version on disk now (a later change asks again).
+    pub fn keep_mine(&mut self, path: &Path) {
+        self.core.kept = match void_editor::check(path, None) {
+            Ok(OnDisk::Changed(fp)) => Some(fp),
+            _ => None,
+        };
+        self.core.disk = DiskState::InSync;
+    }
+
+    /// The file was renamed: the buffer follows (highlighting changes with the extension).
+    pub fn set_path(&mut self, path: &Path) {
+        let lang = Lang::for_path(path);
+        if &lang != self.lang() {
+            self.warm = matches!(lang, Lang::Plain);
+            self.core.syntax = Syntax::new(lang);
+            self.parsed = None;
+            self.hl_cache = None;
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.vim.state().mode
     }
@@ -413,6 +518,10 @@ impl Doc {
         let line = line.min(c.buffer.line_count().saturating_sub(1));
         let p = c.buffer.line_start(line);
         c.sel = (p, p);
+        c.buffer.disk = disk.disk;
+        c.new_file = false;
+        c.disk = DiskState::InSync;
+        c.kept = None;
         self.hl_cache = None;
         Ok(())
     }

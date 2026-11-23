@@ -18,6 +18,97 @@ use super::{DocKey, input, status};
 use crate::panels::Panels;
 use crate::theme::{self, with_alpha};
 
+/// Height of one banner above the text.
+const BANNER_H: f32 = 28.0;
+
+/// What a banner button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerAction {
+    /// Take the file on disk (the buffer's edits are dropped, as one undo step).
+    Reload,
+    /// Keep the buffer; don't ask again about this version of the file.
+    KeepMine,
+}
+
+/// A strip above the text: a notice, or a question with buttons.
+pub struct Banner {
+    pub icon: &'static str,
+    pub text: String,
+    pub color: fn(&theme::Palette) -> egui::Color32,
+    pub buttons: Vec<(&'static str, BannerAction)>,
+}
+
+/// The banners an open buffer shows, top to bottom. (Task 8 adds "pending changes" here.)
+pub fn banners(doc: &Doc) -> Vec<Banner> {
+    use super::state::DiskState;
+    let mut out = Vec::new();
+    match doc.core.disk {
+        DiskState::Changed => out.push(Banner {
+            icon: theme::icon::WARNING,
+            text: "Changed on disk while you have unsaved edits".into(),
+            color: |p| p.warn,
+            buttons: vec![
+                ("Reload", BannerAction::Reload),
+                ("Keep mine", BannerAction::KeepMine),
+            ],
+        }),
+        DiskState::Deleted => out.push(Banner {
+            icon: theme::icon::TRASH,
+            text: "Deleted on disk. The text is still here; saving puts the file back".into(),
+            color: |p| p.err,
+            buttons: Vec::new(),
+        }),
+        DiskState::InSync => {}
+    }
+    if let Some(n) = &doc.core.buffer.notice {
+        out.push(Banner {
+            icon: theme::icon::WARNING,
+            text: n.clone(),
+            color: |p| p.warn,
+            buttons: Vec::new(),
+        });
+    }
+    out
+}
+
+fn banner(ui: &mut Ui, pal: &theme::Palette, r: Rect, b: &Banner) -> Option<BannerAction> {
+    let color = (b.color)(pal);
+    ui.painter()
+        .rect_filled(r, CornerRadius::same(4), with_alpha(color, 26));
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(r.shrink2(vec2(6.0, 1.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.label(theme::itext_styled(
+        b.icon,
+        &b.text,
+        theme::small_size(),
+        color,
+    ));
+    let mut hit = None;
+    for (label, action) in &b.buttons {
+        if child.small_button(*label).clicked() {
+            hit = Some(*action);
+        }
+    }
+    hit
+}
+
+fn apply_banner(doc: &mut Doc, path: &std::path::Path, action: BannerAction) {
+    match action {
+        BannerAction::Reload => {
+            doc.core.message = Some(match doc.reload(path) {
+                Ok(()) => {
+                    super::state::Msg::info(format!("\"{}\" reloaded", super::file_name(path)))
+                }
+                Err(e) => super::state::Msg::error(format!("Couldn't reload: {e}")),
+            });
+        }
+        BannerAction::KeepMine => doc.keep_mine(path),
+    }
+}
+
 pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     let pal = theme::palette_of(ui);
     let id = ui.scope_id().with("editor");
@@ -83,8 +174,8 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     let row_h = (glyph_h * 1.35).round();
     let full = ui.available_rect_before_wrap();
     ui.allocate_rect(full, Sense::hover());
-    let notice = doc.core.buffer.notice.clone();
-    let notice_h = if notice.is_some() { 26.0 } else { 0.0 };
+    let banners = banners(doc);
+    let notice_h = banners.len() as f32 * BANNER_H;
     let status_h = 26.0;
     let prompt_h = if doc.core.prompt.is_some() {
         row_h + 6.0
@@ -103,15 +194,18 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     let painter = ui.painter_at(full);
     painter.rect_filled(gutter, CornerRadius::ZERO, pal.bg_panel);
 
-    if let Some(n) = &notice {
-        let r = Rect::from_min_size(full.min, vec2(full.width(), notice_h - 4.0));
-        let mut child = ui.new_child(UiBuilder::new().max_rect(r));
-        child.label(theme::itext_styled(
-            theme::icon::WARNING,
-            n,
-            theme::small_size(),
-            pal.warn,
-        ));
+    let mut clicked = None;
+    for (i, b) in banners.iter().enumerate() {
+        let r = Rect::from_min_size(
+            pos2(full.left(), full.top() + i as f32 * BANNER_H),
+            vec2(full.width(), BANNER_H - 4.0),
+        );
+        if let Some(a) = banner(ui, &pal, r, b) {
+            clicked = Some(a);
+        }
+    }
+    if let Some(a) = clicked {
+        apply_banner(doc, &key.0, a);
     }
 
     // The visual-block shape comes from the engine.

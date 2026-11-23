@@ -121,8 +121,8 @@ pub struct EditorStore {
     pub settings: EditorSettings,
     /// The editor widget that had keyboard focus last frame (clipboard keys go to it).
     pub focused_widget: Option<egui::Id>,
-    /// The app's quit dialog is up.
-    pub quitting: bool,
+    /// One of the app's own dialogs (quit, delete from the file tree) is up.
+    pub dialog: bool,
 }
 
 impl EditorStore {
@@ -139,7 +139,7 @@ impl EditorStore {
             focus: None,
             settings: EditorSettings::default(),
             focused_widget: None,
-            quitting: false,
+            dialog: false,
         }
     }
 
@@ -148,9 +148,9 @@ impl EditorStore {
         self.docs.len()
     }
 
-    /// A dialog (close or quit) is waiting for the user.
+    /// A dialog (close, quit, delete) is waiting for the user.
     pub fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.quitting
+        self.confirm.is_some() || self.dialog
     }
 
     pub fn doc(&self, key: &DocKey) -> Option<&Doc> {
@@ -243,6 +243,47 @@ impl EditorStore {
             .map_err(|e| format!("Couldn't reload {}: {e}", key.0.display()))
     }
 
+    /// Files changed on disk (watcher events; a folder stands for everything in it): check
+    /// the buffers on them. Returns how many were reloaded or flagged.
+    pub fn check_disk(&mut self, changed: &[PathBuf]) -> usize {
+        let hit = |p: &Path| changed.iter().any(|c| p == c || p.starts_with(c));
+        let mut n = 0;
+        for (key, doc) in &mut self.docs {
+            if key.1 == EditorView::Disk
+                && hit(&key.0)
+                && doc.check_disk(&key.0) != state::DiskCheck::Nothing
+            {
+                n += 1;
+            }
+        }
+        // A tab that couldn't open its file tries again.
+        self.failed.retain(|k, _| !hit(&k.0));
+        n
+    }
+
+    /// Check every open file (the window came back into focus: events may have been missed).
+    pub fn check_all_disk(&mut self) -> usize {
+        let paths: Vec<PathBuf> = self.docs.keys().map(|k| k.0.clone()).collect();
+        self.check_disk(&paths)
+    }
+
+    /// Files under `from` were renamed to `to`: their buffers move along (edits and undo kept).
+    pub fn rename_path(&mut self, from: &Path, to: &Path) {
+        let moved: Vec<DocKey> = self
+            .docs
+            .keys()
+            .filter(|k| k.0.starts_with(from))
+            .cloned()
+            .collect();
+        for key in moved {
+            let path = moved_path(&key.0, from, to);
+            if let Some(mut doc) = self.docs.remove(&key) {
+                doc.set_path(&path);
+                self.docs.insert((path, key.1), doc);
+            }
+        }
+    }
+
     /// Drop a buffer and its edits.
     pub fn discard(&mut self, key: &DocKey) {
         self.docs.remove(key);
@@ -286,6 +327,15 @@ impl EditorStore {
                 version,
             );
         }
+    }
+}
+
+/// Where `path` (at or under `from`) is after `from` was renamed to `to`.
+pub fn moved_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    match path.strip_prefix(from) {
+        Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+        Ok(rest) => to.join(rest),
+        Err(_) => path.to_path_buf(),
     }
 }
 

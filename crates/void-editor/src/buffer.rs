@@ -49,6 +49,8 @@ pub struct Buffer {
     pub final_newline: bool,
     pub read_only: bool,
     pub notice: Option<String>,
+    /// What the file held when this buffer last loaded or saved it (`None`: never on disk).
+    pub disk: Option<crate::Fingerprint>,
     undo: Vec<Group>,
     redo: Vec<Group>,
     open_group: Option<Group>,
@@ -79,6 +81,7 @@ impl Buffer {
             final_newline,
             read_only: false,
             notice: None,
+            disk: None,
             undo: Vec::new(),
             redo: Vec::new(),
             open_group: None,

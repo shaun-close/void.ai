@@ -24,6 +24,8 @@ pub enum Tab {
     Backends,
     Settings,
     Review,
+    /// The workspace's file tree.
+    Files,
     /// `id` tells tabs on the same file and view apart (they share one buffer).
     Editor {
         id: u32,
@@ -40,6 +42,7 @@ impl Tab {
             Tab::Backends => "backends",
             Tab::Settings => "settings",
             Tab::Review => "review",
+            Tab::Files => "files",
             Tab::Editor { .. } => "editor",
         }
     }
@@ -54,7 +57,8 @@ impl Tab {
     }
 }
 
-/// Conversations on the left, Chat in the middle, Backends and Settings tabbed on the right.
+/// Chats and Files tabbed on the left, Chat in the middle, Backends, Settings and Review
+/// tabbed on the right.
 pub fn default_layout() -> DockState<Tab> {
     let mut d = DockState::new(vec![Tab::Chat {
         id: 1,
@@ -66,7 +70,7 @@ pub fn default_layout() -> DockState<Tab> {
         0.72,
         vec![Tab::Backends, Tab::Settings, Tab::Review],
     );
-    tree.split_left(chat, 0.3, vec![Tab::Conversations]);
+    tree.split_left(chat, 0.3, vec![Tab::Conversations, Tab::Files]);
     d
 }
 
@@ -126,8 +130,29 @@ mod tests {
     fn default_layout_has_all_tabs() {
         assert_eq!(
             kinds(&default_layout()),
-            ["backends", "chat", "conversations", "review", "settings"]
+            [
+                "backends",
+                "chat",
+                "conversations",
+                "files",
+                "review",
+                "settings"
+            ]
         );
+    }
+
+    #[test]
+    fn files_tabbed_with_chats_and_old_layouts_still_load() {
+        let d = default_layout();
+        let chats = d.find_tab(&Tab::Conversations).unwrap();
+        let files = d.find_tab(&Tab::Files).unwrap();
+        assert_eq!(chats.node_path(), files.node_path(), "same leaf");
+        // A layout saved before the Files tab existed loads as it was.
+        let mut old = default_layout();
+        old.remove_tab(files);
+        let back = from_text(&to_text(&old)).unwrap();
+        assert!(back.find_tab(&Tab::Files).is_none());
+        assert!(back.find_tab(&Tab::Conversations).is_some());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::Fingerprint;
 use crate::buffer::{Buffer, LineEnding};
 use std::fs;
 use std::io;
@@ -8,13 +9,17 @@ impl Buffer {
     /// Load `path`. Invalid UTF-8 or a NUL in the first 8 KiB opens lossily, read-only, with a notice, so saving cannot
     /// corrupt the file.
     pub fn from_file(path: &Path) -> io::Result<Buffer> {
+        // Metadata first: a write landing in between shows up as a newer timestamp later.
+        let meta = fs::metadata(path)?;
         let bytes = fs::read(path)?;
+        let disk = Fingerprint::new(&meta, &bytes);
         let has_nul = bytes.iter().take(8192).any(|&b| b == 0);
         let (text, valid) = match String::from_utf8(bytes) {
             Ok(text) => (text, true),
             Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
         };
         let mut b = Buffer::new(&text);
+        b.disk = Some(disk);
         if has_nul || !valid {
             b.read_only = true;
             b.notice = Some(if valid {
@@ -51,6 +56,9 @@ impl Buffer {
             out.replace('\n', eol)
         };
         atomic_write(path, out.as_bytes())?;
+        self.disk = fs::metadata(path)
+            .ok()
+            .map(|meta| Fingerprint::new(&meta, out.as_bytes()));
         self.mark_saved();
         Ok(())
     }
