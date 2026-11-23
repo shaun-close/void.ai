@@ -810,6 +810,68 @@ fn closing_deleted_on_disk_buffer_asks() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me\n");
 }
 
+/// `:qa` counts a clean buffer whose file was deleted on disk as unsaved (it holds the only
+/// copy) and refuses; `:qa!` drops it.
+#[test]
+fn qa_keeps_deleted_on_disk_buffer() {
+    let (_t, file, mut h) = watched("keep me\n");
+    let key = (file.clone(), EditorView::Disk);
+    std::fs::remove_file(&file).unwrap();
+    until(&mut h, "deleted", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_deleted())
+    });
+    assert!(!h.state().editors.is_dirty(&key));
+    let id = editor_tabs(h.state())[0];
+    text(&mut h, ":qa");
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert_eq!(editor_tabs(h.state()), vec![id], "still open");
+    let msg = h.state().editors.doc(&key).unwrap().core.message.clone();
+    assert!(format!("{msg:?}").contains("E162"), "{msg:?}");
+    text(&mut h, ":qa!");
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert!(editor_tabs(h.state()).is_empty());
+    assert!(!file.exists());
+}
+
+/// Quitting asks about a clean buffer whose file was deleted on disk; Save all puts it back.
+#[test]
+fn quit_asks_about_deleted_on_disk_buffer() {
+    let (_t, file, mut h) = watched("keep me\n");
+    let key = (file.clone(), EditorView::Disk);
+    std::fs::remove_file(&file).unwrap();
+    until(&mut h, "deleted", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_deleted())
+    });
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    h.step();
+    assert!(
+        h.query_by_label_contains("Save changes before quitting")
+            .is_some()
+    );
+    assert!(
+        h.query_by_label_contains("a.txt (deleted on disk)")
+            .is_some()
+    );
+    h.get_by_label("Save all").click();
+    h.step();
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me\n");
+    assert!(
+        h.query_by_label_contains("Save changes before quitting")
+            .is_none()
+    );
+}
+
 /// End to end on a real source file: search, change a word, write, undo, write again.
 #[test]
 fn e2e_editor_round_trip() {

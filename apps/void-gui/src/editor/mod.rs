@@ -236,7 +236,13 @@ impl EditorStore {
     /// Closing the last tab on `key` loses edits, or the only copy of a file deleted on
     /// disk: ask first.
     pub fn needs_confirm(&self, key: &DocKey, tabs_on_key: usize) -> bool {
-        tabs_on_key <= 1 && (self.is_dirty(key) || self.is_deleted(key))
+        tabs_on_key <= 1 && self.unsaved(key)
+    }
+
+    /// Dropping the buffer would lose something: edits, or the only copy of a file deleted on
+    /// disk (saving puts it back).
+    pub fn unsaved(&self, key: &DocKey) -> bool {
+        self.is_dirty(key) || self.is_deleted(key)
     }
 
     /// The buffer's file was deleted on disk (the buffer holds the last copy).

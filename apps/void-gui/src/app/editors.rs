@@ -166,7 +166,7 @@ impl VoidApp {
                     })
                     .collect();
                 if !force
-                    && let Some((_, dirty)) = tabs.iter().find(|(_, k)| self.editors.is_dirty(k))
+                    && let Some((_, dirty)) = tabs.iter().find(|(_, k)| self.editors.unsaved(k))
                 {
                     let dirty = dirty.clone();
                     let name = file_name(&dirty.0);
@@ -338,14 +338,15 @@ impl VoidApp {
         }
     }
 
-    /// Quitting with unsaved buffers asks first: Save all / Quit without saving / Cancel.
-    /// Chat-view saves go through the engine: the dialog waits for them ("Saving…") and quits
-    /// only when every save landed; otherwise it stays up with the errors.
+    /// Quitting with unsaved buffers (edits, or files deleted on disk) asks first: Save all /
+    /// Quit without saving / Cancel. Chat-view saves go through the engine: the dialog waits
+    /// for them ("Saving…") and quits only when every save landed; otherwise it stays up with
+    /// the errors.
     pub(super) fn quit_dialog(&mut self, ctx: &egui::Context) {
         let dirty: Vec<DocKey> = self
             .editors
             .keys()
-            .filter(|k| self.editors.is_dirty(k))
+            .filter(|k| self.editors.unsaved(k))
             .cloned()
             .collect();
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_anyway && !dirty.is_empty() {
@@ -369,7 +370,16 @@ impl VoidApp {
             }
         }
         let saving = !self.quit_saving.is_empty();
-        let names: Vec<String> = dirty.iter().map(|k| file_name(&k.0)).collect();
+        let names: Vec<String> = dirty
+            .iter()
+            .map(|k| {
+                if self.editors.is_dirty(k) {
+                    file_name(&k.0)
+                } else {
+                    format!("{} (deleted on disk)", file_name(&k.0))
+                }
+            })
+            .collect();
         let errors = self.quit_errors.clone();
         let mut choice = None;
         let modal = egui::Modal::new(egui::Id::unique("editor-quit")).show(ctx, |ui| {
