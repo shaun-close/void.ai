@@ -1099,6 +1099,7 @@ mod e2e {
                     tool: "bash".into(),
                     summary: "git stash".into(),
                     command: Some("git stash && cargo test".into()),
+                    kind: Default::default(),
                 },
             ));
         for _ in 0..6 {
@@ -1279,6 +1280,7 @@ impl Parser {
                     tool: "bash".into(),
                     summary: "cargo test".into(),
                     command: Some("cargo test -p void-core".into()),
+                    kind: Default::default(),
                 },
             ));
         h.step();
@@ -1288,6 +1290,59 @@ impl Parser {
                 .is_some()
         );
         h.get_by_label_contains("Allow once").click();
+        until(&mut h, 10, "approval resolved", |a| {
+            a.state.approvals.is_empty()
+        });
+    }
+
+    /// Offline: Claude Code's requests offer "Always allow" only when Claude Code suggested a
+    /// permission update (never void's prefix rule); Allow once and Deny always.
+    #[test]
+    fn claude_approval_card_always_only_with_suggestions() {
+        use void_core::permissions::{ApprovalKind, ApprovalRequest};
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        h.state().engine.send(Command::NewConversation);
+        until(&mut h, 10, "bound", |a| a.focused_conversation().is_some());
+        let conv = h.state().focused_conversation().unwrap();
+        let req = |id, always_allow| ApprovalRequest {
+            id,
+            conversation: conv,
+            tool: "Bash".into(),
+            summary: "cargo test".into(),
+            command: Some("cargo test -p void-core".into()),
+            kind: ApprovalKind::ClaudeCode {
+                always_allow,
+                title: None,
+                description: None,
+                blocked_path: None,
+            },
+        };
+        h.state_mut()
+            .state
+            .apply(void_core::engine::Event::ApprovalNeeded(req(43, false)));
+        h.step();
+        h.step();
+        assert!(h.query_by_label_contains("Allow once").is_some());
+        assert!(h.query_by_label_contains("Deny").is_some());
+        assert!(h.query_by_label_contains("Always allow").is_none());
+        h.get_by_label_contains("Deny").click();
+        until(&mut h, 10, "approval resolved", |a| {
+            a.state.approvals.is_empty()
+        });
+        h.state_mut()
+            .state
+            .apply(void_core::engine::Event::ApprovalNeeded(req(44, true)));
+        h.step();
+        h.step();
+        assert!(
+            h.query_by_label_contains("Always allow `cargo test`")
+                .is_none()
+        );
+        h.get_by_label_contains("Always allow").click();
         until(&mut h, 10, "approval resolved", |a| {
             a.state.approvals.is_empty()
         });

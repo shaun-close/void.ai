@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent;
 use crate::backend::{Backend, BackendError, StreamEvent, make_backend};
-use crate::claude_code::turn::{self as cc, NoPrompts, PermissionBridge, TurnUpdate};
+use crate::claude_code::permission::{HostBridge, HostMsg};
+use crate::claude_code::turn::{self as cc, PermissionBridge, TurnUpdate};
 use crate::config::{BackendKind, Config, Profile, load_config, resolve_api_key, save_config};
 use crate::context::{build_request, estimate_tokens};
 use crate::context::{compaction_split, needs_compaction};
@@ -311,10 +312,12 @@ impl Engine {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/"))
         });
-        let claude_bridge = options
-            .claude_bridge
-            .clone()
-            .unwrap_or_else(|| Arc::new(NoPrompts));
+        let claude_bridge = options.claude_bridge.clone().unwrap_or_else(|| {
+            let tx = tx.clone();
+            Arc::new(HostBridge::new(move |m| {
+                tx.send(Msg::ClaudePermission(m)).is_ok()
+            }))
+        });
         let state = State {
             config_path,
             config: Config::default(),
@@ -410,6 +413,8 @@ enum Msg {
         generation: u64,
         update: TurnUpdate,
     },
+    /// Claude Code asks for (or withdraws) a permission prompt.
+    ClaudePermission(HostMsg),
 }
 
 enum ToolMsg {
@@ -542,15 +547,13 @@ impl State {
                     item,
                 } => self.stream_item(conversation, generation, item),
                 Msg::Tool(id, m) => self.tool_msg(id, m),
-                Msg::Approval { mut req, reply } => {
+                Msg::Approval { req, reply } => {
                     if !self.turns.contains_key(&req.conversation) {
                         continue;
                     }
-                    req.id = self.next_approval;
-                    self.next_approval += 1;
-                    self.approvals.insert(req.id, (req.conversation, reply));
-                    self.emit(Event::ApprovalNeeded(req));
+                    self.request_approval(req, reply);
                 }
+                Msg::ClaudePermission(m) => self.claude_permission(m),
                 Msg::Claude {
                     conversation,
                     generation,
@@ -673,16 +676,7 @@ impl State {
         };
         t.cancel.cancel();
         let running = t.runner.is_some();
-        let pending: Vec<u64> = self
-            .approvals
-            .iter()
-            .filter(|(_, (c, _))| *c == id)
-            .map(|(k, _)| *k)
-            .collect();
-        for k in pending {
-            self.approvals.remove(&k);
-            self.emit(Event::ApprovalResolved { id: k });
-        }
+        self.withdraw_approvals(id);
         if !running {
             self.finalize_turn(id);
             return;
@@ -700,15 +694,23 @@ impl State {
         });
     }
 
-    /// End a turn now (abort a running tool) and report its changes.
-    fn finalize_turn(&mut self, id: ConversationId) {
-        let Some(t) = self.turns.remove(&id) else {
-            return;
-        };
-        t.cancel.cancel();
-        if let Some(r) = t.runner {
-            r.abort();
-        }
+    /// Ask the user (the GUI's approval dialog); the answer goes to `reply`. Dropping the
+    /// entry (Stop, the turn's end) closes the dialog and drops `reply` unanswered.
+    fn request_approval(
+        &mut self,
+        mut req: ApprovalRequest,
+        reply: oneshot::Sender<Decision>,
+    ) -> u64 {
+        req.id = self.next_approval;
+        self.next_approval += 1;
+        self.approvals.insert(req.id, (req.conversation, reply));
+        let id = req.id;
+        self.emit(Event::ApprovalNeeded(req));
+        id
+    }
+
+    /// Close every pending approval of the chat (their requests get no answer).
+    fn withdraw_approvals(&mut self, id: ConversationId) {
         let pending: Vec<u64> = self
             .approvals
             .iter()
@@ -719,6 +721,18 @@ impl State {
             self.approvals.remove(&k);
             self.emit(Event::ApprovalResolved { id: k });
         }
+    }
+
+    /// End a turn now (abort a running tool) and report its changes.
+    fn finalize_turn(&mut self, id: ConversationId) {
+        let Some(t) = self.turns.remove(&id) else {
+            return;
+        };
+        t.cancel.cancel();
+        if let Some(r) = t.runner {
+            r.abort();
+        }
+        self.withdraw_approvals(id);
         self.emit(Event::TurnState {
             conversation: id,
             active: false,
@@ -867,10 +881,11 @@ impl State {
                                 tool: name.clone(),
                                 summary: summary.clone(),
                                 command,
+                                kind: Default::default(),
                             };
                             let _ = tx.send(Msg::Approval { req, reply: otx });
                             match orx.await {
-                                Ok(Decision::Once) => {}
+                                Ok(Decision::Once | Decision::AlwaysAsSuggested) => {}
                                 Ok(Decision::AlwaysForWorkspace(prefix)) => {
                                     let _ = tx.send(Msg::AddRule {
                                         ws: ws.id.clone(),
@@ -2659,6 +2674,61 @@ mod tests {
             a.overlay().read(std::path::Path::new("a.txt")).unwrap(),
             b"mango\n"
         );
+    }
+
+    /// A Claude Code permission request for a chat whose turn is over (a late one, after Stop,
+    /// or from a process that's going away) is refused at once and shows no dialog.
+    #[test]
+    fn late_claude_ask_is_denied() {
+        use crate::claude_code::permission::{HostMsg, TURN_OVER};
+        use crate::claude_code::turn::PermissionAsk;
+        let mut r = rig();
+        r.started();
+        let c = r.new_conversation();
+        let (stdin, mut lines) = mpsc::unbounded_channel();
+        let ask = PermissionAsk {
+            request_id: "late-1".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            suggestions: None,
+            title: None,
+            description: None,
+            blocked_path: None,
+        };
+        let _ = r.handle.tx.send(Msg::ClaudePermission(HostMsg::Cancel {
+            conversation: c,
+            request_id: "unknown".into(),
+        }));
+        let _ = r.handle.tx.send(Msg::ClaudePermission(HostMsg::Ask {
+            conversation: c,
+            ask,
+            stdin,
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = loop {
+            if let Ok(l) = lines.try_recv() {
+                break l;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the late request was never answered"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            line,
+            crate::claude_code::control_response_deny("late-1", TURN_OVER, false)
+        );
+        r.handle.send(Command::NewConversation);
+        let mut asked = false;
+        loop {
+            match r.next() {
+                Event::ApprovalNeeded(_) => asked = true,
+                Event::ConversationCreated(_) => break,
+                _ => {}
+            }
+        }
+        assert!(!asked, "no dialog for a turn that's over");
     }
 
     #[test]

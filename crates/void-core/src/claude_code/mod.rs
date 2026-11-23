@@ -2,6 +2,7 @@
 //! UI-free; `turn` runs one chat turn's `claude` process for the engine.
 
 pub mod args;
+pub mod permission;
 pub mod stream;
 pub mod turn;
 

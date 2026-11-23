@@ -1,0 +1,5 @@
+# Permission request without suggestions ("Always allow" isn't offered), with Claude Code's own wording.
+{"type":"system","subtype":"init","session_id":"sess-p","model":"claude-fake"}
+{"type":"control_request","request_id":"perm-2","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"/etc/hostname"},"permission_suggestions":[],"blocked_path":"/etc/hostname","title":"Claude wants to read /etc/hostname","description":"It's outside the project.","tool_use_id":"tu_2"}}
+#wait-stdin-line
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"sess-p","result":"ok","usage":{"input_tokens":5,"output_tokens":1}}

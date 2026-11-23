@@ -41,6 +41,10 @@ pub enum CcEvent {
         tool: String,
         input: Value,
         suggestions: Option<Value>,
+        /// Claude Code's own wording for the prompt, and the path that made it ask.
+        title: Option<String>,
+        description: Option<String>,
+        blocked_path: Option<String>,
     },
     Result {
         usage: Usage,
@@ -272,6 +276,9 @@ fn control_request(v: &Value) -> Option<CcEvent> {
                 .get("permission_suggestions")
                 .filter(|x| !x.is_null())
                 .cloned(),
+            title: s(req, "title"),
+            description: s(req, "description"),
+            blocked_path: s(req, "blocked_path"),
         });
     }
     Some(CcEvent::UnsupportedControl {
@@ -510,8 +517,25 @@ mod tests {
                 tool: "Bash".into(),
                 input: json!({"command":"rm x"}),
                 suggestions: Some(json!([{"type":"addRules"}])),
+                title: None,
+                description: None,
+                blocked_path: None,
             }
         );
+        let t = r#"{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool","tool_name":"Read","input":{},"title":"Read it?","description":"outside","blocked_path":"/etc/x","display_name":"Read"}}"#;
+        match parse_line(t) {
+            CcEvent::PermissionRequest {
+                title,
+                description,
+                blocked_path,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Read it?"));
+                assert_eq!(description.as_deref(), Some("outside"));
+                assert_eq!(blocked_path.as_deref(), Some("/etc/x"));
+            }
+            e => panic!("{e:?}"),
+        }
         let n = r#"{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Read","input":{},"permission_suggestions":null}}"#;
         match parse_line(n) {
             CcEvent::PermissionRequest { suggestions, .. } => assert_eq!(suggestions, None),

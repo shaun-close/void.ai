@@ -575,6 +575,7 @@ mod tests {
             tool: "bash".into(),
             summary: "rm -rf build".into(),
             command: Some("rm -rf build".into()),
+            kind: Default::default(),
         };
         s.apply(Event::ApprovalNeeded(req.clone()));
         assert_eq!(s.approvals, vec![req]);

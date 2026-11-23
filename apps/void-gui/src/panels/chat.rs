@@ -395,30 +395,40 @@ fn approval_card(
                 });
             ui.horizontal_wrapped(|ui| {
                 use void_core::engine::Command;
-                use void_core::permissions::Decision;
+                use void_core::permissions::{ApprovalKind, Decision};
                 if theme::primary_button(ui, icon::CHECK, "Allow once").clicked() {
                     engine.send(Command::Approve {
                         id: req.id,
                         decision: Decision::Once,
                     });
                 }
-                let prefix = req
-                    .command
-                    .as_deref()
-                    .map(void_core::permissions::always_prefix)
-                    .unwrap_or_default();
-                let always = if prefix.is_empty() {
-                    format!("Always allow {}", req.tool)
-                } else {
-                    format!("Always allow `{prefix}`")
+                // Claude Code's requests: "Always allow" only when Claude Code suggested a
+                // permission update, which goes back to it (void's rules are never written).
+                let always = match &req.kind {
+                    ApprovalKind::ClaudeCode { always_allow, .. } => always_allow
+                        .then(|| ("Always allow".to_string(), Decision::AlwaysAsSuggested)),
+                    ApprovalKind::Void => {
+                        let prefix = req
+                            .command
+                            .as_deref()
+                            .map(void_core::permissions::always_prefix)
+                            .unwrap_or_default();
+                        let label = if prefix.is_empty() {
+                            format!("Always allow {}", req.tool)
+                        } else {
+                            format!("Always allow `{prefix}`")
+                        };
+                        Some((label, Decision::AlwaysForWorkspace(prefix)))
+                    }
                 };
-                if ui
-                    .button(theme::itext(icon::SHIELD_CHECK, &always))
-                    .clicked()
+                if let Some((label, decision)) = always
+                    && ui
+                        .button(theme::itext(icon::SHIELD_CHECK, &label))
+                        .clicked()
                 {
                     engine.send(Command::Approve {
                         id: req.id,
-                        decision: Decision::AlwaysForWorkspace(prefix),
+                        decision,
                     });
                 }
                 if ui

@@ -2,13 +2,18 @@
 //! Stop, and the checks that keep a running turn's overlay mount safe. The process and the
 //! stream mapping live in [`crate::claude_code::turn`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{Event, Msg, State, StreamMode};
-use crate::claude_code::turn::{self as cc, Out, Segments, StdinTx, TurnSpec, TurnUpdate};
-use crate::claude_code::{SessionMode, TurnArgs};
+use crate::claude_code::permission::{self as perm, HostMsg};
+use crate::claude_code::turn::{
+    self as cc, Out, PermissionAsk, Segments, StdinTx, TurnSpec, TurnUpdate,
+};
+use crate::claude_code::{SessionMode, TurnArgs, control_response_deny};
 use crate::config::{BackendKind, Profile};
 use crate::model::{Conversation, ConversationId, Message, Part, Role, WorkspaceId};
 use crate::sandbox::{Availability, OverlayMounts, Sandbox};
@@ -24,9 +29,10 @@ pub(super) struct ClaudeRun {
     pub(super) done: bool,
     /// Where the turn has its overlay mounted (kept after Delete until the process is gone).
     pub(super) workspace: WorkspaceId,
-    /// `claude`'s stdin, for permission answers.
-    #[allow(dead_code)]
+    /// The current attempt's `claude` stdin: permission requests from any other are stale.
     pub(super) stdin: Option<StdinTx>,
+    /// Claude Code's pending permission requests: request id → approval id.
+    pub(super) asks: HashMap<String, u64>,
 }
 
 impl State {
@@ -79,6 +85,7 @@ impl State {
                     .map(|t| t.workspace.id.clone())
                     .unwrap_or_else(|| self.workspace.id.clone()),
                 stdin: None,
+                asks: HashMap::new(),
             },
         );
         self.apply_outs(id, outs);
@@ -265,6 +272,8 @@ impl State {
                     let out = run.seg.finish(false, error, Some(usage));
                     self.apply_outs(id, out.into_iter().collect());
                 }
+                // stdin closes now: nothing can be answered any more.
+                self.claude_turn_ended(id);
             }
             TurnUpdate::Exited { error } => {
                 if !run.done {
@@ -274,8 +283,8 @@ impl State {
                     let out = run.seg.finish(false, Some(error), None);
                     self.apply_outs(id, out.into_iter().collect());
                 }
+                self.claude_turn_ended(id);
                 self.claude.remove(&id);
-                self.claude_bridge.turn_ended(id);
                 self.finalize_turn(id);
                 if self
                     .convs
@@ -372,18 +381,78 @@ impl State {
             let out = run.seg.finish(true, None, None);
             self.apply_outs(id, out.into_iter().collect());
         }
-        self.claude_bridge.turn_ended(id);
-        let pending: Vec<u64> = self
-            .approvals
-            .iter()
-            .filter(|(_, (c, _))| *c == id)
-            .map(|(k, _)| *k)
-            .collect();
-        for k in pending {
-            self.approvals.remove(&k);
-            self.emit(Event::ApprovalResolved { id: k });
-        }
+        self.claude_turn_ended(id);
         true
+    }
+
+    /// The chat's Claude Code turn is over (or stopped): close its permission prompts, unanswered
+    /// (no stdin writes after this), and tell the bridge.
+    fn claude_turn_ended(&mut self, id: ConversationId) {
+        if let Some(run) = self.claude.get_mut(&id) {
+            run.asks.clear();
+        }
+        self.withdraw_approvals(id);
+        self.claude_bridge.turn_ended(id);
+    }
+
+    pub(super) fn claude_permission(&mut self, m: HostMsg) {
+        match m {
+            HostMsg::Ask {
+                conversation,
+                ask,
+                stdin,
+            } => self.claude_ask(conversation, ask, stdin),
+            HostMsg::Cancel {
+                conversation,
+                request_id,
+            } => {
+                let k = self
+                    .claude
+                    .get_mut(&conversation)
+                    .and_then(|run| run.asks.remove(&request_id));
+                if let Some(k) = k
+                    && self.approvals.remove(&k).is_some()
+                {
+                    self.emit(Event::ApprovalResolved { id: k });
+                }
+            }
+        }
+    }
+
+    /// Show Claude Code's permission request in the approval dialog, like void's own requests,
+    /// and answer it on `stdin` when the user decides. void's permission rules play no part.
+    /// A request from a turn that's over (or from an earlier attempt) is refused at once, so
+    /// `claude` never waits for a dialog that won't come.
+    fn claude_ask(&mut self, id: ConversationId, ask: PermissionAsk, stdin: StdinTx) {
+        let live = self.turns.contains_key(&id)
+            && self.claude.get(&id).is_some_and(|run| {
+                !run.done
+                    && run
+                        .stdin
+                        .as_ref()
+                        .is_some_and(|current| current.same_channel(&stdin))
+            });
+        if !live {
+            let _ = stdin.send(control_response_deny(
+                &ask.request_id,
+                perm::TURN_OVER,
+                false,
+            ));
+            return;
+        }
+        let base = self.turns.get(&id).and_then(|t| t.workspace.root.clone());
+        let req = perm::approval_request(id, &ask, base.as_deref());
+        let (reply, decided) = oneshot::channel();
+        let k = self.request_approval(req, reply);
+        if let Some(run) = self.claude.get_mut(&id) {
+            run.asks.insert(ask.request_id.clone(), k);
+        }
+        tokio::spawn(async move {
+            // No answer when the prompt was withdrawn (cancelled, stopped, turn over).
+            if let Ok(decision) = decided.await {
+                let _ = stdin.send(perm::answer(&ask, &decision));
+            }
+        });
     }
 }
 
@@ -394,7 +463,7 @@ impl State {
         if let Some(run) = self.claude.get_mut(&id) {
             run.cancel.cancel();
             run.done = true;
-            self.claude_bridge.turn_ended(id);
+            self.claude_turn_ended(id);
         }
     }
 }

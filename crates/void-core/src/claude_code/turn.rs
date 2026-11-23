@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CcEvent, SessionMode, TurnArgs, build_args, control_response_deny, control_response_error,
-    initialize_request, parse_events, user_message,
+    CcEvent, SessionMode, TurnArgs, build_args, control_response_error, initialize_request,
+    parse_events, user_message,
 };
 use crate::config::{ApiKeySource, resolve_api_key};
 use crate::context::estimate_tokens;
@@ -35,8 +35,6 @@ pub const NOT_SIGNED_IN: &str =
     "Claude Code isn't signed in — run `claude` in a terminal to sign in";
 /// Review actions and chat-view saves while a turn has the overlay mounted.
 pub const BUSY: &str = "A Claude Code turn is running — try again when it finishes";
-/// Placeholder answer to permission requests until approvals are wired to void's dialog.
-pub const NO_PROMPTS: &str = "void.ai can't show permission prompts yet";
 
 /// The earlier transcript sent with a chat's first Claude Code turn, at most this many bytes.
 const TRANSCRIPT_CAP: usize = 200 * 1024;
@@ -47,7 +45,7 @@ const STDERR_LINE_CAP: usize = 500;
 /// After the result, how long `claude` gets to exit once stdin is closed.
 const EXIT_GRACE: Duration = Duration::from_secs(10);
 
-/// Lines for `claude`'s stdin (without the newline). Task 5 answers permission requests here.
+/// Lines for `claude`'s stdin (without the newline); permission answers go here too.
 pub type StdinTx = mpsc::UnboundedSender<String>;
 
 /// A `can_use_tool` request from Claude Code.
@@ -57,6 +55,10 @@ pub struct PermissionAsk {
     pub tool: String,
     pub input: Value,
     pub suggestions: Option<Value>,
+    /// Claude Code's own wording and the path that made it ask, when it sends them.
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub blocked_path: Option<String>,
 }
 
 /// Where Claude Code's permission requests go. Each request must eventually get exactly one
@@ -68,17 +70,6 @@ pub trait PermissionBridge: Send + Sync {
     /// The chat's turn was stopped, deleted or is over: drop anything still pending for it.
     /// May be called more than once per turn.
     fn turn_ended(&self, _conversation: ConversationId) {}
-}
-
-/// Answers every request with a deny (until approvals reach void's dialog).
-pub struct NoPrompts;
-
-impl PermissionBridge for NoPrompts {
-    fn ask(&self, _conversation: ConversationId, ask: PermissionAsk, stdin: StdinTx) {
-        let _ = stdin.send(control_response_deny(&ask.request_id, NO_PROMPTS, false));
-    }
-
-    fn cancel(&self, _conversation: ConversationId, _request_id: &str) {}
 }
 
 /// Find the profile's `claude`: a path (a leading `~/` is the home directory) or a bare name,
@@ -674,6 +665,9 @@ async fn attempt(
                     tool,
                     input,
                     suggestions,
+                    title,
+                    description,
+                    blocked_path,
                 } => bridge.ask(
                     spec.conversation,
                     PermissionAsk {
@@ -681,6 +675,9 @@ async fn attempt(
                         tool,
                         input,
                         suggestions,
+                        title,
+                        description,
+                        blocked_path,
                     },
                     tx.clone(),
                 ),
@@ -1122,24 +1119,5 @@ mod tests {
             Ok(TurnUpdate::Exited { error: None })
         ));
         assert!(rx.try_recv().is_err(), "one Exited only");
-    }
-
-    #[test]
-    fn no_prompts_denies() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        NoPrompts.ask(
-            ConversationId::new(),
-            PermissionAsk {
-                request_id: "r1".into(),
-                tool: "Bash".into(),
-                input: Value::Null,
-                suggestions: None,
-            },
-            tx,
-        );
-        let v: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(v["response"]["request_id"], "r1");
-        assert_eq!(v["response"]["response"]["behavior"], "deny");
-        assert_eq!(v["response"]["response"]["message"], NO_PROMPTS);
     }
 }

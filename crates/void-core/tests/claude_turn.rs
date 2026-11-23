@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use uuid::Uuid;
 use void_core::claude_code::turn::{PermissionAsk, PermissionBridge, StdinTx};
+use void_core::claude_code::{control_response_allow, control_response_deny};
 use void_core::config::{ApiKeySource, BackendKind, Config, Profile, save_config};
 use void_core::engine::{Command, DeltaKind, Engine, EngineHandle, EngineOptions, Event};
 use void_core::model::{Conversation, ConversationId, Message, Part, Role, Workspace};
 use void_core::overlay::Overlay;
+use void_core::permissions::{Action, ApprovalKind, ApprovalRequest, Decision, Permissions, Rule};
 use void_core::sandbox::{Availability, SandboxSettings};
 use void_core::store::Store;
 
@@ -43,6 +45,8 @@ struct Setup {
     /// Conversations saved before the engine starts (in the workspace).
     before: Vec<Conversation>,
     bridge: Option<Arc<dyn PermissionBridge>>,
+    /// void's own permission rules for the workspace, saved before the engine starts.
+    rules: Option<Vec<Rule>>,
 }
 
 impl Default for Setup {
@@ -54,6 +58,7 @@ impl Default for Setup {
             command: None,
             before: Vec::new(),
             bridge: None,
+            rules: None,
         }
     }
 }
@@ -150,6 +155,11 @@ fn rig_with(setup: Setup, workspace: bool) -> Option<Rig> {
             Workspace::scratch().id
         };
         store.save(&c).unwrap();
+    }
+    if let Some(rules) = setup.rules {
+        Permissions { rules }
+            .save(&store.permissions_path(&wsm.id))
+            .unwrap();
     }
     let handle = Engine::start_with_options(
         cfg_path,
@@ -272,6 +282,50 @@ impl Rig {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The next approval the engine asks for.
+    fn approval(&mut self) -> ApprovalRequest {
+        match self.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => req,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The control responses a spawn received on stdin, as sent (one line each).
+    fn control_responses(&self, n: usize) -> Vec<String> {
+        self.fake(&format!("stdin-{n}"))
+            .lines()
+            .filter(|l| {
+                serde_json::from_str::<Value>(l).is_ok_and(|v| v["type"] == "control_response")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn permissions_file(&self) -> Option<Vec<u8>> {
+        let w = self.store.workspace_for(&self.ws).unwrap();
+        fs::read(self.store.permissions_path(&w.id)).ok()
+    }
+
+    /// Processes from this rig's sandbox still alive (their env or argv names the dummy home).
+    fn sandbox_processes(&self) -> Vec<String> {
+        let needle = self.home.to_string_lossy().into_owned();
+        let mut found = Vec::new();
+        for e in fs::read_dir("/proc").unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            for f in ["environ", "cmdline"] {
+                let bytes = fs::read(e.path().join(f)).unwrap_or_default();
+                if String::from_utf8_lossy(&bytes).contains(&needle) {
+                    found.push(name.clone());
+                    break;
+                }
+            }
+        }
+        found
     }
 
     /// The user messages a spawn received on stdin.
@@ -852,6 +906,11 @@ fn control_requests_are_answered() {
     };
     let c = r.new_conversation();
     r.send(c, "go");
+    let id = r.approval().id;
+    r.handle.send(Command::Approve {
+        id,
+        decision: Decision::Deny,
+    });
     match r.until(|e| matches!(e, Event::TurnStatus { .. })) {
         Event::TurnStatus { status, .. } => assert!(status.contains("retrying"), "{status}"),
         _ => unreachable!(),
@@ -1050,4 +1109,292 @@ fn bridge_hears_when_turns_end() {
     r.handle.send(Command::DeleteConversation(deleted));
     r.until(|e| matches!(e, Event::ConversationDeleted(_)));
     assert!(ended(deleted), "a deleted chat");
+}
+
+// ---- permission prompts (Claude Code's `can_use_tool`) -----------------------------------
+
+/// The request in permission.ndjson.
+fn rm_build() -> Value {
+    serde_json::json!({"command": "rm -rf build"})
+}
+
+fn rm_build_suggestions() -> Value {
+    serde_json::json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"rm -rf build"}],"behavior":"allow","destination":"session"}])
+}
+
+#[test]
+fn permission_request_shows_approval() {
+    let Some(mut r) = rig(Setup {
+        pick: r#"if [ "$n" = 1 ]; then sc=permission; else sc=permission-plain; fi"#.into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "clean up");
+    let req = r.approval();
+    assert_eq!(req.conversation, c);
+    assert_eq!(req.tool, "Bash");
+    assert_eq!(req.summary, "rm -rf build");
+    assert_eq!(req.command.as_deref(), Some("rm -rf build"));
+    assert_eq!(
+        req.kind,
+        ApprovalKind::ClaudeCode {
+            always_allow: true,
+            title: None,
+            description: None,
+            blocked_path: None,
+        }
+    );
+    assert!(
+        r.control_responses(1).is_empty(),
+        "nothing answered before the user decides"
+    );
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Once,
+    });
+    r.until(|e| matches!(e, Event::ApprovalResolved { id } if *id == req.id));
+    r.turn_over(c);
+
+    // Claude Code's own wording comes along; no suggestions → no "Always allow".
+    r.send(c, "read it");
+    let req = r.approval();
+    assert_eq!(req.tool, "Read");
+    assert_eq!(req.summary, "/etc/hostname");
+    assert_eq!(req.command, None);
+    assert_eq!(
+        req.kind,
+        ApprovalKind::ClaudeCode {
+            always_allow: false,
+            title: Some("Claude wants to read /etc/hostname".into()),
+            description: Some("It's outside the project.".into()),
+            blocked_path: Some("/etc/hostname".into()),
+        }
+    );
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Once,
+    });
+    r.turn_over(c);
+}
+
+#[test]
+fn allow_writes_control_response() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=permission".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "clean up");
+    let req = r.approval();
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Once,
+    });
+    // The fake only goes on (tool result, result) once it has the answer.
+    r.until(|e| matches!(e, Event::ToolFinished { call_id, .. } if call_id == "tu_9"));
+    r.turn_over(c);
+    assert_eq!(
+        r.control_responses(1),
+        [control_response_allow("perm-1", &rm_build(), None)]
+    );
+}
+
+#[test]
+fn deny_with_message() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=permission".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "clean up");
+    let req = r.approval();
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Deny,
+    });
+    r.turn_over(c);
+    assert_eq!(
+        r.control_responses(1),
+        [control_response_deny(
+            "perm-1",
+            "The user denied this in void.ai",
+            false
+        )]
+    );
+}
+
+#[test]
+fn always_allow_sends_suggestion() {
+    let Some(mut r) = rig(Setup {
+        pick: r#"case $n in 1|2) sc=permission;; *) sc=permission-plain;; esac"#.into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let rules_before = r.permissions_file();
+    let c = r.new_conversation();
+    r.send(c, "clean up");
+    let req = r.approval();
+    assert!(matches!(
+        req.kind,
+        ApprovalKind::ClaudeCode {
+            always_allow: true,
+            ..
+        }
+    ));
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::AlwaysAsSuggested,
+    });
+    r.turn_over(c);
+    let sug = rm_build_suggestions();
+    assert_eq!(
+        r.control_responses(1),
+        [control_response_allow("perm-1", &rm_build(), Some(&sug))],
+        "Claude Code's suggestion goes back unchanged"
+    );
+
+    // void's own "always" (a workspace rule) is never written for a Claude Code chat.
+    r.send(c, "again");
+    let req = r.approval();
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::AlwaysForWorkspace("rm".into()),
+    });
+    r.turn_over(c);
+    assert_eq!(
+        r.control_responses(2),
+        [control_response_allow("perm-1", &rm_build(), None)]
+    );
+
+    // Without suggestions it isn't offered, and asking for it anyway allows once.
+    r.send(c, "read it");
+    let req = r.approval();
+    assert!(matches!(
+        req.kind,
+        ApprovalKind::ClaudeCode {
+            always_allow: false,
+            ..
+        }
+    ));
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::AlwaysAsSuggested,
+    });
+    r.turn_over(c);
+    assert_eq!(
+        r.control_responses(3),
+        [control_response_allow(
+            "perm-2",
+            &serde_json::json!({"file_path": "/etc/hostname"}),
+            None
+        )]
+    );
+    assert_eq!(r.permissions_file(), rules_before, "void's rules untouched");
+}
+
+#[test]
+fn void_rules_not_consulted() {
+    let deny = |tool: &str| Rule {
+        tool: tool.into(),
+        prefix: None,
+        action: Action::Deny,
+    };
+    let Some(mut r) = rig(Setup {
+        pick: "sc=permission".into(),
+        rules: Some(vec![deny("bash"), deny("Bash")]),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let rules_before = r.permissions_file();
+    assert!(rules_before.is_some());
+    let c = r.new_conversation();
+    r.send(c, "clean up");
+    // Asked (Claude Code's settings said "ask"), not refused by void's deny rule.
+    let req = r.approval();
+    assert_eq!(req.tool, "Bash");
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Once,
+    });
+    r.turn_over(c);
+    assert_eq!(
+        r.control_responses(1),
+        [control_response_allow("perm-1", &rm_build(), None)]
+    );
+    assert_eq!(r.permissions_file(), rules_before);
+}
+
+#[test]
+fn stop_during_permission_request() {
+    let Some(mut r) = rig(Setup {
+        pick: r#"if [ "$n" = 1 ]; then sc=permission-stop; else sc=text-turn; fi"#.into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "go");
+    let req = r.approval();
+    assert!(!r.sandbox_processes().is_empty(), "the fake is running");
+    r.handle.send(Command::Stop(c));
+    // The dialog closes and the partial reply is kept (in either order).
+    let (mut closed, mut msg) = (false, None);
+    while !closed || msg.is_none() {
+        match r.next() {
+            Event::ApprovalResolved { id } if id == req.id => closed = true,
+            Event::StreamFinished { message, .. } => msg = Some(message),
+            _ => {}
+        }
+    }
+    let msg = msg.unwrap();
+    assert!(msg.stopped);
+    assert_eq!(msg.text(), "partial answer");
+    r.turn_over(c);
+    assert!(
+        r.sandbox_processes().is_empty(),
+        "no orphan claude: {:?}",
+        r.sandbox_processes()
+    );
+    assert!(r.control_responses(1).is_empty(), "nothing answered");
+    // A late answer to the closed dialog does nothing.
+    r.handle.send(Command::Approve {
+        id: req.id,
+        decision: Decision::Once,
+    });
+    assert!(r.saved(c, true).messages.last().unwrap().stopped);
+    r.send(c, "next");
+    r.until(
+        |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == "Hello world"),
+    );
+    assert!(r.control_responses(1).is_empty());
+}
+
+#[test]
+fn cancel_withdraws_approval() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=permission-cancel".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "go");
+    let req = r.approval();
+    r.until(|e| matches!(e, Event::ApprovalResolved { id } if *id == req.id));
+    r.until(
+        |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == "Never mind."),
+    );
+    r.turn_over(c);
+    assert!(
+        r.control_responses(1).is_empty(),
+        "a withdrawn request gets no answer"
+    );
 }

@@ -145,13 +145,40 @@ pub struct ApprovalRequest {
     pub summary: String,
     /// The full command, for bash.
     pub command: Option<String>,
+    /// Whose request this is: void's own agent, or Claude Code (a Claude Code chat).
+    #[serde(default)]
+    pub kind: ApprovalKind,
+}
+
+/// Who is asking. void's own requests are decided by void's workspace rules; Claude Code's come
+/// from Claude Code's own permission settings, and void's rules are never read or written for
+/// them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalKind {
+    #[default]
+    Void,
+    ClaudeCode {
+        /// Claude Code suggested a permission update for "Always allow"
+        /// ([`Decision::AlwaysAsSuggested`]); offer the button only then.
+        always_allow: bool,
+        /// Claude Code's own wording for the request, when it sent any.
+        title: Option<String>,
+        description: Option<String>,
+        /// The path that made Claude Code ask (e.g. outside its allowed directories).
+        blocked_path: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Once,
     /// Allow now and add a rule for this command prefix (or the whole tool when empty).
+    /// void's own requests only: for Claude Code's it allows once and writes no rule.
     AlwaysForWorkspace(String),
+    /// Claude Code's "Always allow": allow and hand Claude Code back its own suggested
+    /// permission update (Claude Code applies it; void writes nothing). Allows once when there
+    /// was no suggestion, and for void's own requests.
+    AlwaysAsSuggested,
     Deny,
 }
 

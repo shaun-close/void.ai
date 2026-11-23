@@ -1,0 +1,7 @@
+# Claude Code asks, then withdraws the request itself and carries on.
+{"type":"system","subtype":"init","session_id":"sess-pc","model":"claude-fake"}
+{"type":"control_request","request_id":"perm-4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"sleep 1"},"permission_suggestions":null,"tool_use_id":"tu_4"}}
+#sleep 200
+{"type":"control_cancel_request","request_id":"perm-4"}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"Never mind."}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"Never mind.","usage":{"input_tokens":1,"output_tokens":1}}
