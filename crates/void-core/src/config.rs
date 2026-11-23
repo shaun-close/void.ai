@@ -74,11 +74,14 @@ impl Profile {
     }
 }
 
+/// A profile as written in config.toml. Only `id`, `name` and `kind` are required: a
+/// hand-written Claude Code profile has no URL, and the limits default by kind.
 #[derive(Serialize, Deserialize)]
 struct ProfileRepr {
     id: String,
     name: String,
     kind: BackendKind,
+    #[serde(default)]
     base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
@@ -86,9 +89,12 @@ struct ProfileRepr {
     api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key_cmd: Option<String>,
+    #[serde(default)]
     model: String,
-    context_limit: u32,
-    max_output: u32,
+    #[serde(default)]
+    context_limit: Option<u32>,
+    #[serde(default)]
+    max_output: Option<u32>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     extra_body: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +116,11 @@ impl TryFrom<ProfileRepr> for Profile {
                 ));
             }
         };
+        // Claude Code's models have a far larger window than a typical local model.
+        let (context_limit, max_output) = match r.kind {
+            BackendKind::ClaudeCode => (200_000, 32_000),
+            BackendKind::OpenAi | BackendKind::Anthropic => (32768, 8192),
+        };
         Ok(Self {
             id: r.id,
             name: r.name,
@@ -117,8 +128,8 @@ impl TryFrom<ProfileRepr> for Profile {
             base_url: r.base_url,
             api_key,
             model: r.model,
-            context_limit: r.context_limit,
-            max_output: r.max_output,
+            context_limit: r.context_limit.unwrap_or(context_limit),
+            max_output: r.max_output.unwrap_or(max_output),
             extra_body: r.extra_body,
             command: r.command,
         })
@@ -142,8 +153,8 @@ impl From<Profile> for ProfileRepr {
             api_key_env,
             api_key_cmd,
             model: p.model,
-            context_limit: p.context_limit,
-            max_output: p.max_output,
+            context_limit: Some(p.context_limit),
+            max_output: Some(p.max_output),
             extra_body: p.extra_body,
             command: p.command,
         }
@@ -461,6 +472,43 @@ mod tests {
         let old = Config::default().profiles[0].clone();
         assert_eq!(old.command, None);
         assert!(!toml::to_string(&old).unwrap().contains("command"));
+    }
+
+    /// A hand-written Claude Code profile needs only what it uses; the rest gets defaults
+    /// (and doesn't break the whole config).
+    #[test]
+    fn minimal_claude_code_profile_parses() {
+        let src = r#"
+            active_profile = "cc"
+            [[profiles]]
+            id = "cc"
+            name = "Claude Code"
+            kind = "claude-code"
+            command = "claude"
+        "#;
+        let cfg: Config = toml::from_str(src).unwrap();
+        let p = cfg.profile("cc").unwrap();
+        assert_eq!(p.kind, BackendKind::ClaudeCode);
+        assert_eq!(p.command.as_deref(), Some("claude"));
+        assert_eq!((p.base_url.as_str(), p.model.as_str()), ("", ""));
+        assert_eq!((p.context_limit, p.max_output), (200_000, 32_000));
+        let local: Profile = toml::from_str(
+            r#"
+            id = "l"
+            name = "L"
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+        "#,
+        )
+        .unwrap();
+        assert_eq!((local.context_limit, local.max_output), (32768, 8192));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, src).unwrap();
+        let (loaded, warning) = load_config(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.profile("cc"), Some(p));
+        assert!(path.exists(), "not set aside");
     }
 
     #[test]
