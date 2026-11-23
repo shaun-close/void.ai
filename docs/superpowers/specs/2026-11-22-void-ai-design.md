@@ -45,7 +45,7 @@ llama.cpp `llama-server` and Ollama, with hosted Anthropic-style APIs possible l
 
 ## Constraints
 
-- Machine: Linux (Wayland, fish shell), a 16 GB GPU, a desktop CPU, plenty of RAM.
+- Platform: Linux desktops (Wayland); local inference needs a GPU.
 - Tooling: moon 2.5.0 via proto (`~/.proto/shims`). Rust toolchains installed include 1.99.1; eframe 0.37 and
   egui_dock 0.22 need Rust ≥ 1.95, so the workspace pins **1.99.1** (`rust-toolchain.toml` and `.prototools`).
 - Strata: OpenAI-compatible at `http://127.0.0.1:8080/v1` (streaming, tool calls, reasoning in

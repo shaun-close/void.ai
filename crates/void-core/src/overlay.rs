@@ -1673,12 +1673,12 @@ mod tests {
         fs::write(t.ws.join(".gitignore"), "target/\n").unwrap();
         fs::write(t.ws.join("a.txt"), "1").unwrap();
         t.ov.write(Path::new("a.txt"), b"agent").unwrap();
-        fs::write(t.ws.join("a.txt"), "shaun's edit").unwrap();
+        fs::write(t.ws.join("a.txt"), "the user's edit").unwrap();
         let skipped = t.ov.accept_all(true).unwrap();
         assert_eq!(skipped, vec![PathBuf::from("a.txt")]);
         assert_eq!(
             fs::read_to_string(t.ws.join("a.txt")).unwrap(),
-            "shaun's edit"
+            "the user's edit"
         );
     }
 
@@ -1729,14 +1729,14 @@ mod tests {
         crate::testutil::bwrap_exec(&t.ov, "rm -rf d");
         t.ov.snapshot_bases().unwrap();
         assert!(!t.ov.changes()[0].conflict);
-        fs::write(t.ws.join("d/new-by-shaun"), "keep me").unwrap();
+        fs::write(t.ws.join("d/new-by-user"), "keep me").unwrap();
         let c = t.ov.changes();
         assert!(c[0].conflict, "{c:?}");
         assert!(matches!(
             t.ov.accept_file(Path::new("d"), false),
             Err(OverlayError::Conflict(_))
         ));
-        assert!(t.ws.join("d/new-by-shaun").exists());
+        assert!(t.ws.join("d/new-by-user").exists());
     }
 
     #[test]
@@ -1744,14 +1744,14 @@ mod tests {
         let t = setup();
         fs::write(t.ws.join("a"), "one\n").unwrap();
         t.ov.write(Path::new("a"), b"agent\n").unwrap();
-        fs::write(t.ws.join("a"), "shaun\n").unwrap();
+        fs::write(t.ws.join("a"), "user\n").unwrap();
         let d = t.ov.disk_diff(Path::new("a")).unwrap();
         let lines: Vec<String> = d
             .iter()
             .flat_map(|h| h.lines.iter())
             .map(|(c, l)| format!("{c}{l}"))
             .collect();
-        assert_eq!(lines, ["-one", "+shaun"]);
+        assert_eq!(lines, ["-one", "+user"]);
     }
 
     #[test]

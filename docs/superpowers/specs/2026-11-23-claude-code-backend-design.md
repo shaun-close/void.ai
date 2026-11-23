@@ -2,9 +2,10 @@
 
 ## Intent
 
-The user wants a fallback for machines where local AI isn't an option. The fallback is **Claude Code itself**: its own tools, skills, subagents, hooks and
-`CLAUDE.md`, driven from inside void.ai so a chat works the same as any other void.ai chat — streaming replies,
-tool cards, approvals, pending changes in Review, Retry, Stop, the context meter.
+The user wants a fallback for machines where local AI isn't an option. The fallback is **Claude Code itself**:
+its own tools, skills, subagents, hooks and `CLAUDE.md`, driven from inside void.ai so a chat works the same as
+any other void.ai chat — streaming replies, tool cards, approvals, pending changes in Review, Retry, Stop, the
+context meter.
 
 The user said shelling out to the `claude` binary is fine "as long as everything works the same".
 
@@ -78,12 +79,12 @@ The user said shelling out to the `claude` binary is fine "as long as everything
   `SetConversationProfile`. No new switching mechanism.
 - Backends panel "Test" for this kind: runs `claude --version` (outside the sandbox) and reports the version or
   "not found". It does not spend tokens. Sign-in problems surface on the first turn as a clear error with the hint
-  "run `claude` in a terminal to sign in".
+  "Claude Code isn't signed in — run `claude auth login` in a terminal".
 
 ### Turn lifecycle (engine)
 
 The engine's turn path branches on the chat's profile kind. For `ClaudeCode`, void's own agent loop, tools,
-compaction and Backend trait aren't used; a new module `crates/void-core/src/claude_code.rs` runs the turn.
+compaction and Backend trait aren't used; a new module, `crates/void-core/src/claude_code/`, runs the turn.
 
 - **One `claude` process per turn**, started at `begin_turn` and ended when it emits its `result` message (or on
   Stop/error). Command:
@@ -166,7 +167,7 @@ unknown tool names (name + pretty JSON arguments + result text), with small spec
   applied on top of that. Verified with a dummy HOME: `claude mcp add -s user` saved successfully.
 - **Per-folder home layer (the user's decision, 2026-11-23, after the live test).** A single overlay on `$HOME`
   fails with EINVAL ("overlayfs: failed to clone lowerpath") whenever any mount sits below `$HOME` (e.g. an
-  autofs/NFS share under `~/`): inherited mounts are locked in bwrap's user namespace. So the layer is
+  network share under `~/` (autofs/NFS)): inherited mounts are locked in bwrap's user namespace. So the layer is
   built per entry, always (one code path): `--tmpfs $HOME`; each top-level directory with no mount below it gets
   its own `--overlay-src D --tmp-overlay D`; directories containing mounts are recreated (`--dir`) and recursed
   into the same way; **mount points themselves are skipped** (left as empty directories — never touched by path,
@@ -182,14 +183,15 @@ unknown tool names (name + pretty JSON arguments + result text), with small spec
   Claude Code turn runs in a workspace, Review's Accept/Reject (for any chat in that workspace) and chat-view
   saves for that chat are refused with "a Claude Code turn is running — try again when it finishes" (the engine
   checks, as for `SaveToOverlay` today). The sandbox's cache lock is held for the turn, so package-cache overlays
-  work inside Claude's Bash; other chats' commands wait for it (the fallback case is mostly one chat at a time). The
-  status bar shows why a command is waiting.
+  work inside Claude's Bash; other chats' commands wait for it (the fallback case is mostly one chat at a time).
+  The status bar shows why a command is waiting, and Stop ends the wait.
 - **Scratch** *(controller's call)*: Scratch has no workspace, so a Claude Code chat there runs in an empty
   per-chat directory under void's data dir (inside the sandbox, no overlay), with tools; nothing reaches Review.
 - **Extensions** *(controller's call)*: hooks, MCP servers and plugins load, but the sandbox stays as configured
   (desktop sockets, D-Bus, keyrings stay hidden; the rest of the disk read-only). Those that need more fail as
-  tool errors in the chat; the existing `[sandbox] expose` list is how the user opens specific paths. The
-  Backends panel's Test lists which of the user's MCP servers would see hidden paths, as a heads-up.
+  tool errors in the chat; the existing `[sandbox] expose` list is how the user opens specific paths. (No heads-up about
+  which MCP servers would see hidden paths: finding them means reading `~/.claude.json`, which void.ai never
+  does. Not done.)
 - Requires sandbox network (Claude Code calls the API). If `[sandbox] network = false` or bwrap is unavailable,
   the turn fails with a clear message; there is no unsandboxed fallback.
 - Stop: SIGTERM to the process group, then SIGKILL after 3 s; the partial reply is kept as `stopped`.
