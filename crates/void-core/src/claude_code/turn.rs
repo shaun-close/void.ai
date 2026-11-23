@@ -690,7 +690,7 @@ async fn attempt(
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     let close = CancellationToken::new();
     tokio::spawn(write_stdin(stdin, rx, close.clone()));
-    let stderr_task = tokio::spawn(stderr_tail(stderr));
+    let stderr_task = tokio::spawn(stderr_tail(stderr, key.map(str::to_owned)));
     send(TurnUpdate::Spawned(tx.clone()));
     let id = Uuid::now_v7().simple().to_string();
     let request_id = format!("req_1_{}", &id[id.len() - 8..]);
@@ -900,8 +900,8 @@ async fn write_stdin(
     }
 }
 
-/// The last lines of stderr (for failure messages only; never logged).
-async fn stderr_tail(err: impl AsyncRead + Unpin) -> VecDeque<String> {
+/// The last lines of stderr, the API key blanked (for failure messages only; never logged).
+async fn stderr_tail(err: impl AsyncRead + Unpin, key: Option<String>) -> VecDeque<String> {
     let mut reader = BufReader::new(err);
     let mut lines = VecDeque::new();
     let mut buf = Vec::new();
@@ -910,8 +910,9 @@ async fn stderr_tail(err: impl AsyncRead + Unpin) -> VecDeque<String> {
         .await
         .is_ok_and(|n| n > 0)
     {
-        let line = String::from_utf8_lossy(&buf);
-        let line: String = line.trim_end().chars().take(STDERR_LINE_CAP).collect();
+        // Redact before capping: a cut through the key would leave part of it behind.
+        let line = redact(String::from_utf8_lossy(&buf).trim_end(), key.as_deref());
+        let line: String = line.chars().take(STDERR_LINE_CAP).collect();
         buf.clear();
         if line.is_empty() {
             continue;
@@ -1053,6 +1054,19 @@ mod tests {
         assert_eq!(with_meanwhile(&c, 4, 4, "now"), "now");
         assert_eq!(transcript_between(&c, 9, 4), "");
         assert_eq!(transcript(&c, 4), transcript_between(&c, 0, 4));
+    }
+
+    /// The key is blanked before a long stderr line is cut, so no part of it survives the cut.
+    #[tokio::test]
+    async fn stderr_tail_redacts_before_capping() {
+        let key = "sk-ant-0123456789abcdefghij";
+        for pad in STDERR_LINE_CAP - key.len()..=STDERR_LINE_CAP {
+            let line = format!("{}{key}\n", "x".repeat(pad));
+            let lines = stderr_tail(line.as_bytes(), Some(key.into())).await;
+            let got = lines.iter().cloned().collect::<Vec<_>>().join("\n");
+            assert!(!got.contains("sk-ant-0"), "pad {pad}: {got}");
+            assert!(got.chars().count() <= STDERR_LINE_CAP, "pad {pad}");
+        }
     }
 
     #[test]
