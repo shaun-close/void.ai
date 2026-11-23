@@ -350,20 +350,27 @@ impl Sandbox {
         expand(p, &self.home, self.uid)
     }
 
-    /// Hidden paths (that exist and aren't exposed).
+    /// Hidden paths (that aren't exposed), plus void.ai's own data dir wherever it is
+    /// (env profiles, conversations): that one can't be exposed or unhidden.
     pub fn hidden_paths(&self) -> Vec<PathBuf> {
         let expose: Vec<PathBuf> = self.settings.expose.iter().map(|p| self.exp(p)).collect();
-        self.settings
+        let mut v: Vec<PathBuf> = self
+            .settings
             .hidden
             .iter()
             .map(|p| self.exp(p))
             .filter(|p| !expose.contains(p))
-            .collect()
+            .collect();
+        if !v.contains(&self.data_dir) {
+            v.push(self.data_dir.clone());
+        }
+        v
     }
 
-    /// Where the hidden paths (minus `unhide`) really are: what `args_hidden` mounts over.
-    fn hidden_targets(&self, unhide: &[PathBuf]) -> Vec<PathBuf> {
-        let unhide: Vec<PathBuf> = unhide
+    /// `unhide` with both spellings of each path, never including the data dir.
+    fn unhide_set(&self, unhide: &[PathBuf]) -> Vec<PathBuf> {
+        let data = std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
+        unhide
             .iter()
             .flat_map(|u| {
                 [
@@ -371,7 +378,13 @@ impl Sandbox {
                     std::fs::canonicalize(u).unwrap_or_else(|_| u.clone()),
                 ]
             })
-            .collect();
+            .filter(|u| *u != self.data_dir && *u != data)
+            .collect()
+    }
+
+    /// Where the hidden paths (minus `unhide`) really are: what `args_hidden` mounts over.
+    fn hidden_targets(&self, unhide: &[PathBuf]) -> Vec<PathBuf> {
+        let unhide = self.unhide_set(unhide);
         self.hidden_paths()
             .into_iter()
             .filter(|h| !unhide.contains(h))
@@ -523,15 +536,7 @@ impl Sandbox {
     /// symlinks such as /var/run → /run): directories get an empty tmpfs, files and sockets
     /// /dev/null.
     fn args_hidden(&self, a: &mut Args, unhide: &[PathBuf]) {
-        let unhide: Vec<PathBuf> = unhide
-            .iter()
-            .flat_map(|u| {
-                [
-                    u.clone(),
-                    std::fs::canonicalize(u).unwrap_or_else(|_| u.clone()),
-                ]
-            })
-            .collect();
+        let unhide = self.unhide_set(unhide);
         let mut seen = std::collections::HashSet::new();
         for h in self.hidden_paths() {
             let Ok(real) = std::fs::canonicalize(&h) else {
@@ -1813,6 +1818,50 @@ mod tests {
         assert!(pos(&a, &["--chdir", &home.join("proj").to_string_lossy()]).is_some());
         assert_eq!(&a[a.len() - 3..], ["--", "claude", "-p"]);
         assert!(!a.iter().any(|x| x == "bash"));
+    }
+
+    /// void.ai's real data dir (holding env.toml and conversations) is hidden wherever it is,
+    /// not only at the default `~/.local/share/void.ai`, and `expose` can't open it.
+    #[test]
+    fn custom_data_dir_is_always_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, home, mut plan) = claude_rig(tmp.path());
+        let data = home.join(".xdg/void-data");
+        fs::create_dir_all(data.join("workspaces/w")).unwrap();
+        fs::write(data.join("workspaces/w/env.toml"), "secret").unwrap();
+        let settings = SandboxSettings {
+            expose: vec!["~/.xdg/void-data".into()],
+            caches: vec![],
+            ..SandboxSettings::default()
+        };
+        let sb = Sandbox::with_paths(
+            Some("/usr/bin/bwrap".into()),
+            None,
+            data.clone(),
+            home.clone(),
+            settings,
+        );
+        let real = data.canonicalize().unwrap();
+        assert!(sb.hidden_paths().contains(&data));
+        let d = real.to_string_lossy().into_owned();
+        let run = RunPlan {
+            workspace: home.join("proj"),
+            upper: tmp.path().join("ovl/upper"),
+            work: tmp.path().join("ovl/work"),
+            target_dir: tmp.path().join("target"),
+            command: "true".into(),
+            timeout_secs: None,
+        };
+        let a = strs(&sb.bwrap_args(&run));
+        assert!(pos(&a, &["--tmpfs", &d]).is_some(), "run: {a:?}");
+        plan.unhide.push(data.clone());
+        let a = strs(&sb.spawn_args(&plan).unwrap());
+        assert!(pos(&a, &["--tmpfs", &d]).is_some(), "spawn: {a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.starts_with(&d) && pos(&a, &["--tmpfs", x]).is_none()),
+            "nothing under the data dir is listed into the home layer: {a:?}"
+        );
     }
 
     #[test]
