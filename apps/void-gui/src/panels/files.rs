@@ -582,7 +582,12 @@ fn entry_icon(pal: &theme::Palette, e: &Entry, open: bool) -> (&'static str, egu
             pal.accent,
         );
     }
-    let ext = Path::new(&e.name)
+    file_icon(pal, &e.name)
+}
+
+/// A file's icon and its colour, by extension.
+pub fn file_icon(pal: &theme::Palette, name: &str) -> (&'static str, egui::Color32) {
+    let ext = Path::new(name)
         .extension()
         .map(|x| x.to_string_lossy().to_lowercase())
         .unwrap_or_default();

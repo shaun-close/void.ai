@@ -230,6 +230,39 @@ impl Tree {
     }
 }
 
+/// Every file under `root`, by the tree's rules: `.git` left out, and what the `.gitignore`
+/// files (any folder, a deeper one overriding) and `.git/info/exclude` ignore left out too
+/// (the tree shows those dimmed; a search skips them). Other dotfiles are kept. Paths are
+/// relative to `root`, sorted, at most `cap` of them. Reads the whole tree: call it off the UI
+/// thread.
+pub fn walk_files(root: &Path, cap: usize) -> Vec<PathBuf> {
+    let walk = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .ignore(false)
+        .git_global(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .require_git(false)
+        .parents(false)
+        .follow_links(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    let mut out = Vec::new();
+    for entry in walk.flatten() {
+        let file = entry
+            .file_type()
+            .is_some_and(|t| t.is_file() || (t.is_symlink() && entry.path().is_file()));
+        if file && let Ok(rel) = entry.path().strip_prefix(root) {
+            out.push(rel.to_path_buf());
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// A name for a new or renamed entry: one path component that isn't taken in `dir`.
 pub fn check_name(dir: &Path, name: &str, current: Option<&Path>) -> Result<PathBuf, String> {
     let name = name.trim();

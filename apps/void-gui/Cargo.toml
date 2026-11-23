@@ -30,6 +30,7 @@ trash = "5.4.0"
 ignore = "0.4.34"
 # No std: its OSC buffer is then fixed-size (an unterminated OSC in run output can't grow it).
 vte = { version = "0.15", default-features = false }
+nucleo-matcher = "0.3.1"
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "snapshot", "wgpu"] }

@@ -1,6 +1,8 @@
 mod app;
+mod commands;
 mod editor;
 mod layout;
+mod palette;
 mod panels;
 mod state;
 mod theme;

@@ -13,6 +13,7 @@ use void_core::model::ConversationId;
 use void_core::runner::RunId;
 use void_core::store::Store;
 
+use crate::commands::CommandId;
 use crate::editor::EditorStore;
 use crate::layout::{self, EditorView, Tab};
 use crate::panels::{Action, Panels};
@@ -20,8 +21,9 @@ use crate::state::UiState;
 use crate::theme::{self, icon};
 use egui::RichText;
 
-mod disk;
+pub(crate) mod disk;
 mod editors;
+mod palette;
 
 pub struct VoidApp {
     pub(crate) engine: EngineHandle,
@@ -62,6 +64,10 @@ pub struct VoidApp {
     last_editor: Option<u32>,
     /// The Runs panel's drafts.
     pub(crate) runs: crate::panels::runs::RunsUi,
+    /// The Shift+Shift palette and what it searches.
+    pub(crate) palette: crate::palette::PaletteUi,
+    /// Watches raw input for a double tap of Shift.
+    shift: crate::palette::DoubleShift,
 }
 
 impl VoidApp {
@@ -126,6 +132,8 @@ impl VoidApp {
             disk: Default::default(),
             last_editor: None,
             runs: Default::default(),
+            palette: Default::default(),
+            shift: Default::default(),
         }
     }
 
@@ -454,19 +462,7 @@ impl VoidApp {
             theme::wordmark(ui, 17.0);
             ui.add_space(12.0);
             ui.menu_button("File", |ui| {
-                if ui
-                    .button(theme::itext(icon::FOLDER_OPEN, "Open Folder…"))
-                    .clicked()
-                {
-                    let tx = self.folders.0.clone();
-                    let ctx = ui.ctx().clone();
-                    std::thread::spawn(move || {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            let _ = tx.send(p);
-                            ctx.request_repaint();
-                        }
-                    });
-                }
+                self.command_button(ui, CommandId::OpenFolder);
                 ui.menu_button(theme::itext(icon::FOLDER_OPEN, "Recent"), |ui| {
                     let recent: Vec<_> = self
                         .state
@@ -492,53 +488,29 @@ impl VoidApp {
                         }
                     }
                 });
-                if ui.button(theme::itext(icon::PLANET, "Scratch")).clicked() {
-                    self.open_workspace(None);
-                }
+                self.command_button(ui, CommandId::Scratch);
                 ui.separator();
-                if ui.button(theme::itext(icon::PLUS, "New chat")).clicked() {
-                    self.engine.send(Command::NewConversation);
-                }
+                self.command_button(ui, CommandId::NewChat);
                 ui.separator();
-                if ui.button(theme::itext(icon::SIGN_OUT, "Quit")).clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                self.command_button(ui, CommandId::Quit);
             });
             ui.menu_button("View", |ui| {
-                if ui
-                    .button(theme::itext(icon::CHAT, "New chat tab"))
-                    .clicked()
-                {
-                    let id = layout::next_chat_id(&self.dock);
-                    layout::ensure_tab(
-                        &mut self.dock,
-                        Tab::Chat {
-                            id,
-                            conversation: None,
-                        },
-                    );
-                    self.focused_chat = Some(id);
-                }
-                for (label, tab) in [
-                    (theme::itext(icon::CHATS, "Chats"), Tab::Conversations),
-                    (theme::itext(icon::FOLDER, "Files"), Tab::Files),
-                    (theme::itext(icon::PLAY, "Runs"), Tab::Runs),
-                    (theme::itext(icon::PLUGS, "Backends"), Tab::Backends),
-                    (theme::itext(icon::GEAR, "Settings"), Tab::Settings),
-                    (theme::itext(icon::GIT_DIFF, "Review"), Tab::Review),
+                for id in [
+                    CommandId::NewChatTab,
+                    CommandId::ShowChats,
+                    CommandId::ShowFiles,
+                    CommandId::ShowRuns,
+                    CommandId::ShowBackends,
+                    CommandId::ShowSettings,
+                    CommandId::ShowReview,
                 ] {
-                    if ui.button(label).clicked() {
-                        layout::ensure_tab(&mut self.dock, tab);
-                    }
+                    self.command_button(ui, id);
                 }
                 ui.separator();
-                if ui
-                    .button(theme::itext(icon::LAYOUT, "Reset layout"))
-                    .clicked()
-                {
-                    self.dock = layout::default_layout();
-                    self.focused_chat = None;
-                }
+                self.command_button(ui, CommandId::ResetLayout);
+            });
+            ui.menu_button("Run", |ui| {
+                self.command_button(ui, CommandId::RerunLast);
             });
             ui.menu_button("Backend", |ui| {
                 let mut active = self.state.saved_config.active_profile.clone();
@@ -856,6 +828,8 @@ impl eframe::App for VoidApp {
         }) {
             self.engine.send(Command::RerunLast);
         }
+        self.palette_keys(&ctx);
+        self.palette_ui(&ctx);
 
         let pal = theme::palette(self.state.config.theme);
         let bar = egui::Frame::new()
@@ -918,6 +892,11 @@ impl VoidApp {
             _ => None,
         };
         if focused_editor.is_some() {
+            if focused_editor != self.last_editor
+                && let Some((path, _)) = focused_editor.and_then(|id| self.editor_key(id))
+            {
+                self.palette.recent.touch(&path);
+            }
             self.last_editor = focused_editor;
         }
         let active_file = self
@@ -1873,6 +1852,40 @@ impl Parser {
         }
         h.render().unwrap().save(out.join("runs-envs.png")).unwrap();
         h.set_size(egui::vec2(1400.0, 860.0));
+        h.key_press(egui::Key::Escape);
+        h.step();
+
+        // The palette: recent files and tabs, then a query over everything, then `!` runs.
+        until(&mut h, 10, "palette files", |a| {
+            !a.palette.files.files().is_empty()
+        });
+        let shift_shift = |h: &mut Harness<'_, VoidApp>| {
+            for m in [
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::NONE,
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::NONE,
+            ] {
+                h.event(egui::Event::ModifiersChanged(m));
+            }
+            for _ in 0..4 {
+                h.step();
+            }
+        };
+        shift_shift(&mut h);
+        h.render().unwrap().save(out.join("palette.png")).unwrap();
+        for (query, name) in [("re", "palette-query.png"), ("!", "palette-runs.png")] {
+            h.event(egui::Event::Text(query.into()));
+            for _ in 0..4 {
+                h.step();
+            }
+            h.render().unwrap().save(out.join(name)).unwrap();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.key_press(egui::Key::Backspace);
+            h.step();
+        }
+        h.key_press(egui::Key::Escape);
+        h.step();
     }
 
     /// Offline: an approval card's "Allow once" sends Approve; the engine answers with

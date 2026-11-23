@@ -169,6 +169,7 @@ impl VoidApp {
             self.state.error(err);
         }
         self.files.set_root(root.as_deref());
+        self.palette.set_root(root.as_deref());
         let outside: HashSet<PathBuf> = self
             .editors
             .keys()
@@ -189,6 +190,7 @@ impl VoidApp {
         if !paths.is_empty() {
             self.editors.check_disk(&paths);
             self.files.changed(&paths);
+            self.palette.files.changed(&paths, Instant::now());
             if root
                 .as_deref()
                 .is_some_and(|r| touches_moon_config(&paths, r))
