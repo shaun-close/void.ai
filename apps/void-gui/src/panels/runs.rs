@@ -176,6 +176,15 @@ impl EnvsDraft {
         plain(self) == plain(other)
     }
 
+    /// Saving this draft would keep exactly `profiles`: it is them as typed, or once
+    /// normalised (trimmed names, variables in order) as a save stores them.
+    fn matches(&self, profiles: &[EnvProfile]) -> bool {
+        self.same(&EnvsDraft::new(profiles))
+            || self
+                .to_envs(&[], None)
+                .is_ok_and(|(envs, _)| envs.profiles == profiles)
+    }
+
     /// The profiles to save (with `active` following a rename, or cleared when its profile
     /// went), and each of the `saved` profiles' new name when it changed (None: deleted). Errors never quote values.
     #[allow(clippy::type_complexity)]
@@ -925,8 +934,7 @@ fn environments(
         // A draft of the profiles: rebuilt from what's saved unless it holds unsaved edits.
         let saved = &state.envs.profiles;
         let stale = runs_ui.envs.as_ref().is_some_and(|(base, draft)| {
-            base != saved
-                && (draft.same(&EnvsDraft::new(base)) || draft.same(&EnvsDraft::new(saved)))
+            base != saved && (draft.matches(base) || draft.matches(saved))
         });
         if runs_ui.envs.is_none() || stale {
             runs_ui.envs = Some((saved.clone(), EnvsDraft::new(saved)));
@@ -946,7 +954,7 @@ fn environments(
             draft.profiles.remove(pi);
             runs_ui.revealed.clear();
         }
-        let dirty = !draft.same(&EnvsDraft::new(saved));
+        let dirty = !draft.matches(saved);
         ui.horizontal_wrapped(|ui| {
             if ui.button(theme::itext(icon::PLUS, "Profile")).clicked() {
                 draft.profiles.push(ProfileDraft {

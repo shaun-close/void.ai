@@ -375,3 +375,44 @@ fn output_split_keeps_editor_focus() {
     );
     assert!(focused_editor(&mut h), "editor still focused");
 }
+
+/// Saving profiles whose input the save normalises (variables out of order, stray
+/// whitespace) still releases the draft: nothing left unsaved, no "changed elsewhere".
+#[test]
+fn env_draft_released_after_a_normalising_save() {
+    use super::{EnvsDraft, Kind, ProfileDraft, VarDraft};
+    let (t, ws) = workspace();
+    let mut h = harness(t.path(), &ws);
+    show_runs(&mut h);
+    h.state_mut().runs.show_envs = true;
+    steps(&mut h, 3);
+    let var = |name: &str, kind, value: &str| VarDraft {
+        name: name.into(),
+        kind,
+        value: value.into(),
+    };
+    h.state_mut().runs.envs = Some((
+        vec![],
+        EnvsDraft {
+            profiles: vec![ProfileDraft {
+                name: " dev ".into(),
+                was: None,
+                vars: vec![var("B ", Kind::Value, "2"), var("A", Kind::Env, " HOME ")],
+            }],
+        },
+    ));
+    steps(&mut h, 2);
+    let save = format!("{}Save", crate::theme::icon::FLOPPY);
+    h.get_by_label(&save).click();
+    until(&mut h, "saved", |a| a.state.envs.profiles.len() == 1);
+    steps(&mut h, 3);
+    assert_eq!(
+        h.state().state.envs.profiles[0].vars["A"],
+        EnvValue::Env("HOME".into())
+    );
+    assert!(
+        h.get_by_label(&save).accesskit_node().is_disabled(),
+        "nothing left to save"
+    );
+    assert!(h.query_by_label_contains("Changed elsewhere").is_none());
+}
