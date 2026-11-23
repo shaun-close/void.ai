@@ -578,6 +578,18 @@ impl eframe::App for VoidApp {
             .show(ui, |ui| self.dock_area(ui));
         self.close_dialog(&ctx);
         self.quit_dialog(&ctx);
+        // One clipboard for the app: text egui copies (text fields, copy buttons) goes through the
+        // same `editor::Clipboard` that pastes and Vim's "+ / "* registers read.
+        let clipboard = &self.editors.clipboard;
+        ctx.output_mut(|o| {
+            o.commands.retain(|c| match c {
+                egui::OutputCommand::CopyText(text) => {
+                    clipboard.set(text);
+                    false
+                }
+                _ => true,
+            })
+        });
     }
 
     /// Clipboard shortcuts: keys for a focused editor (Vim's Ctrl+V), clipboard events for

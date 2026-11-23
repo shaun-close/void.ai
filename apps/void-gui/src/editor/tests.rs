@@ -508,3 +508,79 @@ fn accessible_text_is_bounded() {
     assert!(text.len() < 20_100, "{} bytes", text.len());
     assert!(text.ends_with("\nshort"));
 }
+
+fn command(key: Key) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    }
+}
+
+/// Run the app's input hook on the queued input (egui_kittest doesn't call it), then step.
+fn hooked_step(h: &mut Harness<'_, VoidApp>) {
+    use eframe::App as _;
+    let ctx = h.ctx.clone();
+    let mut raw = h.input_mut().clone();
+    h.state_mut().raw_input_hook(&ctx, &mut raw);
+    *h.input_mut() = raw;
+    h.step();
+    h.step();
+}
+
+/// One clipboard for the whole app: Ctrl+C in one text field pastes with Ctrl+V in another, and
+/// the editor's `"+y` pastes into a text field too. (The system clipboard can't be used
+/// headless; tests run on the app's in-memory clipboard, which every copy and paste goes
+/// through.)
+#[test]
+fn copy_paste_round_trips_through_one_clipboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    // Ctrl+C in the chat search field...
+    h.get_by_role(Role::TextInput).focus();
+    h.step();
+    h.get_by_role(Role::TextInput).type_text("borrow");
+    h.step();
+    h.input_mut().events.push(command(Key::A));
+    h.step();
+    h.input_mut().events.push(command(Key::C));
+    hooked_step(&mut h);
+    assert_eq!(h.state().editors.clipboard.get().as_deref(), Some("borrow"));
+    // ...Ctrl+V in the chat input.
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.input_mut().events.push(command(Key::V));
+    hooked_step(&mut h);
+    assert_eq!(
+        h.get_by_role(Role::MultilineTextInput).value().as_deref(),
+        Some("borrow")
+    );
+
+    // The editor's "+y, then Ctrl+V in the search field.
+    let file = dir.path().join("y.txt");
+    std::fs::write(&file, "yanked\n").unwrap();
+    h.state_mut().open_editor(file, EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "\"+yiw");
+    assert_eq!(h.state().editors.clipboard.get().as_deref(), Some("yanked"));
+    let chat = h
+        .state()
+        .dock
+        .find_tab_from(|t| matches!(t, Tab::Chat { .. }))
+        .unwrap();
+    let _ = h.state_mut().dock.set_active_tab(chat);
+    h.step();
+    h.get_by_role(Role::TextInput).focus();
+    h.step();
+    h.input_mut().events.push(command(Key::A));
+    h.step();
+    h.input_mut().events.push(command(Key::V));
+    hooked_step(&mut h);
+    assert_eq!(
+        h.get_by_role(Role::TextInput).value().as_deref(),
+        Some("yanked")
+    );
+}
