@@ -28,7 +28,19 @@ fn harness(root: &Path) -> Harness<'static, VoidApp> {
 }
 
 pub(super) fn until(h: &mut Harness<'_, VoidApp>, what: &str, done: impl Fn(&VoidApp) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    until_within(h, what, Duration::from_secs(10), done);
+}
+
+/// A full parse of a 100k-line file in a debug build on a loaded machine.
+const PARSE_WAIT: Duration = Duration::from_secs(120);
+
+fn until_within(
+    h: &mut Harness<'_, VoidApp>,
+    what: &str,
+    limit: Duration,
+    done: impl Fn(&VoidApp) -> bool,
+) {
+    let deadline = Instant::now() + limit;
     loop {
         h.step();
         if done(h.state()) {
@@ -216,42 +228,79 @@ fn editor_dirty_close_asks() {
     assert!(editor_tabs(h.state()).is_empty());
 }
 
+/// Opening a 100k-line file shows its first frame about as fast as a small file does, and
+/// parses in the background. Timed against a small-file baseline in the same harness (a loaded
+/// machine slows both alike); the parse being off the UI thread is checked without timing.
 #[test]
 fn editor_big_file_first_frame_fast() {
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("big.rs");
-    let mut src = String::with_capacity(4_000_000);
-    for i in 0..100_000 {
-        src.push_str(&format!(
-            "fn f{i}(x: u32) -> u32 {{ x + {i} }} // line {i}\n"
-        ));
-    }
-    std::fs::write(&file, &src).unwrap();
-    let mut h = harness(dir.path());
-    let t = Instant::now();
-    h.state_mut()
-        .open_editor(file.clone(), EditorView::Disk, None);
-    h.step();
-    let first = t.elapsed();
-    let bar = if cfg!(debug_assertions) {
-        Duration::from_millis(1500)
-    } else {
-        Duration::from_millis(200)
+    let write = |name: &str, lines: usize| {
+        let mut src = String::with_capacity(lines * 45);
+        for i in 0..lines {
+            src.push_str(&format!(
+                "fn f{i}(x: u32) -> u32 {{ x + {i} }} // line {i}\n"
+            ));
+        }
+        let file = dir.path().join(name);
+        std::fs::write(&file, &src).unwrap();
+        file
     };
-    println!("100 000-line file: open + first frame in {first:?} (bar {bar:?})");
+    let small = write("small.rs", 1_000);
+    let file = write("big.rs", 100_000);
+    let mut h = harness(dir.path());
+    let highlighted = |key: &std::path::PathBuf| {
+        let key = (key.clone(), EditorView::Disk);
+        move |a: &VoidApp| a.editors.doc(&key).is_some_and(|d| d.highlighted())
+    };
+    let open = |h: &mut Harness<'_, VoidApp>, f: &std::path::PathBuf| {
+        let t = Instant::now();
+        h.state_mut().open_editor(f.clone(), EditorView::Disk, None);
+        h.step();
+        t.elapsed()
+    };
+    // The baseline also pays the one-off costs (fonts, the Rust grammar).
+    let base = open(&mut h, &small);
+    until_within(&mut h, "small file parse", PARSE_WAIT, highlighted(&small));
+    let first = open(&mut h, &file);
+    // Unloaded (debug): ~70 ms against ~90 ms; a full parse on open would add ~1.3 s.
+    let bar = base * 5
+        + if cfg!(debug_assertions) {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(50)
+        };
+    println!("first frame: 100 000-line file {first:?}, 1 000-line file {base:?} (bar {bar:?})");
     assert!(shown(&h).contains("fn f0(x: u32)"));
-    assert!(first < bar, "first frame took {first:?}");
-    // Highlighting follows from the background parse.
-    until(&mut h, "background parse", |a| {
-        a.editors
-            .doc(&(file.clone(), EditorView::Disk))
-            .is_some_and(|d| d.highlighted())
-    });
-    // Jumping to the end stays quick too.
+    assert!(
+        first < bar,
+        "first frame took {first:?} (a 1 000-line file: {base:?})"
+    );
+    // A finished background parse is only installed by a later frame, so after one frame
+    // the file can't be highlighted yet unless it was parsed on the UI thread.
+    assert!(
+        !highlighted(&file)(h.state()),
+        "the 100 000-line file was parsed while opening it"
+    );
+    let t = Instant::now();
+    until_within(&mut h, "background parse", PARSE_WAIT, highlighted(&file));
+    println!("background parse: {:?} more", t.elapsed());
+    // Jumping to the end. (The view, before and after, goes in the failure message: under a
+    // loaded gate the view has been seen left at line ~83 200 with the cursor on the last line.)
+    let key = (file.clone(), EditorView::Disk);
+    let view = |h: &Harness<'_, VoidApp>| h.state().editors.doc(&key).map(|d| d.core.view.clone());
+    let before = view(&h);
     let t = Instant::now();
     text(&mut h, "G");
     println!("G on 100 000 lines: {:?}", t.elapsed());
-    assert!(shown(&h).contains("line 99999"));
+    let doc = h.state().editors.doc(&key).unwrap();
+    assert!(
+        shown(&h).contains("line 99999"),
+        "G didn't show the last line: cursor {:?}, view before {before:?}, after {:?}, \
+         first line shown {:?}",
+        doc.core.line_col(),
+        view(&h),
+        shown(&h).lines().next()
+    );
 }
 
 #[test]
