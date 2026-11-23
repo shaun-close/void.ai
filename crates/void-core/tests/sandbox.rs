@@ -363,7 +363,8 @@ impl Drop for HomeRig {
     }
 }
 
-/// Host processes whose command line contains `needle`.
+/// Host processes running `needle`: their command line starts with it. (Not "contains": bwrap's
+/// and the shell's command lines hold the whole script, and would match before it runs.)
 fn procs_with(needle: &str) -> usize {
     fs::read_dir("/proc")
         .unwrap()
@@ -378,7 +379,7 @@ fn procs_with(needle: &str) -> usize {
         .filter(|c| {
             String::from_utf8_lossy(c)
                 .replace('\0', " ")
-                .contains(needle)
+                .starts_with(needle)
         })
         .count()
 }
@@ -560,6 +561,25 @@ async fn spawn_holds_cache_lock() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// `procs_with` counts the process running a command, not the sandbox whose script merely
+/// mentions it (bwrap's and the shell's command lines hold the whole script): otherwise a test
+/// "sees" its grandchild before the sandboxed program has even started.
+#[tokio::test]
+async fn procs_with_ignores_script_text() {
+    let Some(r) = home_rig(&[]).await else { return };
+    let tag = format!("75{}.5", std::process::id() % 1000);
+    let mut s = r
+        .spawn(&format!("sleep 1.5; exec sleep {tag}"), false)
+        .await;
+    assert_eq!(procs_with(&format!("sleep {tag}")), 0, "matched the script");
+    let t = Instant::now();
+    while procs_with(&format!("sleep {tag}")) == 0 {
+        assert!(t.elapsed() < Duration::from_secs(10), "never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.kill().await.unwrap();
 }
 
 #[tokio::test]

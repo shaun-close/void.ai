@@ -1,0 +1,5 @@
+# Starts a tool, then dies without its result.
+{"type":"system","subtype":"init","session_id":"sess-tc","model":"claude-fake"}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_8","name":"Bash","input":{"command":"make"}}]}}
+#stderr fatal: the fake crashed mid-tool
+#exit 2

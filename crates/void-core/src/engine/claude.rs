@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Event, Msg, State, StreamMode};
 use crate::claude_code::permission::{self as perm, HostMsg};
 use crate::claude_code::turn::{
-    self as cc, Out, PermissionAsk, Segments, StdinTx, TurnSpec, TurnUpdate,
+    self as cc, Out, PermissionAsk, STOPPED_TOOL, Segments, StdinTx, TurnSpec, TurnUpdate,
 };
 use crate::claude_code::{SessionMode, TurnArgs, control_response_deny};
 use crate::config::{BackendKind, Profile};
@@ -246,7 +246,18 @@ impl State {
             }
             TurnUpdate::Restarting => {
                 if !run.done {
-                    run.seg.reset();
+                    // The failed attempt's running calls are in no stored message: close
+                    // their cards without recording a result.
+                    for call_id in run.seg.reset() {
+                        self.emit(Event::ToolFinished {
+                            conversation: id,
+                            call_id,
+                            output: ToolOutput {
+                                content: STOPPED_TOOL.into(),
+                                is_error: true,
+                            },
+                        });
+                    }
                     status(
                         self,
                         "Claude Code didn't have this chat's session — starting a new one with \
@@ -269,8 +280,8 @@ impl State {
             TurnUpdate::Result { usage, error } => {
                 if !run.done {
                     run.done = true;
-                    let out = run.seg.finish(false, error, Some(usage));
-                    self.apply_outs(id, out.into_iter().collect());
+                    let outs = run.seg.end(false, error, Some(usage));
+                    self.apply_outs(id, outs);
                 }
                 // stdin closes now: nothing can be answered any more.
                 self.claude_turn_ended(id);
@@ -280,8 +291,8 @@ impl State {
                     run.done = true;
                     let error =
                         error.unwrap_or_else(|| "Claude Code ended without a reply.".into());
-                    let out = run.seg.finish(false, Some(error), None);
-                    self.apply_outs(id, out.into_iter().collect());
+                    let outs = run.seg.end(false, Some(error), None);
+                    self.apply_outs(id, outs);
                 }
                 self.claude_turn_ended(id);
                 self.claude.remove(&id);
@@ -376,12 +387,15 @@ impl State {
             return false;
         };
         run.cancel.cancel();
-        if !run.done {
+        let outs = if run.done {
+            Vec::new()
+        } else {
             run.done = true;
-            let out = run.seg.finish(true, None, None);
-            self.apply_outs(id, out.into_iter().collect());
-        }
+            run.seg.end(true, None, None)
+        };
+        // The bridge hears of the end before anyone sees the reply finish.
         self.claude_turn_ended(id);
+        self.apply_outs(id, outs);
         true
     }
 

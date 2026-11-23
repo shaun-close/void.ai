@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use uuid::Uuid;
-use void_core::claude_code::turn::{PermissionAsk, PermissionBridge, StdinTx};
+use void_core::claude_code::turn::{PermissionAsk, PermissionBridge, STOPPED_TOOL, StdinTx};
 use void_core::claude_code::{control_response_allow, control_response_deny};
 use void_core::config::{ApiKeySource, BackendKind, Config, Profile, save_config};
 use void_core::engine::{Command, DeltaKind, Engine, EngineHandle, EngineOptions, Event};
@@ -19,6 +19,7 @@ use void_core::overlay::Overlay;
 use void_core::permissions::{Action, ApprovalKind, ApprovalRequest, Decision, Permissions, Rule};
 use void_core::sandbox::{Availability, SandboxSettings};
 use void_core::store::Store;
+use void_core::tools::ToolOutput;
 
 const NOT_SIGNED_IN: &str = "Claude Code isn't signed in — run `claude` in a terminal to sign in";
 const BUSY: &str = "A Claude Code turn is running — try again when it finishes";
@@ -1059,10 +1060,13 @@ fn init_session_uuid_is_stored() {
     );
 }
 
-/// Records which chats' turns ended; denies every request.
+/// Records which chats' turns ended; denies every request. `slow` makes `turn_ended` take a
+/// while, so an engine that reports the turn's end before telling the bridge is caught every
+/// time, not only when the test thread wins a race.
 #[derive(Default)]
 struct Recorder {
     ended: std::sync::Mutex<Vec<ConversationId>>,
+    slow: bool,
 }
 
 impl PermissionBridge for Recorder {
@@ -1075,13 +1079,19 @@ impl PermissionBridge for Recorder {
     }
     fn cancel(&self, _c: ConversationId, _request_id: &str) {}
     fn turn_ended(&self, c: ConversationId) {
+        if self.slow {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         self.ended.lock().unwrap().push(c);
     }
 }
 
 #[test]
 fn bridge_hears_when_turns_end() {
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(Recorder {
+        slow: true,
+        ..Recorder::default()
+    });
     let Some(mut r) = rig(Setup {
         pick: r#"if [ "$n" = 1 ]; then sc=text-turn; else sc=slow; fi"#.into(),
         bridge: Some(rec.clone()),
@@ -1397,4 +1407,76 @@ fn cancel_withdraws_approval() {
         r.control_responses(1).is_empty(),
         "a withdrawn request gets no answer"
     );
+}
+
+/// Events up to the end of `c`'s turn: the ToolFinished events seen for it.
+fn tool_finishes_until_turn_over(r: &mut Rig, c: ConversationId) -> Vec<(String, ToolOutput)> {
+    let mut seen = Vec::new();
+    loop {
+        match r.next() {
+            Event::ToolFinished {
+                conversation,
+                call_id,
+                output,
+            } if conversation == c => seen.push((call_id, output)),
+            Event::TurnState {
+                conversation,
+                active: false,
+            } if conversation == c => return seen,
+            _ => {}
+        }
+    }
+}
+
+/// The tool a stopped turn was running is finished as stopped: its card stops spinning and
+/// the stored transcript has a result for the call, after the call.
+#[test]
+fn stop_finishes_running_tool() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=tool-stop".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "go");
+    r.until(|e| matches!(e, Event::ToolStarted { call_id, .. } if call_id == "tu_9"));
+    r.handle.send(Command::Stop(c));
+    let finished = tool_finishes_until_turn_over(&mut r, c);
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].0, "tu_9");
+    assert!(finished[0].1.is_error);
+    assert_eq!(finished[0].1.content, STOPPED_TOOL);
+    let saved = r.saved(c, true);
+    let roles: Vec<_> = saved.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        [Role::User, Role::Assistant, Role::Tool],
+        "{saved:?}"
+    );
+    assert!(saved.messages[1].stopped);
+    assert_eq!(
+        saved.messages[2].parts,
+        [Part::ToolResult {
+            call_id: "tu_9".into(),
+            content: STOPPED_TOOL.into()
+        }]
+    );
+}
+
+/// A turn that dies mid-tool finishes that tool too.
+#[test]
+fn crash_finishes_running_tool() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=tool-crash".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "go");
+    let finished = tool_finishes_until_turn_over(&mut r, c);
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].0, "tu_8");
+    assert!(finished[0].1.is_error);
 }

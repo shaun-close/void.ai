@@ -328,6 +328,19 @@ impl UiState {
                     self.active_turns.insert(conversation);
                 } else {
                     self.active_turns.remove(&conversation);
+                    // The engine finishes its calls; a call still open now never will be.
+                    for t in self.tool_calls.values_mut() {
+                        if t.conversation == conversation && t.done.is_none() {
+                            t.done = Some(void_core::tools::ToolOutput {
+                                content: if t.output.is_empty() {
+                                    "(stopped)".into()
+                                } else {
+                                    t.output.clone()
+                                },
+                                is_error: true,
+                            });
+                        }
+                    }
                 }
             }
             Event::ReviewError { error, .. } => self.error(error),
@@ -770,6 +783,44 @@ mod tests {
         assert_eq!(status(&s), None, "the turn is over");
         s.apply(Event::ConversationDeleted(id));
         assert!(!s.claude_models.contains_key(&id));
+    }
+
+    /// A call still open when its chat's turn ends isn't left running (spinning) forever;
+    /// finished calls and other chats' calls are untouched.
+    #[test]
+    fn turn_end_closes_open_tool_calls() {
+        let mut s = UiState::default();
+        let (id, other) = (ConversationId::new(), ConversationId::new());
+        for (c, call) in [(id, "open"), (id, "done"), (other, "elsewhere")] {
+            s.apply(Event::ToolStarted {
+                conversation: c,
+                call_id: call.into(),
+                name: "Bash".into(),
+                summary: "x".into(),
+            });
+        }
+        s.apply(Event::ToolOutput {
+            conversation: id,
+            call_id: "open".into(),
+            text: "partial".into(),
+        });
+        let ok = void_core::tools::ToolOutput::ok("fine");
+        s.apply(Event::ToolFinished {
+            conversation: id,
+            call_id: "done".into(),
+            output: ok.clone(),
+        });
+        s.apply(Event::TurnState {
+            conversation: id,
+            active: false,
+        });
+        let open = s.tool_calls["open"].done.clone().expect("closed");
+        assert!(open.is_error);
+        assert_eq!(s.tool_calls["done"].done, Some(ok));
+        assert!(
+            s.tool_calls["elsewhere"].done.is_none(),
+            "another chat's call"
+        );
     }
 
     #[test]

@@ -190,6 +190,9 @@ pub fn tool_summary(arguments: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The result recorded for a tool call whose turn ended (Stop, a failure) before it finished.
+pub const STOPPED_TOOL: &str = "(stopped before it finished)";
+
 /// What the engine does with a mapped event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Out {
@@ -230,6 +233,8 @@ pub struct Segments {
     usage: Option<Usage>,
     turn_usage: Option<Usage>,
     first_delta: Option<Instant>,
+    /// Main-thread tool calls started (ToolStarted) whose results haven't come yet.
+    open_calls: Vec<String>,
 }
 
 impl Segments {
@@ -248,12 +253,15 @@ impl Segments {
         out
     }
 
-    /// Forget the open segment's content (a failed attempt before a restart).
-    pub fn reset(&mut self) {
+    /// Forget the open segment's content (a failed attempt before a restart). Returns the
+    /// tool calls it had started that never finished: they're in no stored message, so the
+    /// engine closes their cards without recording a result.
+    pub fn reset(&mut self) -> Vec<String> {
         self.committed.clear();
         self.partial.clear();
         self.usage = None;
         self.turn_usage = None;
+        std::mem::take(&mut self.open_calls)
     }
 
     pub fn on_event(&mut self, ev: CcEvent) -> Vec<Out> {
@@ -285,6 +293,7 @@ impl Segments {
                         arguments,
                     } = p
                     {
+                        self.open_calls.push(id.clone());
                         out.push(Out::ToolStarted {
                             call_id: id.clone(),
                             name: name.clone(),
@@ -321,6 +330,7 @@ impl Segments {
                 is_error,
                 parent: None,
             } => {
+                self.open_calls.retain(|c| *c != call_id);
                 if self.open && !(self.committed.is_empty() && self.partial.is_empty()) {
                     out.extend(self.finish(false, None, None));
                 }
@@ -348,6 +358,30 @@ impl Segments {
             }),
         }
         out.push(Out::Delta(kind, text));
+    }
+
+    /// End the turn: [`finish`](Self::finish) the open segment, then finish every tool call
+    /// still running as stopped ([`STOPPED_TOOL`], an error), after the message holding it.
+    pub fn end(
+        &mut self,
+        stopped: bool,
+        error: Option<String>,
+        result_usage: Option<Usage>,
+    ) -> Vec<Out> {
+        let mut out: Vec<Out> = self
+            .finish(stopped, error, result_usage)
+            .into_iter()
+            .collect();
+        out.extend(
+            std::mem::take(&mut self.open_calls)
+                .into_iter()
+                .map(|call_id| Out::ToolFinished {
+                    call_id,
+                    content: STOPPED_TOOL.into(),
+                    is_error: true,
+                }),
+        );
+        out
     }
 
     /// End the open segment as a message (`stopped` keeps the partial text; `error` makes it a
@@ -1047,6 +1081,78 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    /// Ending a turn finishes its still-open tool calls (as stopped), after the message that
+    /// holds them; calls whose results came are left alone. A reset hands back its open calls.
+    #[test]
+    fn end_finishes_open_tool_calls() {
+        let call = |id: &str| Part::ToolCall {
+            id: id.into(),
+            name: "Bash".into(),
+            arguments: "{}".into(),
+        };
+        let mut s = Segments::default();
+        s.start();
+        s.on_event(CcEvent::Assistant {
+            parts: vec![call("a"), call("b")],
+            parent: None,
+            error: None,
+            usage: None,
+        });
+        s.on_event(CcEvent::ToolResult {
+            call_id: "a".into(),
+            content: "ok".into(),
+            is_error: false,
+            parent: None,
+        });
+        let out = s.end(true, None, None);
+        assert_eq!(
+            out,
+            [Out::ToolFinished {
+                call_id: "b".into(),
+                content: STOPPED_TOOL.into(),
+                is_error: true,
+            }]
+        );
+        assert!(s.end(true, None, None).is_empty(), "finished once");
+
+        let mut s = Segments::default();
+        s.start();
+        s.on_event(CcEvent::Assistant {
+            parts: vec![Part::Text("x".into()), call("c")],
+            parent: None,
+            error: None,
+            usage: None,
+        });
+        match &s.end(false, Some("boom".into()), None)[..] {
+            [
+                Out::Finished { message, .. },
+                Out::ToolFinished {
+                    call_id, is_error, ..
+                },
+            ] => {
+                assert_eq!(message.parts.len(), 2);
+                assert_eq!(call_id, "c");
+                assert!(is_error);
+            }
+            o => panic!("{o:?}"),
+        }
+
+        let mut s = Segments::default();
+        s.start();
+        s.on_event(CcEvent::Assistant {
+            parts: vec![call("d")],
+            parent: None,
+            error: None,
+            usage: None,
+        });
+        assert_eq!(s.reset(), ["d".to_string()]);
+        assert!(
+            s.end(false, None, None)
+                .iter()
+                .all(|o| !matches!(o, Out::ToolFinished { .. }))
+        );
     }
 
     #[test]
