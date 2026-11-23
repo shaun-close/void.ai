@@ -233,7 +233,7 @@ pub enum Event {
 }
 
 /// Knobs for embedding the engine (tests lower the step limit and skip the sandbox).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EngineOptions {
     /// Tool rounds per turn before the agent is stopped.
     pub step_limit: u32,
@@ -242,6 +242,19 @@ pub struct EngineOptions {
     /// The home directory the sandbox (and Claude Code's state) is based on; None = `$HOME`.
     /// Tests point it at a dummy home.
     pub home: Option<PathBuf>,
+    /// Where Claude Code's permission requests go; None = the built-in one.
+    pub claude_bridge: Option<Arc<dyn PermissionBridge>>,
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineOptions")
+            .field("step_limit", &self.step_limit)
+            .field("sandbox", &self.sandbox)
+            .field("home", &self.home)
+            .field("claude_bridge", &self.claude_bridge.is_some())
+            .finish()
+    }
 }
 
 impl Default for EngineOptions {
@@ -250,6 +263,7 @@ impl Default for EngineOptions {
             step_limit: 50,
             sandbox: true,
             home: None,
+            claude_bridge: None,
         }
     }
 }
@@ -297,6 +311,10 @@ impl Engine {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/"))
         });
+        let claude_bridge = options
+            .claude_bridge
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoPrompts));
         let state = State {
             config_path,
             config: Config::default(),
@@ -318,7 +336,7 @@ impl Engine {
             options,
             home,
             claude: HashMap::new(),
-            claude_bridge: Arc::new(NoPrompts),
+            claude_bridge,
         };
         runtime.spawn(state.run(rx));
         EngineHandle {
@@ -981,9 +999,7 @@ impl State {
                 if let Some(s) = self.streams.remove(&id) {
                     s.abort.abort();
                 }
-                if let Some(run) = self.claude.remove(&id) {
-                    run.cancel.cancel();
-                }
+                self.delete_claude(id);
                 self.finalize_turn(id);
                 let ws = self
                     .convs
@@ -993,6 +1009,18 @@ impl State {
                 if let Err(e) = self.store.delete(&ws, &id) {
                     self.emit(Event::Error(format!(
                         "Couldn't delete the conversation: {e}"
+                    )));
+                }
+                let scratch = self
+                    .store
+                    .data_dir()
+                    .join("claude-scratch")
+                    .join(id.to_string());
+                if scratch.exists()
+                    && let Err(e) = crate::fsutil::remove_tree(&scratch)
+                {
+                    self.emit(Event::Error(format!(
+                        "Couldn't remove the chat's Claude Code folder: {e}"
                     )));
                 }
                 let overlay = self.store.overlay_dir(&ws, &id);
@@ -2516,6 +2544,7 @@ mod tests {
                 step_limit,
                 sandbox: false,
                 home: None,
+                claude_bridge: None,
             },
         );
         let mut r = Rig {
@@ -3345,6 +3374,7 @@ mod tests {
                 step_limit: 50,
                 sandbox: true,
                 home: None,
+                claude_bridge: None,
             },
         );
         let mut r = Rig {

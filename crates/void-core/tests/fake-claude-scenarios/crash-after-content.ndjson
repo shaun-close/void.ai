@@ -1,0 +1,6 @@
+# Real work happened, then the process died with session-ish noise on stderr: never restart.
+{"type":"system","subtype":"init","session_id":"sess-cc","model":"claude-fake"}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"Half done."}]}}
+#stderr mcp server "notes": session not found
+#stderr No conversation found with session ID: 00000000-0000-0000-0000-000000000000
+#exit 1

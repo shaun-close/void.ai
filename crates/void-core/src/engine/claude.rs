@@ -20,8 +20,10 @@ pub(super) struct ClaudeRun {
     pub(super) generation: u64,
     pub(super) cancel: CancellationToken,
     pub(super) seg: Segments,
-    /// The reply is over (result, failure or Stop); later stream content is ignored.
+    /// The reply is over (result, failure, Stop or Delete); later stream content is ignored.
     pub(super) done: bool,
+    /// Where the turn has its overlay mounted (kept after Delete until the process is gone).
+    pub(super) workspace: WorkspaceId,
     /// `claude`'s stdin, for permission answers.
     #[allow(dead_code)]
     pub(super) stdin: Option<StdinTx>,
@@ -44,9 +46,7 @@ impl State {
 
     /// Whether a Claude Code turn is running in this workspace.
     pub(super) fn claude_running_in(&self, ws: &WorkspaceId) -> bool {
-        self.claude
-            .keys()
-            .any(|id| self.turns.get(id).is_some_and(|t| t.workspace.id == *ws))
+        self.claude.values().any(|run| run.workspace == *ws)
     }
 
     /// Start the reply to a turn just begun: through Claude Code or void's own agent loop.
@@ -73,6 +73,11 @@ impl State {
                 cancel: cancel.clone(),
                 seg,
                 done: false,
+                workspace: self
+                    .turns
+                    .get(&id)
+                    .map(|t| t.workspace.id.clone())
+                    .unwrap_or_else(|| self.workspace.id.clone()),
                 stdin: None,
             },
         );
@@ -88,13 +93,16 @@ impl State {
         let tx = self.tx.clone();
         let bridge = self.claude_bridge.clone();
         tokio::spawn(async move {
-            let send = move |update| {
+            // If the task dies without reporting the end (a panic), the backstop does, so the
+            // chat doesn't stay busy for good.
+            let backstop = cc::Backstop::new(move |update| {
                 let _ = tx.send(Msg::Claude {
                     conversation: id,
                     generation,
                     update,
                 });
-            };
+            });
+            let send = |update| backstop.send(update);
             cc::run_turn(sandbox, spec, bridge, cancel, &send).await;
         });
     }
@@ -215,9 +223,11 @@ impl State {
             ),
             TurnUpdate::Spawned(tx) => run.stdin = Some(tx),
             TurnUpdate::Session { session, model } => {
-                if let Some(c) = self.convs.get_mut(&id)
-                    && c.claude_session != Some(session)
-                {
+                // Gone from `convs` once deleted: nothing to store (or recreate).
+                let Some(c) = self.convs.get_mut(&id) else {
+                    return;
+                };
+                if c.claude_session != Some(session) {
                     c.claude_session = Some(session);
                     let c = c.clone();
                     self.save(&c);
@@ -265,6 +275,7 @@ impl State {
                     self.apply_outs(id, out.into_iter().collect());
                 }
                 self.claude.remove(&id);
+                self.claude_bridge.turn_ended(id);
                 self.finalize_turn(id);
                 if self
                     .convs
@@ -361,6 +372,7 @@ impl State {
             let out = run.seg.finish(true, None, None);
             self.apply_outs(id, out.into_iter().collect());
         }
+        self.claude_bridge.turn_ended(id);
         let pending: Vec<u64> = self
             .approvals
             .iter()
@@ -372,5 +384,17 @@ impl State {
             self.emit(Event::ApprovalResolved { id: k });
         }
         true
+    }
+}
+
+impl State {
+    /// A chat with a Claude Code turn is being deleted: kill `claude`, but keep the run (and so
+    /// the workspace's review refusal) until the process is gone.
+    pub(super) fn delete_claude(&mut self, id: ConversationId) {
+        if let Some(run) = self.claude.get_mut(&id) {
+            run.cancel.cancel();
+            run.done = true;
+            self.claude_bridge.turn_ended(id);
+        }
     }
 }

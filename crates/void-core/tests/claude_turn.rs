@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use uuid::Uuid;
+use void_core::claude_code::turn::{PermissionAsk, PermissionBridge, StdinTx};
 use void_core::config::{ApiKeySource, BackendKind, Config, Profile, save_config};
 use void_core::engine::{Command, DeltaKind, Engine, EngineHandle, EngineOptions, Event};
 use void_core::model::{Conversation, ConversationId, Message, Part, Role, Workspace};
@@ -41,6 +42,7 @@ struct Setup {
     command: Option<String>,
     /// Conversations saved before the engine starts (in the workspace).
     before: Vec<Conversation>,
+    bridge: Option<Arc<dyn PermissionBridge>>,
 }
 
 impl Default for Setup {
@@ -51,6 +53,7 @@ impl Default for Setup {
             network: true,
             command: None,
             before: Vec::new(),
+            bridge: None,
         }
     }
 }
@@ -155,6 +158,7 @@ fn rig_with(setup: Setup, workspace: bool) -> Option<Rig> {
         Arc::new(void_core::backend::make_backend),
         EngineOptions {
             home: Some(home.clone()),
+            claude_bridge: setup.bridge.clone(),
             ..EngineOptions::default()
         },
     );
@@ -597,6 +601,10 @@ fn crash_without_result_fails_turn() {
     };
     assert!(error.contains("fatal: the fake crashed"), "{error}");
     assert!(error.contains("something went badly wrong"), "{error}");
+    assert!(
+        r.fake("stdin-1").contains("\"user\""),
+        "the fake ran and echoed its key"
+    );
     assert!(!error.contains("sk-secret"), "{error}");
     r.turn_over(c);
     let saved = r.saved(c, true);
@@ -869,4 +877,177 @@ fn control_requests_are_answered() {
     let perm = &answers[1]["response"];
     assert_eq!(perm["request_id"], "perm-1");
     assert_eq!(perm["response"]["behavior"], "deny");
+}
+
+#[test]
+fn restart_never_after_content() {
+    let mut before = Conversation::new(Workspace::scratch().id);
+    before.claude_session = Some(Uuid::now_v7());
+    let c = before.id;
+    let Some(mut r) = rig(Setup {
+        pick: "sc=crash-after-content".into(),
+        before: vec![before],
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    r.send(c, "go");
+    match r.until(|e| matches!(e, Event::StreamFailed { .. })) {
+        Event::StreamFailed { error, .. } => {
+            assert!(error.contains("stopped without finishing"), "{error}")
+        }
+        _ => unreachable!(),
+    }
+    r.turn_over(c);
+    assert_eq!(r.fake("args-2"), "", "the turn wasn't run a second time");
+    let saved = r.saved(c, true);
+    let roles: Vec<Role> = saved.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::User, Role::Assistant]);
+    assert_eq!(saved.messages[1].text(), "Half done.");
+}
+
+/// Accepts or rejects `other`'s changes until it works; how many times it was refused.
+fn accept_when_free(r: &mut Rig, other: ConversationId) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut refused = 0;
+    loop {
+        assert!(Instant::now() < deadline, "review never came back");
+        r.handle.send(Command::AcceptAll {
+            conversation: other,
+            keep_ignored: false,
+        });
+        match r.until(|e| {
+            matches!(e, Event::Error(_))
+                || matches!(e, Event::Changes { conversation, .. } if *conversation == other)
+        }) {
+            Event::Error(m) => {
+                assert_eq!(m, BUSY);
+                refused += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            _ => return refused,
+        }
+    }
+}
+
+#[test]
+fn delete_keeps_review_refused_until_claude_exits() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=stubborn".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let other = r.new_conversation();
+    r.overlay(other)
+        .write(Path::new("a.txt"), b"other chat\n")
+        .unwrap();
+    let c = r.new_conversation();
+    r.send(c, "go");
+    r.until(|e| matches!(e, Event::Delta { .. }));
+    r.handle.send(Command::DeleteConversation(c));
+    r.until(|e| matches!(e, Event::ConversationDeleted(_)));
+    // `claude` ignores SIGTERM, so it lives for the 3 s grace: review stays refused.
+    let refused = accept_when_free(&mut r, other);
+    assert!(
+        refused >= 1,
+        "review allowed while claude was still running"
+    );
+    assert_eq!(
+        fs::read_to_string(r.ws.join("a.txt")).unwrap(),
+        "other chat\n"
+    );
+}
+
+#[test]
+fn deleting_scratch_chat_removes_its_dir() {
+    let Some(mut r) = rig_with(Setup::default(), false) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "hi");
+    r.turn_over(c);
+    let dir = r
+        .store
+        .data_dir()
+        .join("claude-scratch")
+        .join(c.to_string());
+    assert!(dir.is_dir());
+    r.handle.send(Command::DeleteConversation(c));
+    r.until(|e| matches!(e, Event::ConversationDeleted(_)));
+    assert!(!dir.exists(), "the scratch dir went with the chat");
+}
+
+#[test]
+fn init_session_uuid_is_stored() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=init-uuid".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let reported = Uuid::parse_str("0190f000-0000-7000-8000-000000000abc").unwrap();
+    let c = r.new_conversation();
+    r.send(c, "hi");
+    r.turn_over(c);
+    assert_eq!(r.saved(c, true).claude_session, Some(reported));
+    r.send(c, "again");
+    r.turn_over(c);
+    assert!(
+        r.args(2).contains(&format!("--resume={reported}")),
+        "{:?}",
+        r.args(2)
+    );
+}
+
+/// Records which chats' turns ended; denies every request.
+#[derive(Default)]
+struct Recorder {
+    ended: std::sync::Mutex<Vec<ConversationId>>,
+}
+
+impl PermissionBridge for Recorder {
+    fn ask(&self, _c: ConversationId, ask: PermissionAsk, stdin: StdinTx) {
+        let _ = stdin.send(void_core::claude_code::control_response_deny(
+            &ask.request_id,
+            "no",
+            false,
+        ));
+    }
+    fn cancel(&self, _c: ConversationId, _request_id: &str) {}
+    fn turn_ended(&self, c: ConversationId) {
+        self.ended.lock().unwrap().push(c);
+    }
+}
+
+#[test]
+fn bridge_hears_when_turns_end() {
+    let rec = Arc::new(Recorder::default());
+    let Some(mut r) = rig(Setup {
+        pick: r#"if [ "$n" = 1 ]; then sc=text-turn; else sc=slow; fi"#.into(),
+        bridge: Some(rec.clone()),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let ended = |c: ConversationId| rec.ended.lock().unwrap().contains(&c);
+    let done = r.new_conversation();
+    r.send(done, "hi");
+    r.turn_over(done);
+    assert!(ended(done), "a finished turn");
+    let stopped = r.new_conversation();
+    r.send(stopped, "go");
+    r.until(|e| matches!(e, Event::Delta { conversation, .. } if *conversation == stopped));
+    r.handle.send(Command::Stop(stopped));
+    r.until(
+        |e| matches!(e, Event::StreamFinished { conversation, .. } if *conversation == stopped),
+    );
+    assert!(ended(stopped), "told at Stop, before the process is gone");
+    r.turn_over(stopped);
+    let deleted = r.new_conversation();
+    r.send(deleted, "go");
+    r.until(|e| matches!(e, Event::Delta { conversation, .. } if *conversation == deleted));
+    r.handle.send(Command::DeleteConversation(deleted));
+    r.until(|e| matches!(e, Event::ConversationDeleted(_)));
+    assert!(ended(deleted), "a deleted chat");
 }

@@ -1,5 +1,6 @@
 # Dies without a result.
 {"type":"system","subtype":"init","session_id":"sess-c","model":"claude-fake"}
+#echo-env ANTHROPIC_API_KEY
 #stderr something went badly wrong
 #stderr fatal: the fake crashed
 #exit 2

@@ -1,0 +1,5 @@
+# Ignores SIGTERM, so a kill takes the full grace period.
+#ignore-sigterm
+{"type":"system","subtype":"init","session_id":"sess-st","model":"claude-fake"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"busy"}},"parent_tool_use_id":null}
+#sleep 30000

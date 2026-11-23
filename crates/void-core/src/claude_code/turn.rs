@@ -65,6 +65,9 @@ pub trait PermissionBridge: Send + Sync {
     fn ask(&self, conversation: ConversationId, ask: PermissionAsk, stdin: StdinTx);
     /// Claude Code withdrew a request (`control_cancel_request`): drop it, answer nothing.
     fn cancel(&self, conversation: ConversationId, request_id: &str);
+    /// The chat's turn was stopped, deleted or is over: drop anything still pending for it.
+    /// May be called more than once per turn.
+    fn turn_ended(&self, _conversation: ConversationId) {}
 }
 
 /// Answers every request with a deny (until approvals reach void's dialog).
@@ -397,6 +400,38 @@ impl Segments {
     }
 }
 
+/// Reports for a turn's task, and the turn's end if the task dies without reporting it.
+pub struct Backstop<F: Fn(TurnUpdate)> {
+    send: F,
+    exited: std::sync::atomic::AtomicBool,
+}
+
+impl<F: Fn(TurnUpdate)> Backstop<F> {
+    pub fn new(send: F) -> Self {
+        Self {
+            send,
+            exited: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn send(&self, update: TurnUpdate) {
+        if matches!(update, TurnUpdate::Exited { .. }) {
+            self.exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        (self.send)(update)
+    }
+}
+
+impl<F: Fn(TurnUpdate)> Drop for Backstop<F> {
+    fn drop(&mut self) {
+        if !self.exited.load(std::sync::atomic::Ordering::SeqCst) {
+            (self.send)(TurnUpdate::Exited {
+                error: Some("Claude Code's turn ended unexpectedly (a void.ai bug).".into()),
+            });
+        }
+    }
+}
+
 /// What the turn's task reports to the engine.
 #[derive(Debug)]
 pub enum TurnUpdate {
@@ -507,11 +542,32 @@ fn session_of(args: &TurnArgs) -> Uuid {
     }
 }
 
-/// Claude Code saying it can't use the session id it was given.
+/// Claude Code's messages for a session id it can't use, lowercased: each entry is the
+/// fragments one line must all contain. **Unverified** against the real CLI (2.1.330) until
+/// the live smoke test: `--resume` of an unknown id ("No conversation found with session ID:
+/// <id>") and `--session-id` of an existing one ("Session ID <id> is already in use").
+const SESSION_ERRORS: &[&[&str]] = &[
+    &["no conversation found with session id"],
+    &["session id", "already in use"],
+];
+
+/// Claude Code saying it can't use the session id it was given (checked line by line, so
+/// unrelated output that mentions a session elsewhere doesn't count).
 fn session_unusable(text: &str) -> bool {
-    let t = text.to_lowercase();
-    t.contains("no conversation found")
-        || (t.contains("session") && (t.contains("not found") || t.contains("already in use")))
+    text.lines().any(|line| {
+        let l = line.to_lowercase();
+        SESSION_ERRORS
+            .iter()
+            .any(|parts| parts.iter().all(|p| l.contains(p)))
+    })
+}
+
+/// `text` with the API key (if any) blanked out.
+fn redact(text: &str, key: Option<&str>) -> String {
+    match key.filter(|k| !k.is_empty()) {
+        Some(k) => text.replace(k, "[API key]"),
+        None => text.to_string(),
+    }
 }
 
 fn auth_failure(text: &str) -> bool {
@@ -590,6 +646,8 @@ async fn attempt(
     let mut reader = BufReader::new(stdout);
     let mut buf = Vec::new();
     let mut auth = false;
+    // Real work happened (streamed, stored, maybe files changed): never start over after it.
+    let mut worked = false;
     let mut result: Option<(Usage, bool, Option<String>)> = None;
     while result.is_none() {
         buf.clear();
@@ -606,7 +664,11 @@ async fn attempt(
         }
         for ev in parse_events(&String::from_utf8_lossy(&buf)) {
             match ev {
-                CcEvent::Init { model, .. } => send(TurnUpdate::Session { session, model }),
+                CcEvent::Init { session: id, model } => {
+                    // The id Claude Code reports, when it's a UUID; else the one void passed.
+                    let session = Uuid::parse_str(&id).unwrap_or(session);
+                    send(TurnUpdate::Session { session, model })
+                }
                 CcEvent::PermissionRequest {
                     request_id,
                     tool,
@@ -664,17 +726,26 @@ async fn attempt(
                     {
                         auth |= e == "authentication_failed";
                     }
+                    worked |= matches!(&ev, CcEvent::Assistant { parent: None, .. });
                     send(TurnUpdate::Event(ev));
                 }
-                ev => send(TurnUpdate::Event(ev)),
+                ev => {
+                    worked |= matches!(
+                        &ev,
+                        CcEvent::TextDelta { parent: None, .. }
+                            | CcEvent::ThinkingDelta { parent: None, .. }
+                            | CcEvent::ToolResult { parent: None, .. }
+                    );
+                    send(TurnUpdate::Event(ev))
+                }
             }
         }
     }
 
     match result {
         Some((usage, is_error, message)) => {
-            let message = message.unwrap_or_default();
-            let restart = is_error && may_restart && session_unusable(&message);
+            let message = redact(&message.unwrap_or_default(), key);
+            let restart = is_error && may_restart && !worked && session_unusable(&message);
             if !restart {
                 let error = is_error.then(|| {
                     if auth || auth_failure(&message) {
@@ -727,8 +798,8 @@ async fn attempt(
                     Ok(Ok(l)) => l.into(),
                     _ => Vec::new(),
                 };
-            let stderr = lines.join("\n");
-            if may_restart && session_unusable(&stderr) {
+            let stderr = redact(&lines.join("\n"), key);
+            if may_restart && !worked && session_unusable(&stderr) {
                 return Attempt::Restart(stderr);
             }
             if auth || auth_failure(&stderr) {
@@ -1002,9 +1073,55 @@ mod tests {
         ));
         assert!(session_unusable("Error: Session ID abc is already in use."));
         assert!(!session_unusable("rate limited"));
+        // Unrelated noise that merely mentions a session isn't Claude Code's session error.
+        assert!(!session_unusable("mcp server \"notes\": session not found"));
+        assert!(!session_unusable("warning: session\nsomething not found"));
+        assert!(session_unusable(
+            "some warning\nNo conversation found with session ID: x"
+        ));
         assert!(auth_failure("Not logged in · Please run /login"));
         assert!(auth_failure("Invalid API key · Fix external API key"));
         assert!(!auth_failure("Prompt is too long"));
+    }
+
+    #[tokio::test]
+    async fn backstop_ends_a_panicking_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnUpdate>();
+        let task = tokio::spawn(async move {
+            let b = Backstop::new(move |u| {
+                let _ = tx.send(u);
+            });
+            b.send(TurnUpdate::Waiting);
+            if b.exited.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            panic!("turn task bug");
+        });
+        assert!(task.await.is_err(), "the task panicked");
+        assert!(matches!(rx.recv().await, Some(TurnUpdate::Waiting)));
+        match rx.recv().await {
+            Some(TurnUpdate::Exited { error: Some(e) }) => {
+                assert!(e.contains("unexpectedly"), "{e}")
+            }
+            u => panic!("{u:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn backstop_stays_quiet_after_exited() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnUpdate>();
+        {
+            let b = Backstop::new(move |u| {
+                let _ = tx.send(u);
+            });
+            b.send(TurnUpdate::Exited { error: None });
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TurnUpdate::Exited { error: None })
+        ));
+        assert!(rx.try_recv().is_err(), "one Exited only");
     }
 
     #[test]

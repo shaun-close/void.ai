@@ -14,11 +14,14 @@ Scenario lines: JSON is written to stdout verbatim; directives start with `#`:
   #stderr <text>     write text to stderr
   #exit <code>       exit immediately with that code
   #write <path> <text>  write text (plus a newline) to path, relative to the cwd
+  #echo-env <VAR>    write the variable's value to stdout and stderr
+  #ignore-sigterm    ignore SIGTERM from here on (only SIGKILL stops it)
   # anything else    comment (also blank lines are skipped)
 Ends with exit 0 when the scenario is exhausted.
 """
 import json
 import os
+import signal
 import sys
 import time
 
@@ -84,6 +87,13 @@ def main():
             _, path, text = raw.split(" ", 2)
             with open(path, "w") as f:
                 f.write(text + "\n")
+        elif raw.startswith("#echo-env"):
+            val = os.environ.get(raw.split()[1], "")
+            out(val)
+            sys.stderr.write(val + "\n")
+            sys.stderr.flush()
+        elif raw.startswith("#ignore-sigterm"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         elif raw.startswith("#exit"):
             parts = raw.split()
             return int(parts[1]) if len(parts) > 1 else 0
