@@ -106,8 +106,10 @@ const PROTO_DIRS: [&str; 2] = ["shims", "bin"];
 /// project's folder (left unknown if only the projects query fails).
 pub async fn discover(root: &Path) -> Result<Vec<MoonTask>, String> {
     let moon = resolve_moon()?;
-    let mut tasks = parse_moon_tasks(&query(&moon, root, "tasks").await?)?;
-    if let Ok(projects) = query(&moon, root, "projects")
+    let path = home().and_then(|h| proto_path(std::env::var_os("PATH").as_deref(), &h));
+    let path = path.as_deref();
+    let mut tasks = parse_moon_tasks(&query(&moon, root, "tasks", path).await?)?;
+    if let Ok(projects) = query(&moon, root, "projects", path)
         .await
         .and_then(|json| parse_moon_projects(&json))
     {
@@ -116,10 +118,17 @@ pub async fn discover(root: &Path) -> Result<Vec<MoonTask>, String> {
     Ok(tasks)
 }
 
-/// `moon query <what>`'s stdout, killed (with its process group) after 30 s.
-async fn query(moon: &Path, root: &Path, what: &str) -> Result<String, String> {
+/// `moon query <what>`'s stdout, killed (with its process group) after 30 s. `path`: the
+/// PATH to give moon (proto's dirs added, as for run steps), None to leave it.
+async fn query(
+    moon: &Path,
+    root: &Path,
+    what: &str,
+    path: Option<&OsStr>,
+) -> Result<String, String> {
     let child = tokio::process::Command::new(moon)
         .args(["query", what])
+        .envs(path.map(|p| ("PATH", p)))
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -221,6 +230,30 @@ mod tests {
         // runFromWorkspaceRoot is read from the task's options.
         let json = r#"{"tasks":{"web":{"lint":{"command":"eslint","options":{"runFromWorkspaceRoot":true}}}}}"#;
         assert!(parse_moon_tasks(json).unwrap()[0].run_from_workspace_root);
+    }
+
+    #[test]
+    fn moon_queries_get_the_given_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("moon");
+        std::fs::write(&fake, "#!/bin/sh\necho \"$1 $2 $PATH\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let want = "/home/x/.proto/shims:/home/x/.proto/bin:/usr/bin:/bin";
+        let out = rt
+            .block_on(query(&fake, dir.path(), "tasks", Some(OsStr::new(want))))
+            .unwrap();
+        assert_eq!(out.trim(), format!("query tasks {want}"));
+        // None leaves void's own PATH.
+        let out = rt
+            .block_on(query(&fake, dir.path(), "projects", None))
+            .unwrap();
+        let own = std::env::var("PATH").unwrap();
+        assert_eq!(out.trim(), format!("query projects {own}"));
     }
 
     #[test]
