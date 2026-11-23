@@ -1,0 +1,6 @@
+# Tool use + result, then a closing answer.
+{"type":"system","subtype":"init","session_id":"sess-2","model":"claude-fake"}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"list files"},{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"a.txt\nb.txt","is_error":false}]}}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"Two files."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"sess-2","result":"Two files.","usage":{"input_tokens":20,"output_tokens":9}}

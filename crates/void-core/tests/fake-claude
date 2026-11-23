@@ -1,0 +1,92 @@
+#!/usr/bin/env -S python3 -I
+"""Fake `claude` for tests: never contacts any service, spends no tokens.
+
+Env:
+  FAKE_CLAUDE_ARGS_FILE   write argv (one per line) here
+  FAKE_CLAUDE_STDIN_FILE  append every stdin line received here
+  FAKE_CLAUDE_SCENARIO    NDJSON scenario file replayed after the first user message
+
+Flow: answers `initialize` (and `interrupt`) control requests with a success
+control_response; on the first `type:user` stdin line, replays the scenario.
+Scenario lines: JSON is written to stdout verbatim; directives start with `#`:
+  #wait-stdin-line   block until the next stdin line arrives (e.g. a permission answer)
+  #sleep <ms>        pause
+  #stderr <text>     write text to stderr
+  #exit <code>       exit immediately with that code
+  # anything else    comment (also blank lines are skipped)
+Ends with exit 0 when the scenario is exhausted.
+"""
+import json
+import os
+import sys
+import time
+
+
+def out(s):
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    af = os.environ.get("FAKE_CLAUDE_ARGS_FILE")
+    if af:
+        with open(af, "w") as f:
+            f.write("\n".join(sys.argv[1:]) + "\n")
+    sf = os.environ.get("FAKE_CLAUDE_STDIN_FILE")
+
+    def read_line():
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        if sf:
+            with open(sf, "a") as f:
+                f.write(line if line.endswith("\n") else line + "\n")
+        return line.strip()
+
+    def maybe_answer(line):
+        try:
+            m = json.loads(line)
+        except ValueError:
+            return None
+        if m.get("type") == "control_request":
+            sub = (m.get("request") or {}).get("subtype")
+            body = {"commands": [], "models": []} if sub == "initialize" else {}
+            out(json.dumps({"type": "control_response", "response": {
+                "subtype": "success", "request_id": m.get("request_id"), "response": body}}))
+        return m
+
+    while True:
+        line = read_line()
+        if line is None:
+            return 0
+        m = maybe_answer(line)
+        if m and m.get("type") == "user":
+            break
+
+    path = os.environ.get("FAKE_CLAUDE_SCENARIO")
+    lines = open(path).read().splitlines() if path else []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        if raw.startswith("#wait-stdin-line"):
+            line = read_line()
+            if line is None:
+                return 0
+            maybe_answer(line)
+        elif raw.startswith("#sleep"):
+            time.sleep(int(raw.split()[1]) / 1000.0)
+        elif raw.startswith("#stderr"):
+            sys.stderr.write(raw[len("#stderr"):].lstrip() + "\n")
+            sys.stderr.flush()
+        elif raw.startswith("#exit"):
+            parts = raw.split()
+            return int(parts[1]) if len(parts) > 1 else 0
+        elif raw.startswith("#"):
+            continue
+        else:
+            out(raw)
+    return 0
+
+
+sys.exit(main())

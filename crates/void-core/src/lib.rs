@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod backend;
+pub mod claude_code;
 pub mod config;
 pub mod context;
 pub mod engine;
