@@ -1098,6 +1098,10 @@ impl State {
                 {
                     c.messages.pop();
                 }
+                // What Claude Code saw of the replaced attempt doesn't count for what follows.
+                if let Some(seen) = c.claude_upto {
+                    c.claude_upto = Some(seen.min(c.messages.len()));
+                }
                 let c = c.clone();
                 if let Some(ov) = self.existing_overlay(&ws, id)
                     && let Err(e) = ov.restore_checkpoint()
@@ -1697,6 +1701,12 @@ impl State {
                     let at = split.min(c.messages.len());
                     c.messages
                         .insert(at, Message::new(Role::Assistant, vec![Part::Summary(text)]));
+                    // A summary of what Claude Code already saw isn't news to it.
+                    if let Some(seen) = c.claude_upto.as_mut()
+                        && at <= *seen
+                    {
+                        *seen += 1;
+                    }
                     c.updated = Utc::now();
                     let c = c.clone();
                     self.save(&c);

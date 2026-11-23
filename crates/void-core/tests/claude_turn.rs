@@ -1691,6 +1691,51 @@ fn void_bash_waits_for_a_claude_turn_and_stops() {
     r.turn_over(a);
 }
 
+/// Claude → void → Claude: the resumed Claude Code session hears what void's model said in
+/// between (exactly that, once); a Retry doesn't send it again, nor does the next turn.
+#[test]
+fn claude_hears_the_turns_of_another_model() {
+    let Some(mut r) = rig(Setup::default()) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "first");
+    r.turn_over(c);
+    assert_eq!(r.user_inputs(1), ["first"]);
+    r.handle
+        .send(Command::SetConversationProfile(c, Some("local".into())));
+    r.send(c, "local question");
+    r.until(
+        |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == "void reply"),
+    );
+    r.turn_over(c);
+    r.handle.send(Command::SetConversationProfile(c, None));
+    r.send(c, "back to claude");
+    r.turn_over(c);
+    assert!(r.args(2).contains(&format!("--resume={}", c.0)));
+    assert_eq!(
+        r.user_inputs(2),
+        [
+            "Meanwhile in this chat (another model):\n\nUser: local question\n\nAssistant: \
+          void reply\n\n---\n\nback to claude"
+        ]
+    );
+    r.handle.send(Command::Retry(c));
+    r.until(
+        |e| matches!(e, Event::StreamFinished { message, .. } if message.text() == "Hello world"),
+    );
+    r.turn_over(c);
+    assert_eq!(
+        r.user_inputs(3),
+        [format!("{RETRY_NOTE}\n\nback to claude")]
+    );
+    r.send(c, "and again");
+    r.turn_over(c);
+    assert_eq!(r.user_inputs(4), ["and again"]);
+    let saved = r.saved(c, true);
+    assert_eq!(saved.claude_upto, Some(saved.messages.len()));
+}
+
 /// While a Claude Code turn has the sandbox (its cache layers mounted), clearing the caches is
 /// refused, and saving new sandbox settings keeps the same lock: another chat's turn still
 /// waits for the running one.

@@ -154,6 +154,10 @@ pub struct Conversation {
     /// Claude Code turn has started one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session: Option<Uuid>,
+    /// How many of `messages` that Claude Code session has seen (set at the end of each of its
+    /// turns): later messages came from another model, and its next turn is told about them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_upto: Option<usize>,
     pub messages: Vec<Message>,
 }
 
@@ -171,6 +175,7 @@ impl Conversation {
             profile_id: None,
             agent: None,
             claude_session: None,
+            claude_upto: None,
             messages: Vec::new(),
         }
     }

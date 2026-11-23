@@ -33,6 +33,9 @@ pub(super) struct ClaudeRun {
     pub(super) stdin: Option<StdinTx>,
     /// Claude Code's pending permission requests: request id → approval id.
     pub(super) asks: HashMap<String, u64>,
+    /// `claude` started the session (so it has this turn's input): the chat's `claude_upto`
+    /// moves to the end of the turn when it's over.
+    pub(super) seen: bool,
 }
 
 impl State {
@@ -86,6 +89,7 @@ impl State {
                     .unwrap_or_else(|| self.workspace.id.clone()),
                 stdin: None,
                 asks: HashMap::new(),
+                seen: false,
             },
         );
         self.apply_outs(id, outs);
@@ -176,13 +180,18 @@ impl State {
             .ok_or("There's no message to answer.")?;
         let message = c.messages[last].text();
         let fresh_text = cc::with_transcript(c, last, &message);
+        // A resumed session hasn't seen the turns another model had since its last turn.
+        let body = match c.claude_upto {
+            Some(seen) if seen < last => cc::with_meanwhile(c, seen, last, &message),
+            _ => message,
+        };
         let (session, text) = match c.claude_session {
             None => (SessionMode::New(c.id.0), fresh_text.clone()),
             Some(u) if retry => (
                 SessionMode::Resume(u),
-                format!("{}\n\n{message}", cc::RETRY_NOTE),
+                format!("{}\n\n{body}", cc::RETRY_NOTE),
             ),
-            Some(u) => (SessionMode::Resume(u), message),
+            Some(u) => (SessionMode::Resume(u), body),
         };
         let model = profile.model.trim();
         let args = TurnArgs {
@@ -230,6 +239,7 @@ impl State {
             ),
             TurnUpdate::Spawned(tx) => run.stdin = Some(tx),
             TurnUpdate::Session { session, model } => {
+                run.seen = true;
                 // Gone from `convs` once deleted: nothing to store (or recreate).
                 let Some(c) = self.convs.get_mut(&id) else {
                     return;
@@ -287,12 +297,22 @@ impl State {
                 self.claude_turn_ended(id);
             }
             TurnUpdate::Exited { error } => {
+                let seen = run.seen;
                 if !run.done {
                     run.done = true;
                     let error =
                         error.unwrap_or_else(|| "Claude Code ended without a reply.".into());
                     let outs = run.seg.end(false, Some(error), None);
                     self.apply_outs(id, outs);
+                }
+                // The session has everything up to here (its own turn included).
+                if seen
+                    && let Some(c) = self.convs.get_mut(&id)
+                    && c.claude_upto != Some(c.messages.len())
+                {
+                    c.claude_upto = Some(c.messages.len());
+                    let c = c.clone();
+                    self.save(&c);
                 }
                 self.claude_turn_ended(id);
                 self.claude.remove(&id);

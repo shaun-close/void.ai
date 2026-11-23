@@ -122,7 +122,14 @@ fn executable(p: &Path) -> bool {
 /// The chat so far, as plain text for a fresh Claude Code session: the latest compaction
 /// summary and everything after it, before message `upto`. Oldest text is cut first.
 pub fn transcript(c: &Conversation, upto: usize) -> String {
-    let msgs = &c.messages[..upto.min(c.messages.len())];
+    transcript_between(c, 0, upto)
+}
+
+/// Messages `from..upto` as plain text, as [`transcript`] renders them (from the latest
+/// compaction summary among them, capped the same way).
+pub fn transcript_between(c: &Conversation, from: usize, upto: usize) -> String {
+    let upto = upto.min(c.messages.len());
+    let msgs = &c.messages[from.min(upto)..upto];
     let from = msgs
         .iter()
         .rposition(|m| m.parts.iter().any(|p| matches!(p, Part::Summary(_))))
@@ -181,6 +188,17 @@ pub fn with_transcript(c: &Conversation, upto: usize, message: &str) -> String {
         message.to_string()
     } else {
         format!("Earlier in this chat:\n\n{t}\n\n---\n\n{message}")
+    }
+}
+
+/// `message` with messages `from..upto` (another model's turns, which the resumed Claude Code
+/// session never saw) in front of it.
+pub fn with_meanwhile(c: &Conversation, from: usize, upto: usize, message: &str) -> String {
+    let t = transcript_between(c, from, upto);
+    if t.is_empty() {
+        message.to_string()
+    } else {
+        format!("Meanwhile in this chat (another model):\n\n{t}\n\n---\n\n{message}")
     }
 }
 
@@ -1016,6 +1034,25 @@ mod tests {
         assert!(t.len() <= TRANSCRIPT_CAP + 64);
         assert!(t.starts_with("[… earlier messages omitted]"));
         assert!(!t.contains("OLDEST") && t.ends_with("NEWEST"));
+    }
+
+    #[test]
+    fn meanwhile_is_only_the_range() {
+        let c = conv(vec![
+            Message::user("seen q"),
+            Message::new(Role::Assistant, vec![Part::Text("seen a".into())]),
+            Message::user("local q"),
+            Message::new(Role::Assistant, vec![Part::Text("local a".into())]),
+            Message::user("now"),
+        ]);
+        assert_eq!(
+            with_meanwhile(&c, 2, 4, "now"),
+            "Meanwhile in this chat (another model):\n\nUser: local q\n\nAssistant: local a\n\n\
+             ---\n\nnow"
+        );
+        assert_eq!(with_meanwhile(&c, 4, 4, "now"), "now");
+        assert_eq!(transcript_between(&c, 9, 4), "");
+        assert_eq!(transcript(&c, 4), transcript_between(&c, 0, 4));
     }
 
     #[test]
