@@ -29,6 +29,25 @@ impl Host<'_, '_> {
         let p = p.min(self.core.len());
         self.core.sel = (p, p);
     }
+
+    /// `:w` (`force`: `:w!`, over outside changes too).
+    fn write(&mut self, force: bool) {
+        let msg = match self.cx.view {
+            EditorView::Disk => {
+                let r = if force {
+                    self.core.save_forced(self.cx.path)
+                } else {
+                    self.core.save(self.cx.path)
+                };
+                match r {
+                    Ok(m) => Msg::info(m),
+                    Err(e) => Msg::error(e),
+                }
+            }
+            EditorView::Chat(_) => Msg::error("Saving a chat view isn't available yet"),
+        };
+        self.core.message = Some(msg);
+    }
 }
 
 impl VimHost for Host<'_, '_> {
@@ -114,14 +133,11 @@ impl VimHost for Host<'_, '_> {
     }
 
     fn save(&mut self) {
-        let msg = match self.cx.view {
-            EditorView::Disk => match self.core.save(self.cx.path) {
-                Ok(m) => Msg::info(m),
-                Err(e) => Msg::error(e),
-            },
-            EditorView::Chat(_) => Msg::error("Saving a chat view isn't available yet"),
-        };
-        self.core.message = Some(msg);
+        self.write(false);
+    }
+
+    fn save_force(&mut self) {
+        self.write(true);
     }
 
     fn ex(&mut self, cmd: &str) -> bool {

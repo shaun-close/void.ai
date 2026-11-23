@@ -24,6 +24,9 @@ pub struct DiskWatch {
     /// Paths delivered so far (tests wait on these instead of sleeping).
     #[cfg(test)]
     seen: HashSet<PathBuf>,
+    /// Tests: drop every event, to show something else did the work.
+    #[cfg(test)]
+    paused: bool,
 }
 
 impl DiskWatch {
@@ -31,6 +34,11 @@ impl DiskWatch {
     #[cfg(test)]
     pub fn ready(&self) -> bool {
         self.root.is_none() || self.watcher.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn pause(&mut self) {
+        self.paused = true;
     }
 
     #[cfg(test)]
@@ -103,6 +111,10 @@ impl DiskWatch {
             paths.extend(w.drain());
         }
         #[cfg(test)]
+        if self.paused {
+            return Vec::new();
+        }
+        #[cfg(test)]
         self.seen.extend(paths.iter().cloned());
         paths
     }
@@ -125,7 +137,14 @@ impl VoidApp {
             .collect();
         self.disk.sync_extra(outside, ctx);
 
-        let paths = self.disk.drain();
+        let mut paths = self.disk.drain();
+        // Review accepts and rejects write the workspace themselves: check those files now
+        // instead of waiting for (or relying on) the watcher.
+        if let Some(root) = &root {
+            paths.extend(self.state.take_touched().iter().map(|p| root.join(p)));
+        } else {
+            self.state.take_touched();
+        }
         if !paths.is_empty() {
             self.editors.check_disk(&paths);
             self.files.changed(&paths);

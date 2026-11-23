@@ -28,6 +28,8 @@ pub enum BannerAction {
     Reload,
     /// Keep the buffer; don't ask again about this version of the file.
     KeepMine,
+    /// Save the buffer over the outside changes (`:w!`).
+    Overwrite,
 }
 
 /// A strip above the text: a notice, or a question with buttons.
@@ -50,6 +52,7 @@ pub fn banners(doc: &Doc) -> Vec<Banner> {
             buttons: vec![
                 ("Reload", BannerAction::Reload),
                 ("Keep mine", BannerAction::KeepMine),
+                ("Overwrite", BannerAction::Overwrite),
             ],
         }),
         DiskState::Deleted => out.push(Banner {
@@ -106,6 +109,12 @@ fn apply_banner(doc: &mut Doc, path: &std::path::Path, action: BannerAction) {
             });
         }
         BannerAction::KeepMine => doc.keep_mine(path),
+        BannerAction::Overwrite => {
+            doc.core.message = Some(match doc.core.save_forced(path) {
+                Ok(m) => super::state::Msg::info(m),
+                Err(e) => super::state::Msg::error(e),
+            });
+        }
     }
 }
 

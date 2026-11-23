@@ -728,3 +728,84 @@ fn external_change_flags_dirty_buffer() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "newer\n");
     assert!(h.query_by_label_contains("Deleted on disk").is_none());
 }
+
+/// Saving checks the disk itself (no watcher event needed): a file changed since it was read
+/// isn't overwritten; `:w!` or the banner's Overwrite does it on purpose.
+#[test]
+fn save_refuses_when_disk_changed_since_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("s.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    let key = (file.clone(), EditorView::Disk);
+    h.state_mut()
+        .editors
+        .doc_mut(&key)
+        .unwrap()
+        .core
+        .replace(0..0, "x");
+    // Written behind our back, and saved before any watcher event can have arrived.
+    std::fs::write(&file, "theirs\n").unwrap();
+    assert!(h.state_mut().editors.save(&key).is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+    assert!(h.state().editors.doc(&key).unwrap().disk_changed());
+    h.step();
+    h.step();
+    assert!(h.query_by_label_contains("Changed on disk").is_some());
+    assert!(
+        h.query_by_label_contains("changed on disk since").is_some(),
+        "says why"
+    );
+
+    // `:w!` overwrites on purpose.
+    text(&mut h, ":");
+    text(&mut h, "w!");
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "xone\n");
+    assert!(h.query_by_label_contains("Changed on disk").is_none());
+
+    // So does the banner's Overwrite.
+    std::fs::write(&file, "again\n").unwrap();
+    h.state_mut()
+        .editors
+        .doc_mut(&key)
+        .unwrap()
+        .core
+        .replace(0..0, "y");
+    assert!(h.state_mut().editors.save(&key).is_err());
+    h.step();
+    h.step();
+    h.get_by_label("Overwrite").click();
+    h.step();
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yxone\n");
+    assert!(!h.state().editors.is_dirty(&key));
+}
+
+/// Closing the last tab on a buffer whose file was deleted asks first: the buffer is the only
+/// copy left. Save puts the file back.
+#[test]
+fn closing_deleted_on_disk_buffer_asks() {
+    let (_t, file, mut h) = watched("keep me\n");
+    let key = (file.clone(), EditorView::Disk);
+    std::fs::remove_file(&file).unwrap();
+    until(&mut h, "deleted", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.disk_deleted())
+    });
+    assert!(!h.state().editors.is_dirty(&key));
+    let id = editor_tabs(h.state())[0];
+    close(&mut h, id);
+    assert_eq!(editor_tabs(h.state()), vec![id], "still open");
+    assert!(h.query_by_label_contains("deleted on disk").is_some());
+    h.get_by_label("Save").click();
+    h.step();
+    h.step();
+    assert!(editor_tabs(h.state()).is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me\n");
+}

@@ -211,9 +211,17 @@ impl EditorStore {
         self.docs.get(key).is_some_and(|d| d.core.buffer.is_dirty())
     }
 
-    /// Closing the last tab on `key` loses edits: ask first.
+    /// Closing the last tab on `key` loses edits, or the only copy of a file deleted on
+    /// disk: ask first.
     pub fn needs_confirm(&self, key: &DocKey, tabs_on_key: usize) -> bool {
-        tabs_on_key <= 1 && self.is_dirty(key)
+        tabs_on_key <= 1 && (self.is_dirty(key) || self.is_deleted(key))
+    }
+
+    /// The buffer's file was deleted on disk (the buffer holds the last copy).
+    pub fn is_deleted(&self, key: &DocKey) -> bool {
+        self.docs
+            .get(key)
+            .is_some_and(|d| d.core.disk == state::DiskState::Deleted)
     }
 
     pub fn save(&mut self, key: &DocKey) -> Result<String, String> {

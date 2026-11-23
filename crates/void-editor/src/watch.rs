@@ -101,7 +101,11 @@ impl Watcher {
         let (tx, rx) = mpsc::channel();
         let roots = Arc::new(Mutex::new(Vec::new()));
         let all = roots.clone();
-        let config = notify::Config::default().with_event_kinds(notify::EventKindMask::CORE);
+        // Symlinks aren't followed: a link to a big tree elsewhere would register all of it
+        // (and run into the inotify watch limit).
+        let config = notify::Config::default()
+            .with_event_kinds(notify::EventKindMask::CORE)
+            .with_follow_symlinks(false);
         let mut inner = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 let paths = match res {
@@ -239,6 +243,33 @@ mod tests {
         wait_for(&w, &f);
     }
 
+    fn bump_mtime(p: &Path) {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+    }
+
+    /// A symlink to a folder elsewhere isn't followed (that folder isn't registered).
+    #[test]
+    fn watcher_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (root, outside) = (base.join("root"), base.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let w = Watcher::new(std::slice::from_ref(&root), || {}).unwrap();
+        std::fs::write(outside.join("x.txt"), "x").unwrap();
+        // Events arrive in order: once the later write shows up, the earlier one would have.
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, "s").unwrap();
+        let seen = wait_for(&w, &sentinel);
+        assert!(
+            !seen.iter().any(|p| p.ends_with("x.txt")),
+            "followed the link: {seen:?}"
+        );
+    }
+
     #[test]
     fn check_tells_own_bytes_from_new_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -247,14 +278,17 @@ mod tests {
         let meta = std::fs::metadata(&p).unwrap();
         let fp = Fingerprint::new(&meta, b"one");
         assert_eq!(check(&p, Some(&fp)).unwrap(), OnDisk::Unchanged(fp));
-        // Same bytes rewritten (new timestamp): still ours.
-        std::thread::sleep(Duration::from_millis(5));
+        // Same bytes rewritten with a new timestamp (set explicitly: filesystem timestamps
+        // can be coarse): still ours, found by hashing.
         std::fs::write(&p, "one").unwrap();
+        bump_mtime(&p);
         assert!(matches!(
             check(&p, Some(&fp)).unwrap(),
             OnDisk::Unchanged(_)
         ));
-        std::fs::write(&p, "two").unwrap();
+        // Different bytes (of a different length, so even an unchanged timestamp shows it).
+        std::fs::write(&p, "three").unwrap();
+        bump_mtime(&p);
         assert!(matches!(check(&p, Some(&fp)).unwrap(), OnDisk::Changed(_)));
         assert!(matches!(check(&p, None).unwrap(), OnDisk::Changed(_)));
         std::fs::remove_file(&p).unwrap();

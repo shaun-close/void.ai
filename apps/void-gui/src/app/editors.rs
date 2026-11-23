@@ -289,11 +289,17 @@ impl VoidApp {
             return;
         };
         let name = file_name(&req.key.0);
+        let deleted = self.editors.is_deleted(&req.key) && !self.editors.is_dirty(&req.key);
         let mut choice = None;
         let modal = egui::Modal::new(egui::Id::unique("editor-close")).show(ctx, |ui| {
             ui.set_max_width(380.0);
-            theme::heading(ui, icon::FLOPPY, &format!("Save changes to {name}?"));
-            ui.label("Your changes will be lost if you don't save them.");
+            if deleted {
+                theme::heading(ui, icon::FLOPPY, &format!("Save {name}?"));
+                ui.label("It was deleted on disk; this tab holds the only copy.");
+            } else {
+                theme::heading(ui, icon::FLOPPY, &format!("Save changes to {name}?"));
+                ui.label("Your changes will be lost if you don't save them.");
+            }
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Enter saves, Esc cancels")

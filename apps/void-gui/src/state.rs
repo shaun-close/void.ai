@@ -56,6 +56,9 @@ pub struct UiState {
     pub active_turns: std::collections::HashSet<ConversationId>,
     /// The first pending changes of a chat ask the app to show Review.
     review_request: bool,
+    /// Workspace-relative paths a conversation's pending changes covered before or after the
+    /// latest `Changes` event: a review action may just have written them to disk.
+    touched: Vec<std::path::PathBuf>,
     reviewed: std::collections::HashSet<ConversationId>,
     /// Set by WorkspaceOpened: the layout the app should apply (None = default).
     layout: Option<Option<String>>,
@@ -87,6 +90,7 @@ impl Default for UiState {
             disk_diffs: HashMap::new(),
             active_turns: Default::default(),
             review_request: false,
+            touched: Vec::new(),
             reviewed: Default::default(),
             layout: None,
             created: None,
@@ -227,6 +231,9 @@ impl UiState {
                 if !changes.is_empty() && self.reviewed.insert(conversation) {
                     self.review_request = true;
                 }
+                let before = self.changes.get(&conversation).into_iter().flatten();
+                self.touched
+                    .extend(before.chain(&changes).map(|c| c.path.clone()));
                 self.changes.insert(conversation, changes);
                 self.diffs.retain(|(c, _), _| *c != conversation);
                 self.disk_diffs.retain(|(c, _), _| *c != conversation);
@@ -277,6 +284,10 @@ impl UiState {
     /// Replying or running tools: the chat shows Stop.
     pub fn busy(&self, id: ConversationId) -> bool {
         self.streams.contains_key(&id) || self.active_turns.contains(&id)
+    }
+
+    pub fn take_touched(&mut self) -> Vec<std::path::PathBuf> {
+        std::mem::take(&mut self.touched)
     }
 
     pub fn take_review_request(&mut self) -> bool {

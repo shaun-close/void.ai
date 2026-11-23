@@ -276,9 +276,14 @@ impl Engine {
                     self.set_cursor(h, pos);
                 }
             }
-            ("w" | "write", "" | "!") => h.save(),
-            ("wq" | "x" | "xit" | "exit", "" | "!") => {
-                h.save();
+            ("w" | "write", "") => h.save(),
+            ("w" | "write", "!") => h.save_force(),
+            ("wq" | "x" | "xit" | "exit", bang @ ("" | "!")) => {
+                if bang == "!" {
+                    h.save_force();
+                } else {
+                    h.save();
+                }
                 h.ex("q");
             }
             ("noh" | "nohl" | "nohlsearch", "") => h.highlight(None),

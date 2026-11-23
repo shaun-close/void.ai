@@ -172,12 +172,33 @@ impl Core {
         format!("\n{indent}{extra}")
     }
 
-    /// Save to `path` and say so the way Vim does.
+    /// Save to `path` and say so the way Vim does. A file someone else changed since the
+    /// buffer read it isn't overwritten (the banner asks instead); see [`Core::save_forced`].
     pub fn save(&mut self, path: &Path) -> Result<String, String> {
+        self.write(path, false)
+    }
+
+    /// `:w!` / Overwrite: save even over outside changes.
+    pub fn save_forced(&mut self, path: &Path) -> Result<String, String> {
+        self.write(path, true)
+    }
+
+    fn write(&mut self, path: &Path, force: bool) -> Result<String, String> {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Check the disk now rather than trust a watcher event to have arrived (it may be
+        // debounced, or the watcher may not be running at all).
+        if !force
+            && let Ok(OnDisk::Changed(fp)) = void_editor::check(path, self.buffer.disk.as_ref())
+            && self.kept != Some(fp)
+        {
+            self.disk = DiskState::Changed;
+            return Err(format!(
+                "\"{name}\" changed on disk since it was read: Reload, or overwrite with :w!"
+            ));
+        }
         match self.buffer.save(path) {
             Ok(()) => {
                 self.new_file = false;

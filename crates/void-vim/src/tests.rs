@@ -15,6 +15,7 @@ struct Host {
     top: usize,
     height: usize,
     saves: usize,
+    forced: usize,
     scrolls: Vec<(usize, ScrollAt)>,
     clipboard: Option<String>,
     clip_sets: Vec<String>,
@@ -31,6 +32,7 @@ impl Host {
             top: 0,
             height: 20,
             saves: 0,
+            forced: 0,
             scrolls: Vec::new(),
             clipboard: None,
             clip_sets: Vec::new(),
@@ -126,6 +128,9 @@ impl VimHost for Host {
     }
     fn save(&mut self) {
         self.saves += 1;
+    }
+    fn save_force(&mut self) {
+        self.forced += 1;
     }
     fn ex(&mut self, cmd: &str) -> bool {
         self.exs.push(cmd.to_string());
@@ -368,6 +373,19 @@ fn vim_replace_mode() {
     assert_eq!(h.text(), "Zbcdef", "one undo step for the session");
     feed(&mut e, &mut h, "u");
     assert_eq!(h.text(), "abcdef");
+}
+
+/// `:w!` and `:wq!` ask the host for a forced save (it may refuse a plain one).
+#[test]
+fn vim_ex_write_bang_forces() {
+    let (mut e, mut h) = vim("a");
+    feed(&mut e, &mut h, ":");
+    answer(&mut e, &mut h, "w!");
+    assert_eq!((h.saves, h.forced), (0, 1));
+    feed(&mut e, &mut h, ":");
+    answer(&mut e, &mut h, "wq!");
+    assert_eq!((h.saves, h.forced), (0, 2));
+    assert_eq!(h.exs, vec!["q"]);
 }
 
 #[test]

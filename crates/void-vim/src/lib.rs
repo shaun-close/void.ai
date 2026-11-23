@@ -78,6 +78,11 @@ pub trait VimHost {
     /// when the search is case-insensitive); `None` clears the highlight.
     fn highlight(&mut self, pattern: Option<String>);
     fn save(&mut self);
+    /// `:w!`: save even where a plain save would refuse (say, the file changed on disk since
+    /// it was read). Hosts without such a check can leave this as [`VimHost::save`].
+    fn save_force(&mut self) {
+        self.save();
+    }
     /// An ex command the engine does not handle itself (`e path`, `q`, `wa`, `qa`, …). Returns
     /// whether the host knew it.
     fn ex(&mut self, cmd: &str) -> bool;

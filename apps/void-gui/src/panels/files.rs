@@ -129,14 +129,28 @@ impl FilesUi {
     }
 
     /// The typed name: create or rename. On an error the field stays open and says why.
-    fn commit(&mut self, actions: &mut Vec<Action>) {
+    /// `open(path)`: an editor buffer is open at or under `path`.
+    fn commit(&mut self, actions: &mut Vec<Action>, open: impl Fn(&Path) -> bool) {
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
         let result = match &edit.kind {
             EditKind::NewFile => tree::new_file(&edit.dir, &edit.name),
             EditKind::NewFolder => tree::new_folder(&edit.dir, &edit.name),
-            EditKind::Rename(from) => tree::rename(from, &edit.name),
+            // Moving onto a path an open buffer holds (an unsaved `:e notes.md`, say) would
+            // replace that buffer. Names taken on disk are reported first.
+            EditKind::Rename(from) => {
+                tree::check_name(&edit.dir, &edit.name, Some(from)).and_then(|target| {
+                    if target != *from && open(&target) {
+                        Err(format!(
+                            "\u{201c}{}\u{201d} is open in an editor; close it first",
+                            edit.name.trim()
+                        ))
+                    } else {
+                        tree::rename(from, &edit.name)
+                    }
+                })
+            }
         };
         match result {
             Ok(path) => {
@@ -303,7 +317,10 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
         }
     });
     if commit {
-        p.files.commit(p.actions);
+        let editors = &*p.editors;
+        p.files.commit(p.actions, |target| {
+            editors.keys().any(|k| k.0.starts_with(target))
+        });
     } else if cancel {
         p.files.edit = None;
     }

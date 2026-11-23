@@ -303,3 +303,27 @@ fn tree_new_rename_delete() {
         "{status:?}"
     );
 }
+
+/// Renaming onto a path an open buffer holds (say an unsaved `:e notes.md`) would replace that
+/// buffer: refused.
+#[test]
+fn rename_refuses_target_with_open_buffer() {
+    let (t, ws) = workspace();
+    fs::write(ws.join("draft.md"), "draft\n").unwrap();
+    let mut h = harness(t.path(), &ws);
+    let notes = (ws.join("notes.md"), EditorView::Disk);
+    h.state_mut().editors.open_or_create(&notes).unwrap();
+    h.state_mut()
+        .editors
+        .doc_mut(&notes)
+        .unwrap()
+        .core
+        .replace(0..0, "typed");
+    steps(&mut h, 2);
+    menu(&mut h, "draft.md", "Rename");
+    type_text(&mut h, "notes");
+    enter(&mut h);
+    assert!(h.query_by_label_contains("open in an editor").is_some());
+    assert!(ws.join("draft.md").exists() && !ws.join("notes.md").exists());
+    assert_eq!(h.state().editors.doc(&notes).unwrap().text(), "typed");
+}

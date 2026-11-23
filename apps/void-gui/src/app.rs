@@ -1291,6 +1291,85 @@ impl Parser {
         );
     }
 
+    /// Offline: accepting an agent's changes refreshes open buffers right away, without the
+    /// file watcher (paused here): a clean buffer reloads, a dirty one gets the banner.
+    #[test]
+    fn review_accept_refreshes_open_buffers() {
+        use void_core::backend::{StopReason, StreamEvent};
+        let p = paths_tmp();
+        let proj = p.root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj = proj.canonicalize().unwrap();
+        std::fs::write(proj.join("clean.txt"), "old\n").unwrap();
+        std::fs::write(proj.join("dirty.txt"), "old\n").unwrap();
+        let write = |id: &str, path: &str, content: &str| StreamEvent::ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            arguments: format!(r#"{{"path":"{path}","content":"{content}"}}"#),
+        };
+        let scripts = vec![
+            vec![
+                write("w1", "clean.txt", "banana"),
+                write("w2", "dirty.txt", "kiwi"),
+                StreamEvent::Done(StopReason::ToolUse),
+            ],
+            vec![
+                StreamEvent::TextDelta("written".into()),
+                StreamEvent::Done(StopReason::EndTurn),
+            ],
+        ];
+        let backend: Arc<dyn void_core::backend::Backend> =
+            Arc::new(Scripted(std::sync::Mutex::new(scripts.into())));
+        let factory: void_core::engine::BackendFactory = Arc::new(move |_p, _k| backend.clone());
+        let (cfg, data) = (p.root.join("config.toml"), p.root.join("data"));
+        let open = Some(proj.clone());
+        let mut h = Harness::builder()
+            .with_size([1400.0, 860.0])
+            .with_max_steps(10)
+            .with_accessibility_check(false)
+            .build_eframe(move |cc| VoidApp::with_factory(cc, open, cfg, data, Some(factory)));
+        until(&mut h, 10, "proj", |a| a.state.workspace.name == "proj");
+        h.state_mut().disk.pause();
+        let clean = (proj.join("clean.txt"), EditorView::Disk);
+        let dirty = (proj.join("dirty.txt"), EditorView::Disk);
+        h.state_mut()
+            .open_editor(clean.0.clone(), EditorView::Disk, None);
+        h.state_mut()
+            .open_editor(dirty.0.clone(), EditorView::Disk, None);
+        h.state_mut()
+            .editors
+            .doc_mut(&dirty)
+            .unwrap()
+            .core
+            .replace(0..0, "mine ");
+        h.step();
+        let chat = h
+            .state()
+            .dock
+            .find_tab_from(|t| matches!(t, Tab::Chat { .. }))
+            .unwrap();
+        let _ = h.state_mut().dock.set_active_tab(chat);
+        h.step();
+        type_and_send(&mut h, "write both");
+        until(&mut h, 10, "changes", |a| {
+            a.state.changes.values().any(|c| c.len() == 2)
+        });
+        until(&mut h, 10, "reply", |a| a.state.streams.is_empty());
+        let conv = h.state().focused_conversation().unwrap();
+        h.state().engine.send(Command::AcceptAll {
+            conversation: conv,
+            keep_ignored: false,
+        });
+        until(&mut h, 10, "clean buffer reloaded", |a| {
+            a.editors.doc(&clean).is_some_and(|d| d.text() == "banana")
+        });
+        until(&mut h, 10, "dirty buffer flagged", |a| {
+            a.editors.doc(&dirty).is_some_and(|d| d.disk_changed())
+        });
+        assert_eq!(h.state().editors.doc(&dirty).unwrap().text(), "mine old");
+        assert_eq!(std::fs::read_to_string(&dirty.0).unwrap(), "kiwi");
+    }
+
     fn paths_tmp() -> Paths {
         let t = tempfile::tempdir().unwrap();
         Paths {
