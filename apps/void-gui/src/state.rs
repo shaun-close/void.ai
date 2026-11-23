@@ -317,6 +317,9 @@ impl UiState {
                 });
             }
             Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
+            // The status bar's Claude Code model display comes with the GUI task.
+            Event::ClaudeInit { .. } => {}
+            Event::TurnStatus { status, .. } => self.info(status),
         }
     }
 

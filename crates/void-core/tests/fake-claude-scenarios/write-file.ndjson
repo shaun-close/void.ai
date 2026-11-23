@@ -1,0 +1,7 @@
+# Claude Code edits a.txt in its working directory, then answers.
+{"type":"system","subtype":"init","session_id":"sess-w","model":"claude-fake"}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_w","name":"Write","input":{"file_path":"a.txt","content":"from claude"}}]}}
+#write a.txt from claude
+{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_w","content":"File written","is_error":false}]}}
+{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"Wrote a.txt."}],"usage":{"input_tokens":30,"output_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"sess-w","result":"Wrote a.txt.","usage":{"input_tokens":60,"output_tokens":8}}

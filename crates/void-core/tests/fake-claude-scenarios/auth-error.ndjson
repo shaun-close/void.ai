@@ -1,0 +1,4 @@
+# Not signed in: the API call fails with authentication_failed.
+{"type":"system","subtype":"init","session_id":"sess-a","model":"claude-fake"}
+{"type":"assistant","parent_tool_use_id":null,"error":"authentication_failed","message":{"role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]}}
+{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","usage":{"input_tokens":0,"output_tokens":0}}

@@ -1,0 +1,5 @@
+# Dies without a result.
+{"type":"system","subtype":"init","session_id":"sess-c","model":"claude-fake"}
+#stderr something went badly wrong
+#stderr fatal: the fake crashed
+#exit 2

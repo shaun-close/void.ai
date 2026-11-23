@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent;
 use crate::backend::{Backend, BackendError, StreamEvent, make_backend};
+use crate::claude_code::turn::{self as cc, NoPrompts, PermissionBridge, TurnUpdate};
 use crate::config::{BackendKind, Config, Profile, load_config, resolve_api_key, save_config};
 use crate::context::{build_request, estimate_tokens};
 use crate::context::{compaction_split, needs_compaction};
@@ -30,6 +31,9 @@ use crate::permissions::{Action, ApprovalRequest, Decision, Permissions};
 use crate::sandbox::{Availability, Sandbox};
 use crate::store::{Store, WorkspaceEntry};
 use crate::tools::{Registry, ToolCtx, ToolOutput};
+
+mod claude;
+use claude::ClaudeRun;
 
 /// Called after every event, so a UI can wake up (the GUI requests a repaint).
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -214,15 +218,30 @@ pub enum Event {
         path: PathBuf,
         error: String,
     },
+    /// A Claude Code turn started its session: the model Claude Code is using (for the status
+    /// bar; empty when it didn't say).
+    ClaudeInit {
+        conversation: ConversationId,
+        model: String,
+    },
+    /// What a running turn is doing when it isn't streaming (waiting for the sandbox, Claude
+    /// Code retrying the API, …). Not an error.
+    TurnStatus {
+        conversation: ConversationId,
+        status: String,
+    },
 }
 
 /// Knobs for embedding the engine (tests lower the step limit and skip the sandbox).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineOptions {
     /// Tool rounds per turn before the agent is stopped.
     pub step_limit: u32,
     /// Set up the bash sandbox (false: bash reports it's unavailable).
     pub sandbox: bool,
+    /// The home directory the sandbox (and Claude Code's state) is based on; None = `$HOME`.
+    /// Tests point it at a dummy home.
+    pub home: Option<PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -230,6 +249,7 @@ impl Default for EngineOptions {
         Self {
             step_limit: 50,
             sandbox: true,
+            home: None,
         }
     }
 }
@@ -272,6 +292,11 @@ impl Engine {
             .expect("couldn't start the engine runtime");
         let (tx, rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = std_mpsc::channel();
+        let home = options.home.clone().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+        });
         let state = State {
             config_path,
             config: Config::default(),
@@ -291,6 +316,9 @@ impl Engine {
             approvals: HashMap::new(),
             next_approval: 1,
             options,
+            home,
+            claude: HashMap::new(),
+            claude_bridge: Arc::new(NoPrompts),
         };
         runtime.spawn(state.run(rx));
         EngineHandle {
@@ -358,6 +386,12 @@ enum Msg {
     },
     /// The grace period after Stop is over: abort whatever is still running.
     ForceEnd(ConversationId),
+    /// From a Claude Code turn's task.
+    Claude {
+        conversation: ConversationId,
+        generation: u64,
+        update: TurnUpdate,
+    },
 }
 
 enum ToolMsg {
@@ -435,6 +469,10 @@ struct State {
     approvals: HashMap<u64, (ConversationId, oneshot::Sender<Decision>)>,
     next_approval: u64,
     options: EngineOptions,
+    /// The home the sandbox (and Claude Code's state) is based on.
+    home: PathBuf,
+    claude: HashMap<ConversationId, ClaudeRun>,
+    claude_bridge: Arc<dyn PermissionBridge>,
 }
 
 const TITLE_CHARS: usize = 40;
@@ -458,6 +496,10 @@ impl State {
             match msg {
                 Msg::Cmd(cmd) => self.command(cmd),
                 Msg::Shutdown(ack) => {
+                    let runs: Vec<_> = self.claude.keys().copied().collect();
+                    for id in runs {
+                        self.stop_claude(id);
+                    }
                     let ids: Vec<_> = self.streams.keys().copied().collect();
                     for id in ids {
                         if let Some(s) = self.streams.get(&id) {
@@ -491,6 +533,11 @@ impl State {
                     self.approvals.insert(req.id, (req.conversation, reply));
                     self.emit(Event::ApprovalNeeded(req));
                 }
+                Msg::Claude {
+                    conversation,
+                    generation,
+                    update,
+                } => self.claude_update(conversation, generation, update),
                 Msg::ForceEnd(id) => {
                     if self.turns.get(&id).is_some_and(|t| t.stopping) {
                         self.finalize_turn(id);
@@ -511,12 +558,9 @@ impl State {
     }
 
     fn make_sandbox(&self) -> Sandbox {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
         Sandbox::new(
             self.store.data_dir().to_path_buf(),
-            home,
+            self.home.clone(),
             self.config.sandbox.clone(),
         )
     }
@@ -571,7 +615,8 @@ impl State {
             self.emit(Event::Conversation(c.clone()));
         }
         let c = &c;
-        let tools = ws.root.is_some() && self.agent_for(c).is_some_and(|a| !a.tools.is_empty());
+        let tools = ws.root.is_some()
+            && (self.is_claude(c) || self.agent_for(c).is_some_and(|a| !a.tools.is_empty()));
         if tools
             && let Some(ov) = self.overlay_for(&ws, c.id)
             && let Err(e) = ov.checkpoint()
@@ -889,6 +934,21 @@ impl State {
     }
 
     fn command(&mut self, cmd: Command) {
+        let review = matches!(
+            cmd,
+            Command::AcceptFile { .. }
+                | Command::RejectFile { .. }
+                | Command::AcceptHunk { .. }
+                | Command::RejectHunk { .. }
+                | Command::AcceptAll { .. }
+                | Command::RejectAll(_)
+        );
+        // A running Claude Code turn has this workspace mounted under its overlay: changing
+        // the real files beneath it (or its upper layer) isn't safe until it's gone.
+        if review && self.claude_running_in(&self.workspace.id) {
+            self.emit(Event::Error(cc::BUSY.into()));
+            return;
+        }
         match cmd {
             Command::OpenWorkspace(None) => self.open_workspace(Workspace::scratch()),
             Command::OpenWorkspace(Some(path)) => match self.store.workspace_for(&path) {
@@ -920,6 +980,9 @@ impl State {
             Command::DeleteConversation(id) => {
                 if let Some(s) = self.streams.remove(&id) {
                     s.abort.abort();
+                }
+                if let Some(run) = self.claude.remove(&id) {
+                    run.cancel.cancel();
                 }
                 self.finalize_turn(id);
                 let ws = self
@@ -979,9 +1042,12 @@ impl State {
                 self.emit(Event::Conversation(c.clone()));
                 self.emit_changes(&ws, id);
                 let c = self.begin_turn(&c);
-                self.start_stream(c, StreamMode::Reply);
+                self.reply(c, true);
             }
             Command::Stop(id) => {
+                if self.stop_claude(id) {
+                    return;
+                }
                 if let Some(s) = self.streams.get(&id) {
                     s.abort.abort();
                     self.finish(id, true);
@@ -1090,7 +1156,16 @@ impl State {
                 });
             }
             Command::Compact(id) => {
-                if self.streams.contains_key(&id) || self.turns.contains_key(&id) {
+                if self
+                    .conversation(id)
+                    .cloned()
+                    .is_some_and(|c| self.is_claude(&c))
+                {
+                    self.emit(Event::Info(
+                        "Claude Code manages its own context; there's nothing to compact here."
+                            .into(),
+                    ));
+                } else if self.streams.contains_key(&id) || self.turns.contains_key(&id) {
                     self.emit(Event::Error(
                         "Wait for the reply to finish before compacting.".into(),
                     ));
@@ -1139,9 +1214,10 @@ impl State {
                 let factory = self.factory.clone();
                 let events = self.events.clone();
                 let notify = self.notify.clone();
+                let home = self.home.clone();
                 tokio::spawn(async move {
                     let result = if profile.kind == BackendKind::ClaudeCode {
-                        claude_version(profile.claude_command())
+                        claude_version(profile.claude_command(), &home)
                             .await
                             .map(|v| vec![v])
                     } else {
@@ -1186,6 +1262,10 @@ impl State {
             fail(self, path, error);
             return;
         };
+        if self.claude.contains_key(&id) {
+            fail(self, path, cc::BUSY.into());
+            return;
+        }
         if self.busy(id) {
             let error = "void is working in this chat — save to Disk, or wait".into();
             fail(self, path, error);
@@ -1259,7 +1339,12 @@ impl State {
         if let Err(e) = self.store.touch(&ws) {
             self.emit(Event::Error(format!("Couldn't record the workspace: {e}")));
         }
-        let streaming: Vec<_> = self.streams.keys().copied().collect();
+        let streaming: Vec<_> = self
+            .streams
+            .keys()
+            .chain(self.claude.keys())
+            .copied()
+            .collect();
         self.convs.retain(|id, _| streaming.contains(id));
         let (conversations, warnings) = self.store.list(&ws.id);
         let layout = self.store.load_layout(&ws.id);
@@ -1339,11 +1424,23 @@ impl State {
         self.emit(Event::Conversation(c.clone()));
         self.emit_list();
         let c = self.begin_turn(&c);
-        self.start_stream(c, StreamMode::Reply);
+        self.reply(c, false);
     }
 
     /// Ask the conversation's backend for the next reply (compacting first when needed).
     fn start_stream(&mut self, c: Conversation, mode: StreamMode) {
+        // Safety net: Claude Code chats never reach a backend (or void's compaction). Turns
+        // start through `reply`; this is only reached if the chat switched to Claude Code in
+        // the middle of one of void's own turns, which then ends here.
+        if self.is_claude(&c) {
+            if mode == StreamMode::Reply {
+                self.emit(Event::Error(
+                    "This chat now uses Claude Code; send your message again to continue.".into(),
+                ));
+                self.end_turn(c.id);
+            }
+            return;
+        }
         let id = c.id;
         let profile_id = c
             .profile_id
@@ -1617,7 +1714,7 @@ impl State {
         c.updated = Utc::now();
         let c = c.clone();
         self.save(&c);
-        if c.workspace_id != current {
+        if c.workspace_id != current && !self.claude.contains_key(&id) {
             self.convs.remove(&id);
         }
         Some(c)
@@ -1645,9 +1742,14 @@ fn error_text(e: &BackendError) -> String {
 
 /// `<command> --version` outside the sandbox, for the Backends panel's Test. Never passes a
 /// prompt, so it costs no tokens.
-async fn claude_version(command: &str) -> Result<String, String> {
-    let missing = || format!("`{command}` not found \u{2014} install Claude Code");
-    let mut cmd = tokio::process::Command::new(command);
+async fn claude_version(command: &str, home: &std::path::Path) -> Result<String, String> {
+    let program = cc::resolve_command(command, home)?;
+    let missing = || {
+        format!(
+            "`{command}` not found \u{2014} install Claude Code or set the full path in the profile's Command"
+        )
+    };
+    let mut cmd = tokio::process::Command::new(&program);
     cmd.arg("--version")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -2413,6 +2515,7 @@ mod tests {
             EngineOptions {
                 step_limit,
                 sandbox: false,
+                home: None,
             },
         );
         let mut r = Rig {
@@ -3241,6 +3344,7 @@ mod tests {
             EngineOptions {
                 step_limit: 50,
                 sandbox: true,
+                home: None,
             },
         );
         let mut r = Rig {

@@ -1,8 +1,9 @@
 //! Claude Code backend building blocks: CLI arguments, stdin lines, and stdout parsing.
-//! Pure and UI-free; the process engine lives elsewhere.
+//! UI-free; `turn` runs one chat turn's `claude` process for the engine.
 
 pub mod args;
 pub mod stream;
+pub mod turn;
 
 pub use args::{SessionMode, TurnArgs, build_args};
 pub use stream::{

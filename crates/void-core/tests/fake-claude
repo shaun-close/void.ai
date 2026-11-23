@@ -13,6 +13,7 @@ Scenario lines: JSON is written to stdout verbatim; directives start with `#`:
   #sleep <ms>        pause
   #stderr <text>     write text to stderr
   #exit <code>       exit immediately with that code
+  #write <path> <text>  write text (plus a newline) to path, relative to the cwd
   # anything else    comment (also blank lines are skipped)
 Ends with exit 0 when the scenario is exhausted.
 """
@@ -79,6 +80,10 @@ def main():
         elif raw.startswith("#stderr"):
             sys.stderr.write(raw[len("#stderr"):].lstrip() + "\n")
             sys.stderr.flush()
+        elif raw.startswith("#write"):
+            _, path, text = raw.split(" ", 2)
+            with open(path, "w") as f:
+                f.write(text + "\n")
         elif raw.startswith("#exit"):
             parts = raw.split()
             return int(parts[1]) if len(parts) > 1 else 0

@@ -1,0 +1,6 @@
+# Streams a little, then hangs (until killed).
+{"type":"system","subtype":"init","session_id":"sess-s","model":"claude-fake"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial "}},"parent_tool_use_id":null}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}},"parent_tool_use_id":null}
+#sleep 30000
+{"type":"result","subtype":"success","is_error":false,"result":"never"}

@@ -150,6 +150,10 @@ pub struct Conversation {
     /// The agent profile (build, plan…); None follows the default agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The Claude Code session this chat resumes (Claude Code profiles); None until its first
+    /// Claude Code turn has started one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<Uuid>,
     pub messages: Vec<Message>,
 }
 
@@ -166,6 +170,7 @@ impl Conversation {
             updated: now,
             profile_id: None,
             agent: None,
+            claude_session: None,
             messages: Vec::new(),
         }
     }
@@ -253,5 +258,17 @@ mod tests {
         v.as_object_mut().unwrap().remove("agent");
         let back: Conversation = serde_json::from_value(v).unwrap();
         assert_eq!(back.agent, None);
+    }
+
+    #[test]
+    fn conversation_without_claude_session_loads() {
+        let mut c = Conversation::new(Workspace::scratch().id);
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v.get("claude_session").is_none(), "None isn't written");
+        let back: Conversation = serde_json::from_value(v).unwrap();
+        assert_eq!(back.claude_session, None);
+        c.claude_session = Some(Uuid::now_v7());
+        let back: Conversation = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
     }
 }
