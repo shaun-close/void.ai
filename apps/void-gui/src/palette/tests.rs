@@ -664,3 +664,122 @@ fn palette_recent_skips_chat_views() {
     h.step();
     assert_eq!(tabs(h.state()), before);
 }
+
+/// The whole runner path through the real app and engine: a saved run config "check" and an
+/// env profile, started from the palette with `!check`, run by real moon on this repo.
+/// Not part of the normal gate: it runs `moon run workspace:format` and `workspace:lint`
+/// (clippy; minutes) and needs moon on PATH (proto's shim). Run with:
+/// `cargo test -p void-gui live_palette_runs_check_config -- --ignored --nocapture`
+#[test]
+#[ignore = "needs moon (proto); runs cargo fmt and clippy on void.ai (minutes)"]
+fn live_palette_runs_check_config() {
+    use void_core::engine::Command;
+    use void_core::runner::{
+        EnvProfile, EnvValue, Envs, Group, OnFailure, RunConfig, Runs, Step, StepConfig,
+    };
+
+    if std::process::Command::new("moon")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("moon is not on PATH; skipping");
+        return;
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    // Config and data (runs.toml, env.toml) live in a temp dir, never the user's own.
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, data) = (tmp.path().join("config.toml"), tmp.path().join("data"));
+    let open = Some(repo.clone());
+    let mut h = Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_max_steps(10)
+        .with_accessibility_check(false)
+        .build_eframe(move |cc| VoidApp::new(cc, open, cfg, data));
+    let want = repo.clone();
+    until(&mut h, "repo workspace and its runs", |a| {
+        a.state.workspace.root.as_deref() == Some(want.as_path()) && a.state.runner_loaded
+    });
+
+    // Saved through the engine's SaveRuns/SaveEnvs (what the Runs panel's editor sends);
+    // driving the editor's widgets adds nothing the panel's own tests don't cover.
+    let step = |step| StepConfig {
+        step,
+        on_failure: OnFailure::Stop,
+    };
+    let check = RunConfig::new(
+        "check",
+        vec![
+            step(Step::Moon {
+                target: "workspace:format".into(),
+                args: vec![],
+            }),
+            step(Step::Moon {
+                target: "workspace:lint".into(),
+                args: vec![],
+            }),
+            // The label never contains the value, so finding it in the output means the
+            // step's process saw the profile's variable.
+            step(Step::Shell {
+                command: "echo \"level=$RUST_LOG\"".into(),
+            }),
+        ],
+    );
+    h.state().engine.send(Command::SaveRuns(Runs {
+        groups: vec![Group {
+            name: "g".into(),
+            configs: vec![check],
+        }],
+    }));
+    h.state().engine.send(Command::SaveEnvs(Envs {
+        active: Some("dev".into()),
+        profiles: vec![EnvProfile {
+            name: "dev".into(),
+            vars: [("RUST_LOG".to_string(), EnvValue::Value("debug".into()))].into(),
+        }],
+    }));
+    until(&mut h, "runs and envs saved", |a| {
+        a.state.runs.groups.len() == 1 && a.state.envs.profiles.len() == 1
+    });
+
+    shift_shift(&mut h);
+    assert!(h.state().palette.is_open());
+    text(&mut h, "!check");
+    h.key_press(Key::Enter);
+    h.step();
+    assert!(!h.state().palette.is_open(), "Enter closes the palette");
+
+    // Real moon, real clippy: generous bound.
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let run = loop {
+        h.step();
+        if let Some((id, _)) = h
+            .state()
+            .state
+            .run_views
+            .iter()
+            .find(|(_, v)| v.finished.is_some())
+        {
+            break *id;
+        }
+        assert!(Instant::now() < deadline, "the run did not finish in time");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let v = &h.state().state.run_views[&run];
+    let out = v.term.plain_text();
+    let fin = v.finished.as_ref().unwrap();
+    assert_eq!(v.name, "check");
+    assert!(fin.ok, "run failed: {:?}\n{out}", fin.error);
+    assert_eq!(v.steps, 3);
+    assert!(
+        out.contains("level=debug"),
+        "the dev profile's variable reached the shell step:\n{out}"
+    );
+    assert!(
+        h.state().dock.find_tab(&Tab::RunOutput { run }).is_some(),
+        "the run has an output tab"
+    );
+}
