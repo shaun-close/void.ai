@@ -818,15 +818,15 @@ fn e2e_editor_round_trip() {
     let original = include_bytes!("../../../../crates/void-core/src/model.rs");
     std::fs::write(&file, original).unwrap();
     let before = String::from_utf8(original.to_vec()).unwrap();
-    let first = before.find("Conversation").expect("a match");
-    let line_no = before[..first].matches('\n').count();
-    let old_line = before.lines().nth(line_no).unwrap().to_string();
-    // `ciw` replaces the whole word the cursor is in (`ConversationId` here).
-    let start = old_line.find("Conversation").unwrap();
-    let end = old_line[start..]
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(old_line.len(), |n| start + n);
-    let new_line = format!("{}Thread{}", &old_line[..start], &old_line[end..]);
+    // `ciw` replaces the whole word around the first match (`ConversationId` here).
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let hit = before.find("Conversation").expect("a match");
+    let start = before[..hit].rfind(|c| !word(c)).map_or(0, |n| n + 1);
+    let end = hit
+        + before[hit..]
+            .find(|c| !word(c))
+            .unwrap_or(before.len() - hit);
+    let expected = format!("{}Thread{}", &before[..start], &before[end..]);
 
     let mut h = harness(dir.path());
     h.state_mut()
@@ -847,17 +847,11 @@ fn e2e_editor_round_trip() {
     text(&mut h, ":w");
     h.key_press(Key::Enter);
     h.step();
-    let changed = std::fs::read_to_string(&file).unwrap();
-    let want: Vec<&str> = before.lines().collect();
-    let got: Vec<&str> = changed.lines().collect();
-    assert_eq!(got.len(), want.len());
-    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        if i == line_no {
-            assert_eq!(*g, new_line, "the first match changed");
-        } else {
-            assert_eq!(g, w, "line {i} untouched");
-        }
-    }
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        expected.as_bytes(),
+        "the first match changed, every other byte untouched"
+    );
 
     text(&mut h, "u");
     text(&mut h, ":w");
