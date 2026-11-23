@@ -809,3 +809,63 @@ fn closing_deleted_on_disk_buffer_asks() {
     assert!(editor_tabs(h.state()).is_empty());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me\n");
 }
+
+/// End to end on a real source file: search, change a word, write, undo, write again.
+#[test]
+fn e2e_editor_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("model.rs");
+    let original = include_bytes!("../../../../crates/void-core/src/model.rs");
+    std::fs::write(&file, original).unwrap();
+    let before = String::from_utf8(original.to_vec()).unwrap();
+    let first = before.find("Conversation").expect("a match");
+    let line_no = before[..first].matches('\n').count();
+    let old_line = before.lines().nth(line_no).unwrap().to_string();
+    // `ciw` replaces the whole word the cursor is in (`ConversationId` here).
+    let start = old_line.find("Conversation").unwrap();
+    let end = old_line[start..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(old_line.len(), |n| start + n);
+    let new_line = format!("{}Thread{}", &old_line[..start], &old_line[end..]);
+
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "/Conversation");
+    h.key_press(Key::Enter);
+    h.step();
+    text(&mut h, "ciwThread");
+    h.key_press(Key::Escape);
+    h.step();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        before,
+        "nothing written before :w"
+    );
+    text(&mut h, ":w");
+    h.key_press(Key::Enter);
+    h.step();
+    let changed = std::fs::read_to_string(&file).unwrap();
+    let want: Vec<&str> = before.lines().collect();
+    let got: Vec<&str> = changed.lines().collect();
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        if i == line_no {
+            assert_eq!(*g, new_line, "the first match changed");
+        } else {
+            assert_eq!(g, w, "line {i} untouched");
+        }
+    }
+
+    text(&mut h, "u");
+    text(&mut h, ":w");
+    h.key_press(Key::Enter);
+    h.step();
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        original,
+        "undo and :w restore the exact bytes"
+    );
+}

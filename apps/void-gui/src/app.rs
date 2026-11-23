@@ -1502,6 +1502,17 @@ impl Parser {
             .unwrap()
             .save(out.join("editor-chat-view.png"))
             .unwrap();
+
+        // The same editor tab in a narrow window.
+        h.set_size(egui::vec2(560.0, 860.0));
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render()
+            .unwrap()
+            .save(out.join("editor-narrow.png"))
+            .unwrap();
+        h.set_size(egui::vec2(1400.0, 860.0));
     }
 
     /// Offline: an approval card's "Allow once" sends Approve; the engine answers with
