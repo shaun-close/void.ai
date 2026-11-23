@@ -160,9 +160,10 @@ impl RwBind {
 }
 
 /// A long-lived process (a coding agent CLI for one chat turn). Besides what [`RunPlan`]
-/// gives a command, `$HOME` gets a throwaway writable layer (bwrap `--tmp-overlay`, gone when
-/// the process exits) so the program can keep lock and temp files next to its state;
-/// `rw_binds` sit on top of that layer and are written through to the host.
+/// gives a command, `$HOME` gets a throwaway writable layer (built per entry, see
+/// `home_layer_args`; gone when the process exits) so the program can keep lock and temp
+/// files next to its state; `rw_binds` sit on top of that layer and are written through to
+/// the host.
 #[derive(Clone, Debug)]
 pub struct SpawnPlan {
     /// `None` for Scratch: a read-only view, plus `rw_binds` and `cwd` bound writable.
@@ -566,7 +567,12 @@ impl Sandbox {
         self.args_base(&mut a);
         // Throwaway writable home: writes land in an invisible tmpfs, gone with the process.
         let h = home.as_os_str();
-        a.push(&["--overlay-src".as_ref(), h, "--tmp-overlay".as_ref(), h]);
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|m| mount_points(&m))
+            .unwrap_or_default();
+        a.extend(&home_layer_args(&home, &mounts, &mut |d| {
+            list_dir(d, &mounts)
+        }));
         let caches = self.caches();
         self.args_caches(&mut a, &caches);
         if let Some(o) = &plan.overlay {
@@ -911,6 +917,119 @@ fn watch_teardown(
 
 /// `p` with symlinks resolved as far as it exists (the rest appended as written), so paths
 /// that `spawn` hasn't created yet can still be compared.
+/// What the home layer needs to know about one directory entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HomeEntry {
+    Dir,
+    File,
+    Symlink(PathBuf),
+    /// Sockets, fifos, devices, and anything that couldn't be read.
+    Other,
+}
+
+/// Mount points listed in `/proc/self/mountinfo` (field 5, with `\ooo` escapes undone).
+fn mount_points(mountinfo: &str) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    mountinfo
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .map(|m| {
+            let b = m.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                let oct = b
+                    .get(i + 1..i + 4)
+                    .filter(|o| b[i] == b'\\' && o.iter().all(|c| (b'0'..=b'7').contains(c)));
+                match oct {
+                    Some(o) => {
+                        out.push(o.iter().fold(0u8, |n, c| n.wrapping_mul(8) + (c - b'0')));
+                        i += 4;
+                    }
+                    None => {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            }
+            PathBuf::from(OsString::from_vec(out))
+        })
+        .collect()
+}
+
+/// A directory's entries, sorted, without following anything. Mount points are reported as
+/// directories without being looked at (an autofs mount must not be triggered, and a dead
+/// NFS server must not hang the spawn); the home layer skips them anyway.
+fn list_dir(dir: &Path, mounts: &[PathBuf]) -> Vec<(OsString, HomeEntry)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(OsString, HomeEntry)> = rd
+        .flatten()
+        .map(|e| {
+            let path = e.path();
+            let kind = if mounts.contains(&path) {
+                HomeEntry::Dir
+            } else {
+                match e.file_type() {
+                    Ok(t) if t.is_symlink() => std::fs::read_link(&path)
+                        .map(HomeEntry::Symlink)
+                        .unwrap_or(HomeEntry::Other),
+                    Ok(t) if t.is_dir() => HomeEntry::Dir,
+                    Ok(t) if t.is_file() => HomeEntry::File,
+                    _ => HomeEntry::Other,
+                }
+            };
+            (e.file_name(), kind)
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// The throwaway home layer's bwrap arguments, built per entry because unprivileged overlayfs
+/// refuses a lower directory with any mount beneath it (EINVAL, "failed to clone lowerpath"):
+/// a tmpfs on `home`; each directory without mounts at or below it gets its own throwaway
+/// overlay; directories holding mounts are recreated and walked the same way; mount points
+/// stay empty directories (never listed or looked at); files are read-only binds; symlinks are
+/// recreated; anything else is left out. `list` gives a directory's entries.
+fn home_layer_args(
+    home: &Path,
+    mounts: &[PathBuf],
+    list: &mut dyn FnMut(&Path) -> Vec<(OsString, HomeEntry)>,
+) -> Vec<OsString> {
+    fn walk(
+        dir: &Path,
+        mounts: &[PathBuf],
+        list: &mut dyn FnMut(&Path) -> Vec<(OsString, HomeEntry)>,
+        out: &mut Vec<OsString>,
+    ) {
+        for (name, kind) in list(dir) {
+            let p = dir.join(name);
+            let o = p.clone().into_os_string();
+            if mounts.contains(&p) {
+                out.extend(["--dir".into(), o]);
+                continue;
+            }
+            match kind {
+                HomeEntry::Dir if mounts.iter().any(|m| m.starts_with(&p)) => {
+                    out.extend(["--dir".into(), o]);
+                    walk(&p, mounts, list, out);
+                }
+                HomeEntry::Dir => {
+                    out.extend(["--overlay-src".into(), o.clone(), "--tmp-overlay".into(), o])
+                }
+                HomeEntry::File => out.extend(["--ro-bind".into(), o.clone(), o]),
+                HomeEntry::Symlink(t) => out.extend(["--symlink".into(), t.into_os_string(), o]),
+                HomeEntry::Other => {}
+            }
+        }
+    }
+    let mut out = vec!["--tmpfs".into(), home.as_os_str().to_os_string()];
+    walk(home, mounts, list, &mut out);
+    out
+}
+
 fn resolve(p: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut cur = p;
@@ -992,6 +1111,87 @@ mod tests {
     fn pos(args: &[String], seq: &[&str]) -> Option<usize> {
         args.windows(seq.len())
             .position(|w| w.iter().zip(seq).all(|(a, b)| a == b))
+    }
+
+    /// A mount under HOME (here `~/shares/nas`) must not be under any overlay's lower dir:
+    /// unprivileged overlayfs refuses a lower dir with mounts beneath it (EINVAL).
+    #[test]
+    fn home_layer_skips_mounts_and_recurses() {
+        let home = Path::new("/home/u");
+        let mounts: Vec<PathBuf> = ["/", "/home", "/home/u/shares/nas", "/home/u/mnt"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let mut seen = Vec::new();
+        let mut list = |d: &Path| {
+            seen.push(d.to_path_buf());
+            let e = |n: &str, k: HomeEntry| (OsString::from(n), k);
+            match d.to_str().unwrap() {
+                "/home/u" => vec![
+                    e(".bashrc", HomeEntry::File),
+                    e(".config", HomeEntry::Dir),
+                    e("link", HomeEntry::Symlink("/opt/x".into())),
+                    e("mnt", HomeEntry::Dir),
+                    e("shares", HomeEntry::Dir),
+                    e("sock", HomeEntry::Other),
+                ],
+                "/home/u/shares" => vec![
+                    e("nas", HomeEntry::Dir),
+                    e("notes.txt", HomeEntry::File),
+                    e("old", HomeEntry::Dir),
+                ],
+                other => panic!("listed {other}"),
+            }
+        };
+        let a = strs(&home_layer_args(home, &mounts, &mut list));
+        let want: Vec<&str> = vec![
+            "--tmpfs",
+            "/home/u",
+            "--ro-bind",
+            "/home/u/.bashrc",
+            "/home/u/.bashrc",
+            "--overlay-src",
+            "/home/u/.config",
+            "--tmp-overlay",
+            "/home/u/.config",
+            "--symlink",
+            "/opt/x",
+            "/home/u/link",
+            "--dir",
+            "/home/u/mnt",
+            "--dir",
+            "/home/u/shares",
+            "--dir",
+            "/home/u/shares/nas",
+            "--ro-bind",
+            "/home/u/shares/notes.txt",
+            "/home/u/shares/notes.txt",
+            "--overlay-src",
+            "/home/u/shares/old",
+            "--tmp-overlay",
+            "/home/u/shares/old",
+        ];
+        assert_eq!(a, want);
+        assert_eq!(
+            seen,
+            [home.to_path_buf(), home.join("shares")],
+            "mounts never listed"
+        );
+    }
+
+    #[test]
+    fn mountinfo_mount_points_unescaped() {
+        let mi = "36 35 98:0 / / rw - ext4 /dev/root rw\n\
+                  40 36 0:50 / /home/u/my\\040share rw - nfs4 nas:/x rw\n\
+                  41 36 0:51 / /home/u/back\\134slash rw - tmpfs t rw\n";
+        assert_eq!(
+            mount_points(mi),
+            [
+                PathBuf::from("/"),
+                PathBuf::from("/home/u/my share"),
+                PathBuf::from("/home/u/back\\slash")
+            ]
+        );
     }
 
     #[test]
@@ -1317,9 +1517,25 @@ mod tests {
             p(&home.join(".claude")),
             p(&home.join(".claude.json")),
         );
-        let layer = pos(&a, &["--overlay-src", &h, "--tmp-overlay", &h]).expect("home layer");
-        let cache = pos(&a, &["--overlay-src", &p(&home.join(".cargo/registry"))]).unwrap();
-        let ovl = pos(&a, &["--overlay-src", &p(&home.join("proj"))]).unwrap();
+        let layer = pos(&a, &["--tmpfs", &h]).expect("home layer");
+        let proj = p(&home.join("proj"));
+        let state = pos(&a, &["--overlay-src", &claude, "--tmp-overlay", &claude]).unwrap();
+        let state_file = pos(&a, &["--ro-bind", &cj, &cj]).unwrap();
+        let cache = pos(
+            &a,
+            &[
+                "--overlay-src",
+                &p(&home.join(".cargo/registry")),
+                "--overlay",
+            ],
+        );
+        let cache = cache.unwrap();
+        let ovl = pos(&a, &["--overlay-src", &proj, "--overlay"]).unwrap();
+        let proj_layer = pos(&a, &["--overlay-src", &proj, "--tmp-overlay", &proj]).unwrap();
+        assert!(
+            layer < state && state < state_file && state_file < proj_layer && proj_layer < cache,
+            "the home layer, per entry, before everything else"
+        );
         let b1 = pos(&a, &["--bind", &claude, &claude]).expect("~/.claude rw");
         let b2 = pos(&a, &["--bind", &cj, &cj]).expect("~/.claude.json rw");
         assert!(
@@ -1388,8 +1604,16 @@ mod tests {
         let s = scratch.to_string_lossy().into_owned();
         let ws = tmp.path().join("home/proj").canonicalize().unwrap();
         assert!(
-            pos(&a, &["--overlay-src", &ws.to_string_lossy()]).is_none(),
+            pos(&a, &["--overlay-src", &ws.to_string_lossy(), "--overlay"]).is_none(),
             "no workspace overlay"
+        );
+        assert!(
+            pos(
+                &a,
+                &["--overlay-src", &ws.to_string_lossy(), "--tmp-overlay"]
+            )
+            .is_some(),
+            "just its throwaway home layer"
         );
         assert!(!a.iter().any(|x| x == "CARGO_TARGET_DIR"));
         let ssh_dir = tmp.path().join("home/.ssh").canonicalize().unwrap();

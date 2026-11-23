@@ -418,6 +418,44 @@ async fn spawn_home_layer_is_throwaway() {
     );
 }
 
+/// The home layer is built per entry: nested directories are writable but throwaway, files at
+/// the top of HOME are read-only, symlinks resolve, new files at the top are throwaway.
+#[tokio::test]
+async fn spawn_home_layer_per_entry() {
+    let Some(r) = home_rig(&[]).await else { return };
+    fs::create_dir_all(r.home.join("dir/sub")).unwrap();
+    fs::write(r.home.join("dir/sub/f.txt"), "deep\n").unwrap();
+    fs::write(r.home.join("top.txt"), "top\n").unwrap();
+    std::os::unix::fs::symlink("dir/sub", r.home.join("rel")).unwrap();
+    std::os::unix::fs::symlink(r.home.join("dir"), r.home.join("abs")).unwrap();
+    let (code, out) = r
+        .script(
+            r#"cd "$HOME"
+               echo new > dir/sub/new && cat dir/sub/new
+               echo more >> dir/sub/f.txt && echo deep-write=ok
+               echo more >> top.txt 2>/dev/null; echo top-write=$?
+               cat top.txt rel/f.txt abs/sub/f.txt
+               echo n > newtop && echo newtop=ok"#,
+            true,
+        )
+        .await;
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("new\ndeep-write=ok"), "{out}");
+    assert!(
+        !out.contains("top-write=0"),
+        "top-level files are read-only: {out}"
+    );
+    assert!(out.contains("top\ndeep\nmore\ndeep\nmore\n"), "{out}");
+    assert!(out.contains("newtop=ok"), "{out}");
+    assert_eq!(fs::read_to_string(r.home.join("top.txt")).unwrap(), "top\n");
+    assert_eq!(
+        fs::read_to_string(r.home.join("dir/sub/f.txt")).unwrap(),
+        "deep\n"
+    );
+    assert!(!r.home.join("dir/sub/new").exists());
+    assert!(!r.home.join("newtop").exists());
+}
+
 #[tokio::test]
 async fn spawn_claude_state_written_in_place() {
     let Some(r) = home_rig(&[]).await else { return };
