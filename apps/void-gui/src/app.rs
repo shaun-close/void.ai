@@ -68,6 +68,8 @@ pub struct VoidApp {
     pub(crate) palette: crate::palette::PaletteUi,
     /// Watches raw input for a double tap of Shift.
     shift: crate::palette::DoubleShift,
+    /// Run output applied by the last frame's [`drain`] (for tests).
+    pub(crate) drained_last_frame: usize,
 }
 
 impl VoidApp {
@@ -134,12 +136,22 @@ impl VoidApp {
             runs: Default::default(),
             palette: Default::default(),
             shift: Default::default(),
+            drained_last_frame: 0,
         }
     }
 
-    fn pump(&mut self) {
-        while let Some(ev) = self.engine.try_recv() {
-            self.state.apply(ev);
+    fn pump(&mut self, ctx: &egui::Context) {
+        let (engine, state) = (&self.engine, &mut self.state);
+        let d = drain(
+            || engine.try_recv(),
+            |ev| state.apply(ev),
+            DRAIN_BYTES,
+            DRAIN_TIME,
+        );
+        self.drained_last_frame = d.bytes;
+        if d.more {
+            // The rest next frame: this one still draws (and Stop stays clickable).
+            ctx.request_repaint();
         }
         if let Some(layout) = self.state.take_layout() {
             self.dock = layout
@@ -795,10 +807,44 @@ fn fmt_k(n: u32) -> String {
     }
 }
 
+/// Run output applied per frame at most (its terminal parsing runs on the UI thread)...
+const DRAIN_BYTES: usize = 1024 * 1024;
+/// ...and how long a frame spends applying events at most.
+const DRAIN_TIME: Duration = Duration::from_millis(12);
+
+struct Drained {
+    /// Run output applied.
+    bytes: usize,
+    /// Stopped at a budget with events possibly left.
+    more: bool,
+}
+
+/// Apply events from `next` in order until there are none or a budget is spent (checked
+/// after each event, so at least one is applied).
+fn drain(
+    mut next: impl FnMut() -> Option<void_core::engine::Event>,
+    mut apply: impl FnMut(void_core::engine::Event),
+    max_bytes: usize,
+    max_time: Duration,
+) -> Drained {
+    let start = Instant::now();
+    let mut bytes = 0;
+    while let Some(ev) = next() {
+        if let void_core::engine::Event::RunOutput { text, .. } = &ev {
+            bytes += text.len();
+        }
+        apply(ev);
+        if bytes >= max_bytes || start.elapsed() >= max_time {
+            return Drained { bytes, more: true };
+        }
+    }
+    Drained { bytes, more: false }
+}
+
 impl eframe::App for VoidApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.pump();
         let ctx = ui.ctx().clone();
+        self.pump(&ctx);
         self.apply_style(&ctx);
         let title = format!("void.ai — {}", self.state.workspace.name);
         if title != self.title {
@@ -948,6 +994,49 @@ impl VoidApp {
 /// driven headlessly by egui_kittest. Run with:
 /// `cargo test -p void-gui e2e -- --ignored --nocapture`
 /// Set VOID_AI_E2E_DIR to keep the config and data it writes (otherwise a temp dir is used).
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use void_core::engine::Event;
+
+    /// A flood is applied a budget's worth per call, in order, with the run's end after all
+    /// of its output.
+    #[test]
+    fn drain_stops_at_the_budget_and_keeps_order() {
+        let chunk = "x".repeat(64 * 1024);
+        let mut queue: std::collections::VecDeque<Event> = (0..100)
+            .map(|_| Event::RunOutput {
+                run: RunId(1),
+                text: chunk.clone(),
+            })
+            .collect();
+        queue.push_back(Event::Info("after".into()));
+        let mut got = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            let d = drain(
+                || queue.pop_front(),
+                |e| got.push(e),
+                1024 * 1024,
+                Duration::from_secs(3600),
+            );
+            assert!(d.bytes <= 1024 * 1024, "{}", d.bytes);
+            if !d.more {
+                break;
+            }
+        }
+        assert!(calls >= 7, "{calls}");
+        assert_eq!(got.len(), 101);
+        assert!(matches!(got.last(), Some(Event::Info(t)) if t == "after"));
+        // A spent time budget still applies one event.
+        queue.push_back(Event::Info("one".into()));
+        queue.push_back(Event::Info("two".into()));
+        let d = drain(|| queue.pop_front(), |e| got.push(e), 1, Duration::ZERO);
+        assert!(d.more && queue.len() == 1);
+    }
+}
+
 #[cfg(test)]
 mod e2e {
     use super::*;

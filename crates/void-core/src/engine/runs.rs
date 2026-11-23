@@ -10,14 +10,16 @@ use std::time::Instant;
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::run_budget::{Gate, OutputBudget};
 use super::{Command, Event, Msg, State};
 use crate::runner::run::{ChainSpec, RunUpdate, Sink, run_chain};
 use crate::runner::{
     Envs, MoonTask, OnFailure, RunId, RunOrigin, Runs, Step, StepConfig, discover,
 };
 
-#[derive(Default)]
 pub(super) struct RunsState {
+    /// Run output waiting for the UI, shared with the engine's handle.
+    budget: Arc<OutputBudget>,
     runs: Runs,
     envs: Envs,
     /// Why `runs.toml` couldn't be read: it exists, so it's never saved over.
@@ -38,6 +40,23 @@ struct ActiveRun {
     cancel: CancellationToken,
     abort: AbortHandle,
     started: Instant,
+}
+
+impl RunsState {
+    pub(super) fn new(budget: Arc<OutputBudget>) -> Self {
+        Self {
+            budget,
+            runs: Runs::default(),
+            envs: Envs::default(),
+            runs_unreadable: None,
+            envs_unreadable: None,
+            active: HashMap::new(),
+            next_id: 0,
+            last: None,
+            tasks_generation: 0,
+            tasks: Vec::new(),
+        }
+    }
 }
 
 impl State {
@@ -261,8 +280,12 @@ impl State {
             origin: req,
         });
         let tx = self.tx.clone();
+        // A fast printer can't flood the queue (or the UI): see `run_budget`.
+        let gate = Gate::new(self.runs.budget.clone());
         let sink: Sink = Arc::new(move |update| {
-            let _ = tx.send(Msg::Run { run, update });
+            gate.pass(update, |update| {
+                let _ = tx.send(Msg::Run { run, update });
+            });
         });
         let cancel = CancellationToken::new();
         let spec = ChainSpec {
@@ -284,6 +307,9 @@ impl State {
 
     pub(super) fn run_update(&mut self, run: RunId, update: RunUpdate) {
         if !self.runs.active.contains_key(&run) {
+            if let RunUpdate::Output(text) = &update {
+                self.runs.budget.release(text.len());
+            }
             return;
         }
         match update {
@@ -651,6 +677,53 @@ mod tests {
         let (ok, failed, _, stopped, error) = finished(&ev);
         assert!(!ok && stopped && error.is_none());
         assert_eq!(failed, Some(0));
+    }
+
+    /// A step printing as fast as it can while nobody reads: what waits for the UI stays
+    /// bounded (the rest is skipped, with a note saying so), and Stop still ends it promptly.
+    #[test]
+    fn flooding_step_stays_bounded_and_stops() {
+        use crate::engine::run_budget::{HELD_MAX, QUEUED_MAX};
+        let mut r = rig();
+        let cfg = RunConfig::new(
+            "flood",
+            vec![shell("echo ready; yes 'a line of flood output'")],
+        );
+        r.save(vec![cfg.clone()]);
+        r.handle.send(Command::RunConfig {
+            config_id: cfg.id.clone(),
+        });
+        let (run, _, _) = r.started();
+        r.output_until(run, "ready");
+        // Nobody reads for a while.
+        std::thread::sleep(Duration::from_millis(300));
+        let queued = r.handle.queued_run_output();
+        assert!(
+            queued <= QUEUED_MAX + 2 * HELD_MAX,
+            "{queued} bytes queued for the UI"
+        );
+        // Reading again (as the UI would) while asking it to stop.
+        r.handle.send(Command::StopRun(run));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut skipped_note = false;
+        loop {
+            assert!(Instant::now() < deadline, "the run didn't stop");
+            let Some(e) = r.handle.try_recv() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match e {
+                Event::RunOutput { text, .. } => skipped_note |= text.contains("skipped"),
+                Event::RunFinished {
+                    run: done, stopped, ..
+                } if done == run => {
+                    assert!(stopped);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(skipped_note, "the skipped output was noted");
     }
 
     /// No process of the group `pgid` exists any more (zombies included).

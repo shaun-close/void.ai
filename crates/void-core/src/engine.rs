@@ -37,6 +37,7 @@ use crate::tools::{Registry, ToolCtx, ToolOutput};
 
 mod claude;
 use claude::ClaudeRun;
+pub mod run_budget;
 mod runs;
 
 /// Called after every event, so a UI can wake up (the GUI requests a repaint).
@@ -381,6 +382,7 @@ impl Engine {
             .expect("couldn't start the engine runtime");
         let (tx, rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = std_mpsc::channel();
+        let output_budget = Arc::new(run_budget::OutputBudget::default());
         let home = options.home.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -414,12 +416,13 @@ impl Engine {
             home,
             claude: HashMap::new(),
             claude_bridge,
-            runs: runs::RunsState::default(),
+            runs: runs::RunsState::new(output_budget.clone()),
         };
         runtime.spawn(state.run(rx));
         EngineHandle {
             tx,
             events: ev_rx,
+            output_budget,
             runtime: Some(runtime),
         }
     }
@@ -429,6 +432,8 @@ impl Engine {
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<Msg>,
     events: std_mpsc::Receiver<Event>,
+    /// Run output sent and not yet received here (see [`run_budget`]).
+    output_budget: Arc<run_budget::OutputBudget>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
@@ -438,7 +443,16 @@ impl EngineHandle {
     }
 
     pub fn try_recv(&self) -> Option<Event> {
-        self.events.try_recv().ok()
+        let ev = self.events.try_recv().ok()?;
+        if let Event::RunOutput { text, .. } = &ev {
+            self.output_budget.release(text.len());
+        }
+        Some(ev)
+    }
+
+    /// Bytes of run output on their way to [`try_recv`](Self::try_recv).
+    pub fn queued_run_output(&self) -> usize {
+        self.output_budget.queued()
     }
 
     /// Save a workspace's dock layout (an opaque string owned by the UI).

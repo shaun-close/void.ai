@@ -447,3 +447,51 @@ fn editor_shows_a_missing_profile() {
     assert!(h.query_by_value("staging (missing)").is_some());
     assert!(h.query_by_label_contains("won't run").is_some());
 }
+
+/// A real step printing as fast as it can: frames keep coming (each applies a bounded amount
+/// of output) and the output tab's Stop ends it.
+#[test]
+fn flooding_run_keeps_frames_coming_and_stops() {
+    let (t, ws) = workspace();
+    let mut h = harness(t.path(), &ws);
+    let cfg = RunConfig::new(
+        "flood",
+        vec![StepConfig {
+            step: Step::Shell {
+                command: "yes 'a line of flood output'".into(),
+            },
+            on_failure: OnFailure::Stop,
+        }],
+    );
+    h.state().engine.send(Command::SaveRuns(Runs {
+        groups: vec![Group {
+            name: "g".into(),
+            configs: vec![cfg.clone()],
+        }],
+    }));
+    until(&mut h, "saved", |a| a.state.runs.groups.len() == 1);
+    h.state().engine.send(Command::RunConfig {
+        config_id: cfg.id.clone(),
+    });
+    until(&mut h, "output", |a| {
+        a.state
+            .run_views
+            .values()
+            .any(|v| !v.term.lines().is_empty())
+    });
+    for _ in 0..20 {
+        h.step();
+        let applied = h.state().drained_last_frame;
+        assert!(
+            applied <= 1024 * 1024 + 128 * 1024,
+            "{applied} bytes in a frame"
+        );
+    }
+    // What waits for the UI stays bounded.
+    let queued = h.state().engine.queued_run_output();
+    assert!(queued <= 5 * 1024 * 1024, "{queued} bytes queued");
+    h.get_by_label_contains("Stop").click();
+    until(&mut h, "stopped", |a| {
+        a.state.run_views.values().any(|v| v.finished.is_some())
+    });
+}
