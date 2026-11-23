@@ -87,8 +87,8 @@ compaction and Backend trait aren't used; a new module `crates/void-core/src/cla
 
 - **One `claude` process per turn**, started at `begin_turn` and ended when it emits its `result` message (or on
   Stop/error). Command:
-  `claude -p --input-format stream-json --output-format stream-json --include-partial-messages
-   --permission-prompts host [--permission-mode plan] [--model M]
+  `claude -p --output-format stream-json --verbose --input-format stream-json --include-partial-messages
+   --permission-prompts host --permission-prompt-tool stdio [--permission-mode plan] [--model M]
    (--session-id <conversation uuid> | --resume <conversation uuid>)
    --append-system-prompt <void note>`
   The user message (plus any "[Notes from void]" block, M3a Task 8) is written to stdin as one stream-json user
@@ -126,11 +126,10 @@ unknown tool names (name + pretty JSON arguments + result text), with small spec
 
 ### Permissions
 
-- `--permission-prompts host`: Claude Code sends permission requests to the host over the stdio control channel
-  (the same mechanism the Agent SDK uses). The builder confirms the exact message shapes from the Claude Code
-  docs (headless / SDK permission docs); if the stdio host channel isn't usable from a non-SDK host, fall back to
-  `--permission-prompt-tool` with a tiny MCP stdio server that void.ai spawns (inside the sandbox, talking back to
-  the engine over an inherited pipe).
+- `--permission-prompts host --permission-prompt-tool stdio`: Claude Code sends permission requests to the host
+  over the stdio control channel (`can_use_tool`, the same mechanism the Agent SDK uses). Both flags are needed:
+  the live test on 2.1.330 showed that with `--permission-prompts host` alone the CLI never asks — it denies on
+  its own (`system/permission_denied`). The MCP permission-tool fallback wasn't needed.
 - *(Controller's call, from "works the same".)* **Claude Code's own permission system is the authority.** No
   `--permission-mode` flag is passed for Build, so the user's `~/.claude/settings.json` (`defaultMode`,
   allow/deny rules) and project settings decide, exactly as in a terminal; Plan passes `--permission-mode plan`.
@@ -205,7 +204,8 @@ file changes were reverted."). The builder picks after checking the CLI docs and
 ### Errors
 
 - `claude` not found → error naming the profile's `command` and how to install.
-- Not signed in / auth error in `result` → "Claude Code isn't signed in — run `claude` in a terminal to sign in".
+- Not signed in / auth error in `result` → "Claude Code isn't signed in — run `claude auth login` in a terminal",
+  followed by "(Claude Code said: …)" with Claude Code's own message (capped, key-redacted) when it gave one.
 - Rate limit / usage limit → shown as the reply's error, with Claude Code's own message.
 - Process exits without `result` → `StreamFailed` with the last stderr lines (capped, never including env).
 
