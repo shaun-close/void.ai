@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 use void_core::model::ConversationId;
+use void_core::runner::RunId;
 
 /// What an editor tab shows of its file: the real file, or a chat's pending version of it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -32,6 +33,13 @@ pub enum Tab {
         path: PathBuf,
         view: EditorView,
     },
+    /// moon tasks, run configs and environment profiles.
+    Runs,
+    /// One run's output. Run ids only mean something to the engine that started them, so
+    /// these tabs don't survive a restart (see `drop_run_outputs`).
+    RunOutput {
+        run: RunId,
+    },
 }
 
 impl Tab {
@@ -44,6 +52,8 @@ impl Tab {
             Tab::Review => "review",
             Tab::Files => "files",
             Tab::Editor { .. } => "editor",
+            Tab::Runs => "runs",
+            Tab::RunOutput { .. } => "run-output",
         }
     }
 
@@ -52,12 +62,13 @@ impl Tab {
         match (self, other) {
             (Tab::Chat { id: a, .. }, Tab::Chat { id: b, .. }) => a == b,
             (Tab::Editor { id: a, .. }, Tab::Editor { id: b, .. }) => a == b,
+            (Tab::RunOutput { run: a }, Tab::RunOutput { run: b }) => a == b,
             _ => self.kind() == other.kind(),
         }
     }
 }
 
-/// Chats and Files tabbed on the left, Chat in the middle, Backends, Settings and Review
+/// Chats, Files and Runs tabbed on the left, Chat in the middle, Backends, Settings and Review
 /// tabbed on the right.
 pub fn default_layout() -> DockState<Tab> {
     let mut d = DockState::new(vec![Tab::Chat {
@@ -70,7 +81,7 @@ pub fn default_layout() -> DockState<Tab> {
         0.72,
         vec![Tab::Backends, Tab::Settings, Tab::Review],
     );
-    tree.split_left(chat, 0.3, vec![Tab::Conversations, Tab::Files]);
+    tree.split_left(chat, 0.3, vec![Tab::Conversations, Tab::Files, Tab::Runs]);
     d
 }
 
@@ -81,6 +92,14 @@ pub fn ensure_tab(d: &mut DockState<Tab>, tab: Tab) {
         d.set_focused_node_and_surface(path.node_path());
     } else {
         d.push_to_focused_leaf(tab);
+    }
+}
+
+/// Close every run output tab (a restored layout's runs belong to an engine that's gone);
+/// leaves they emptied go too.
+pub fn drop_run_outputs(d: &mut DockState<Tab>) {
+    while let Some(path) = d.find_tab_from(|t| matches!(t, Tab::RunOutput { .. })) {
+        d.remove_tab(path);
     }
 }
 
@@ -136,6 +155,7 @@ mod tests {
                 "conversations",
                 "files",
                 "review",
+                "runs",
                 "settings"
             ]
         );
@@ -153,6 +173,34 @@ mod tests {
         let back = from_text(&to_text(&old)).unwrap();
         assert!(back.find_tab(&Tab::Files).is_none());
         assert!(back.find_tab(&Tab::Conversations).is_some());
+    }
+
+    #[test]
+    fn run_output_tabs_are_dropped_with_their_leaf() {
+        let mut d = default_layout();
+        let chat = d.find_tab_from(|t| matches!(t, Tab::Chat { .. })).unwrap();
+        d.split(
+            chat.node_path(),
+            egui_dock::Split::Below,
+            0.7,
+            egui_dock::Node::leaf_with(vec![
+                Tab::RunOutput { run: RunId(1) },
+                Tab::RunOutput { run: RunId(2) },
+            ]),
+        );
+        let back = from_text(&to_text(&d)).unwrap();
+        let mut back = back;
+        assert!(back.find_tab(&Tab::RunOutput { run: RunId(2) }).is_some());
+        drop_run_outputs(&mut back);
+        let tabs = |d: &DockState<Tab>| -> Vec<Tab> {
+            d.iter_all_tabs().map(|(_, t)| t.clone()).collect()
+        };
+        assert_eq!(tabs(&back), tabs(&default_layout()));
+        // Their leaf went with them: the chat leaf is the only one left in the middle.
+        assert_eq!(
+            back.main_surface().iter().filter(|n| n.is_leaf()).count(),
+            3
+        );
     }
 
     #[test]

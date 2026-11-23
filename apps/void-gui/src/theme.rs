@@ -16,6 +16,7 @@ pub mod icon {
     pub const BRACKETS_CURLY: &str = "\u{E860}";
     pub const CARET_DOWN: &str = "\u{E136}";
     pub const CARET_RIGHT: &str = "\u{E13A}";
+    pub const CARET_UP: &str = "\u{E13C}";
     pub const CROSSHAIR: &str = "\u{E1D6}";
     pub const FILE: &str = "\u{E230}";
     pub const FILE_C: &str = "\u{EB32}";
@@ -65,6 +66,12 @@ pub mod icon {
     pub const LIGHTNING: &str = "\u{E2DE}";
     pub const MAGNIFIER: &str = "\u{E30C}";
     pub const PENCIL: &str = "\u{E3B4}";
+    pub const PLAY: &str = "\u{E3D0}";
+    pub const EYE: &str = "\u{E220}";
+    pub const EYE_SLASH: &str = "\u{E224}";
+    pub const GLOBE: &str = "\u{E288}";
+    pub const LIST: &str = "\u{E2F0}";
+    pub const TIMER: &str = "\u{E492}";
     pub const PLANET: &str = "\u{E652}";
     pub const PLUGS: &str = "\u{EB5A}";
     pub const PLUS: &str = "\u{E3D4}";
@@ -530,6 +537,49 @@ pub fn pill(ui: &mut Ui, icon: &str, text: impl Into<String>, color: Color32) ->
             });
         })
         .response
+}
+
+/// A pill (as [`pill`]) that's a button: one widget, clickable anywhere on it.
+pub fn pill_button(ui: &mut Ui, icon: &str, text: &str, color: Color32) -> Response {
+    use egui::text::{LayoutJob, TextFormat};
+    let p = palette_of(ui);
+    let small = ui
+        .style()
+        .text_styles
+        .get(&TextStyle::Small)
+        .map_or(small_size(), |f| f.size);
+    let mut job = LayoutJob::default();
+    job.append(
+        icon,
+        0.0,
+        TextFormat {
+            font_id: FontId::new(small + 1.0, FontFamily::Name(ICONS.into())),
+            color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        text,
+        5.0,
+        TextFormat {
+            font_id: FontId::proportional(small),
+            color: p.text,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(9.0, 2.0);
+        ui.add(
+            egui::Button::new(job)
+                .fill(with_alpha(color, if p.dark { 28 } else { 36 }))
+                .stroke(Stroke::new(1.0, with_alpha(color, 70)))
+                .corner_radius(CornerRadius::same(255)),
+        )
+    })
+    .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A thin rounded bar showing `fraction` full.

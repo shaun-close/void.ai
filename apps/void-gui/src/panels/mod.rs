@@ -13,6 +13,8 @@ pub mod claude_cards;
 pub mod conversations;
 pub mod files;
 pub mod review;
+pub mod run_output;
+pub mod runs;
 pub mod settings;
 
 use void_core::engine::Command;
@@ -63,6 +65,13 @@ pub enum Action {
     },
     /// Show another version of an editor tab's file (Disk, or a chat's).
     SwitchEditorView { tab: u32, view: EditorView },
+    /// Open a file (absolute) in an editor tab at `line` (1-based): a location in run output.
+    OpenAt {
+        path: std::path::PathBuf,
+        line: usize,
+    },
+    /// Show a run's output tab (reopening it if it was closed).
+    ShowRun(void_core::runner::RunId),
 }
 
 pub struct Panels<'a> {
@@ -85,6 +94,7 @@ pub struct Panels<'a> {
     /// Chats an editor tab can switch to: those with a layer of pending changes, or open in a
     /// Chat tab.
     pub view_chats: Vec<ConversationId>,
+    pub runs: &'a mut runs::RunsUi,
 }
 
 impl egui_dock::TabViewer for Panels<'_> {
@@ -94,6 +104,7 @@ impl egui_dock::TabViewer for Panels<'_> {
         match tab {
             Tab::Chat { id, .. } => Id::unique(("chat", *id)),
             Tab::Editor { id, .. } => Id::unique(("editor", *id)),
+            Tab::RunOutput { run } => Id::unique(("run-output", run.0)),
             other => Id::unique(other.kind()),
         }
     }
@@ -120,6 +131,8 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Backends => theme::itext(icon::PLUGS, "Backends"),
             Tab::Settings => theme::itext(icon::GEAR, "Settings"),
             Tab::Files => theme::itext(icon::FOLDER, "Files"),
+            Tab::Runs => theme::itext(icon::PLAY, "Runs"),
+            Tab::RunOutput { run } => run_output::title(self.state, *run),
             Tab::Review => {
                 let n = self
                     .focused
@@ -194,6 +207,8 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Settings => settings::show(ui, self),
             Tab::Review => review::show(ui, self),
             Tab::Files => files::show(ui, self),
+            Tab::Runs => runs::show(ui, self),
+            Tab::RunOutput { run } => run_output::show(ui, self, *run),
             Tab::Editor { id, path, view } => crate::editor::show(ui, self, *id, path, view),
         }
     }

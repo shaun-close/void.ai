@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use void_editor::Watcher;
 
@@ -27,6 +28,46 @@ pub struct DiskWatch {
     /// Tests: drop every event, to show something else did the work.
     #[cfg(test)]
     paused: bool,
+    /// moon's config changed: ask for its tasks again once the burst is over.
+    pub(crate) moon_refresh: Debounce,
+}
+
+/// One action per burst of pokes: due once `QUIET` has passed since the last poke.
+#[derive(Debug, Default)]
+pub struct Debounce {
+    last: Option<Instant>,
+}
+
+impl Debounce {
+    pub const QUIET: Duration = Duration::from_millis(500);
+
+    pub fn poke(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
+    /// True once per burst, when it has been quiet long enough; otherwise how much longer to
+    /// wait (None when nothing is pending).
+    pub fn due(&mut self, now: Instant) -> Result<bool, Duration> {
+        let Some(last) = self.last else {
+            return Ok(false);
+        };
+        let quiet = now.saturating_duration_since(last);
+        if quiet >= Self::QUIET {
+            self.last = None;
+            Ok(true)
+        } else {
+            Err(Self::QUIET - quiet)
+        }
+    }
+}
+
+/// Whether any of `paths` is moon configuration (`.moon/…` outside its cache, `moon.yml`) in
+/// the workspace at `root`.
+pub fn touches_moon_config(paths: &[PathBuf], root: &Path) -> bool {
+    paths.iter().any(|p| {
+        p.strip_prefix(root)
+            .is_ok_and(void_core::runner::is_moon_config_path)
+    })
 }
 
 impl DiskWatch {
@@ -148,6 +189,17 @@ impl VoidApp {
         if !paths.is_empty() {
             self.editors.check_disk(&paths);
             self.files.changed(&paths);
+            if root
+                .as_deref()
+                .is_some_and(|r| touches_moon_config(&paths, r))
+            {
+                self.disk.moon_refresh.poke(Instant::now());
+            }
+        }
+        match self.disk.moon_refresh.due(Instant::now()) {
+            Ok(true) => self.engine.send(void_core::engine::Command::RefreshTasks),
+            Ok(false) => {}
+            Err(wait) => ctx.request_repaint_after(wait),
         }
         if ctx.input(|i| {
             i.events
@@ -169,5 +221,42 @@ impl VoidApp {
                 *path = crate::editor::moved_path(path, from, to);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moon_refresh_is_debounced() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut d = Debounce::default();
+        assert_eq!(d.due(ms(0)), Ok(false), "nothing pending");
+        // A burst of changes (an editor saving moon.yml writes a few times).
+        for n in [0, 100, 300] {
+            d.poke(ms(n));
+        }
+        assert_eq!(d.due(ms(700)), Err(Duration::from_millis(100)));
+        assert_eq!(d.due(ms(800)), Ok(true), "one refresh for the burst");
+        assert_eq!(d.due(ms(2000)), Ok(false), "and only one");
+        d.poke(ms(3000));
+        assert_eq!(d.due(ms(3600)), Ok(true), "a later change refreshes again");
+    }
+
+    #[test]
+    fn only_moon_config_changes_count() {
+        let root = Path::new("/w");
+        let p = |s: &str| vec![PathBuf::from(s)];
+        assert!(touches_moon_config(&p("/w/moon.yml"), root));
+        assert!(touches_moon_config(&p("/w/apps/gui/moon.yml"), root));
+        assert!(touches_moon_config(&p("/w/.moon/workspace.yml"), root));
+        assert!(!touches_moon_config(
+            &p("/w/.moon/cache/states/x.json"),
+            root
+        ));
+        assert!(!touches_moon_config(&p("/w/src/main.rs"), root));
+        assert!(!touches_moon_config(&p("/elsewhere/moon.yml"), root));
     }
 }

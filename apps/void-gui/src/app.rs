@@ -10,6 +10,7 @@ use void_core::config::Theme;
 use void_core::context::context_used;
 use void_core::engine::{Command, Engine, EngineHandle};
 use void_core::model::ConversationId;
+use void_core::runner::RunId;
 use void_core::store::Store;
 
 use crate::editor::EditorStore;
@@ -59,6 +60,8 @@ pub struct VoidApp {
     pub(crate) disk: disk::DiskWatch,
     /// The editor tab focused last.
     last_editor: Option<u32>,
+    /// The Runs panel's drafts.
+    pub(crate) runs: crate::panels::runs::RunsUi,
 }
 
 impl VoidApp {
@@ -122,6 +125,7 @@ impl VoidApp {
             files: Default::default(),
             disk: Default::default(),
             last_editor: None,
+            runs: Default::default(),
         }
     }
 
@@ -134,6 +138,9 @@ impl VoidApp {
                 .as_deref()
                 .and_then(layout::from_text)
                 .unwrap_or_else(layout::default_layout);
+            layout::drop_run_outputs(&mut self.dock);
+            // Drafts in the Runs panel belonged to the previous workspace.
+            self.runs = Default::default();
             self.focused_chat = None;
             // Restored Chat tabs: load their conversations, forget ones that are gone.
             let known: Vec<ConversationId> =
@@ -207,6 +214,71 @@ impl VoidApp {
         }
         while let Ok(folder) = self.folders.1.try_recv() {
             self.open_workspace(Some(folder));
+        }
+        for run in self.state.take_started_runs() {
+            self.show_run_output(run, true);
+        }
+        // Finished runs whose tab was closed are forgotten.
+        let shown: std::collections::HashSet<_> = self
+            .dock
+            .iter_all_tabs()
+            .filter_map(|(_, t)| match t {
+                Tab::RunOutput { run } => Some(*run),
+                _ => None,
+            })
+            .collect();
+        self.state
+            .run_views
+            .retain(|id, v| v.finished.is_none() || shown.contains(id));
+    }
+
+    /// Bring `run`'s output tab forward, opening one if needed: in place of a finished run of
+    /// the same name (`reuse`, for a new run), else beside the other output tabs, else in a
+    /// new strip below the editors/chats. Keyboard focus stays where it was.
+    fn show_run_output(&mut self, run: RunId, reuse: bool) {
+        if let Some(path) = self.dock.find_tab(&Tab::RunOutput { run }) {
+            let _ = self.dock.set_active_tab(path);
+            return;
+        }
+        let focused = self.dock.focused_leaf();
+        let name = self.state.run_views.get(&run).map(|v| v.name.clone());
+        let views = &self.state.run_views;
+        let stale = reuse
+            .then(|| {
+                self.dock.find_tab_from(|t| {
+                    matches!(t, Tab::RunOutput { run: old } if views.get(old).is_some_and(|v| {
+                        v.finished.is_some() && Some(&v.name) == name.as_ref()
+                    }))
+                })
+            })
+            .flatten();
+        if let Some(path) = stale {
+            if let Some((_, tab)) = self.dock.iter_all_tabs_mut().find(|(p, _)| *p == path) {
+                *tab = Tab::RunOutput { run };
+            }
+            let _ = self.dock.set_active_tab(path);
+        } else if let Some(near) = self
+            .dock
+            .find_tab_from(|t| matches!(t, Tab::RunOutput { .. }))
+        {
+            self.dock.set_focused_node_and_surface(near.node_path());
+            self.dock.push_to_focused_leaf(Tab::RunOutput { run });
+        } else if let Some(main) = self
+            .dock
+            .find_tab_from(|t| matches!(t, Tab::Editor { .. }))
+            .or_else(|| self.dock.find_tab_from(|t| matches!(t, Tab::Chat { .. })))
+        {
+            self.dock.split(
+                main.node_path(),
+                egui_dock::Split::Below,
+                0.68,
+                egui_dock::Node::leaf_with(vec![Tab::RunOutput { run }]),
+            );
+        } else {
+            self.dock.push_to_focused_leaf(Tab::RunOutput { run });
+        }
+        if let Some(f) = focused {
+            self.dock.set_focused_node_and_surface(f);
         }
     }
 
@@ -284,6 +356,14 @@ impl VoidApp {
             }
             Action::SwitchEditorView { tab, view } => {
                 self.switch_editor_view(tab, view);
+                return;
+            }
+            Action::OpenAt { path, line } => {
+                self.open_editor(path, EditorView::Disk, Some(line));
+                return;
+            }
+            Action::ShowRun(run) => {
+                self.show_run_output(run, false);
                 return;
             }
         };
@@ -434,6 +514,7 @@ impl VoidApp {
                 for (label, tab) in [
                     (theme::itext(icon::CHATS, "Chats"), Tab::Conversations),
                     (theme::itext(icon::FOLDER, "Files"), Tab::Files),
+                    (theme::itext(icon::PLAY, "Runs"), Tab::Runs),
                     (theme::itext(icon::PLUGS, "Backends"), Tab::Backends),
                     (theme::itext(icon::GEAR, "Settings"), Tab::Settings),
                     (theme::itext(icon::GIT_DIFF, "Review"), Tab::Review),
@@ -483,6 +564,9 @@ impl VoidApp {
                     .map(|r| r.display().to_string())
                     .unwrap_or_else(|| "Scratch: chats not tied to a folder".into()),
             );
+            if self.state.workspace.root.is_some() {
+                self.env_pill(ui, &pal);
+            }
             match self.state.profile_for(conv) {
                 Some(p) => {
                     let color = match p.kind {
@@ -615,6 +699,58 @@ impl VoidApp {
     }
 }
 
+impl VoidApp {
+    /// The active environment profile for runs; a click opens a menu to switch.
+    fn env_pill(&mut self, ui: &mut egui::Ui, pal: &theme::Palette) {
+        let active = self.state.envs.active.clone();
+        let (label, color) = match &active {
+            Some(name) => (name.as_str(), pal.accent2),
+            None => ("no env", pal.text_faint),
+        };
+        let r = theme::pill_button(ui, icon::GLOBE, label, color)
+            .on_hover_text("Environment profile for runs (click to switch)");
+        let names: Vec<String> = self
+            .state
+            .envs
+            .profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        egui::Popup::menu(&r).show(|ui| {
+            let mut pick = None;
+            if ui
+                .selectable_label(active.is_none(), "No environment")
+                .clicked()
+            {
+                pick = Some(None);
+            }
+            for name in names {
+                if ui
+                    .selectable_label(active.as_ref() == Some(&name), &name)
+                    .clicked()
+                {
+                    pick = Some(Some(name));
+                }
+            }
+            ui.separator();
+            if ui
+                .button(theme::itext(icon::PENCIL, "Edit environments…"))
+                .clicked()
+            {
+                self.runs.show_envs = true;
+                layout::ensure_tab(&mut self.dock, Tab::Runs);
+                ui.close();
+            }
+            if let Some(pick) = pick {
+                if pick != active {
+                    self.engine.send(Command::SetActiveEnv(pick));
+                }
+                ui.close();
+            }
+        });
+    }
+}
+
 /// The profile pill's label and hover text. Claude Code profiles have no URL: they show the
 /// model Claude Code reported for this chat (`claude_model`), else the configured one, else
 /// "default model", and the command they run.
@@ -703,6 +839,15 @@ impl eframe::App for VoidApp {
         self.poll_disk(&ctx);
         self.editors.poll(&ctx);
         self.global_save(&ctx);
+        // Re-run last: app-wide, taken before an editor could see it.
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::F10,
+            )
+        }) {
+            self.engine.send(Command::RerunLast);
+        }
 
         let pal = theme::palette(self.state.config.theme);
         let bar = egui::Frame::new()
@@ -787,6 +932,7 @@ impl VoidApp {
             files: &mut self.files,
             active_file,
             view_chats,
+            runs: &mut self.runs,
         };
         DockArea::new(&mut self.dock)
             .style(theme::dock_style(ui.style().as_ref(), &pal))
@@ -1512,6 +1658,205 @@ impl Parser {
             .unwrap()
             .save(out.join("editor-narrow.png"))
             .unwrap();
+        h.set_size(egui::vec2(1400.0, 860.0));
+
+        // The runner: tasks, configs in groups with one open in the editor, profiles with a
+        // masked value, a finished run and a running one with a progress bar.
+        {
+            use void_core::engine::Event as E;
+            use void_core::runner::{
+                EnvProfile, EnvValue, Envs, Group, MoonTask, OnFailure, RunConfig, RunId, Runs,
+                Step, StepConfig,
+            };
+            let task = |project: &str, id: &str, command: &str| MoonTask {
+                project: project.into(),
+                id: id.into(),
+                target: format!("{project}:{id}"),
+                command: command.into(),
+                description: None,
+                source: Some(project.into()),
+                run_from_workspace_root: false,
+            };
+            let step = |target: &str, on_failure| StepConfig {
+                step: Step::Moon {
+                    target: target.into(),
+                    args: vec![],
+                },
+                on_failure,
+            };
+            let mut check = RunConfig::new(
+                "Check everything",
+                vec![
+                    step("void-core:lint", OnFailure::Continue),
+                    step("void-core:test", OnFailure::Stop),
+                    StepConfig {
+                        step: Step::Shell {
+                            command: "cargo build --release".into(),
+                        },
+                        on_failure: OnFailure::Stop,
+                    },
+                ],
+            );
+            check.env_profile = Some("dev".into());
+            let runs = Runs {
+                groups: vec![
+                    Group {
+                        name: "CI".into(),
+                        configs: vec![
+                            check.clone(),
+                            RunConfig::new(
+                                "Format",
+                                vec![step("void-core:format", OnFailure::Stop)],
+                            ),
+                        ],
+                    },
+                    Group {
+                        name: "Dev".into(),
+                        configs: vec![RunConfig::new(
+                            "Serve docs",
+                            vec![step("docs:serve", OnFailure::Stop)],
+                        )],
+                    },
+                ],
+            };
+            let envs = Envs {
+                active: Some("dev".into()),
+                profiles: vec![
+                    EnvProfile {
+                        name: "dev".into(),
+                        vars: [
+                            ("API_TOKEN".to_string(), EnvValue::Value("hunter2".into())),
+                            ("RUST_LOG".to_string(), EnvValue::Value("debug".into())),
+                            ("HOME_DIR".to_string(), EnvValue::Env("HOME".into())),
+                        ]
+                        .into(),
+                    },
+                    EnvProfile {
+                        name: "prod".into(),
+                        vars: [(
+                            "API_TOKEN".to_string(),
+                            EnvValue::Cmd("pass show api".into()),
+                        )]
+                        .into(),
+                    },
+                ],
+            };
+            h.state().engine.send(Command::SaveRuns(runs));
+            h.state().engine.send(Command::SaveEnvs(envs));
+            until(&mut h, 10, "runs saved", |a| {
+                a.state.runs.groups.len() == 2 && a.state.envs.profiles.len() == 2
+            });
+            std::fs::create_dir_all(proj.join("crates/core/src")).unwrap();
+            std::fs::write(
+                proj.join("crates/core/src/lib.rs"),
+                (1..60).map(|i| format!("// {i}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let st = &mut h.state_mut().state;
+            st.apply(E::Tasks(vec![
+                task("void-core", "format", "cargo fmt --all"),
+                task(
+                    "void-core",
+                    "lint",
+                    "cargo clippy --workspace -- -D warnings",
+                ),
+                task("void-core", "test", "cargo test --workspace"),
+                task("void-gui", "run", "cargo run --package void-gui"),
+                task("docs", "serve", "mdbook serve"),
+            ]));
+            let done = RunId(9001);
+            st.apply(E::RunStarted {
+                run: done,
+                name: "Check everything".into(),
+                steps: 3,
+            });
+            st.apply(E::RunStep {
+                run: done,
+                index: 0,
+                label: "moon run void-core:lint".into(),
+                base_dirs: vec![proj.clone()],
+            });
+            st.apply(E::RunOutput {
+                run: done,
+                text: "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: unused variable: `chunk`\x1b[0m\n   \x1b[1m\x1b[94m--> \x1b[0mcrates/core/src/lib.rs:42:9\n    \x1b[94m|\x1b[0m\n\x1b[32m    Finished\x1b[0m `dev` profile in 3.21s\n".into(),
+            });
+            st.apply(E::RunStep {
+                run: done,
+                index: 1,
+                label: "moon run void-core:test".into(),
+                base_dirs: vec![proj.clone()],
+            });
+            st.apply(E::RunOutput {
+                run: done,
+                text: "running 3 tests\ntest sse::split_crlf ... \x1b[31mFAILED\x1b[0m\n\nthread 'sse::split_crlf' panicked at crates/core/src/lib.rs:17:5:\nassertion failed\n\x1b[31merror\x1b[0m: test failed\n".into(),
+            });
+            st.apply(E::RunFinished {
+                run: done,
+                ok: false,
+                failed_step: Some(1),
+                exit_code: Some(101),
+                stopped: false,
+                error: None,
+                duration_ms: 14_320,
+            });
+            let live = RunId(9002);
+            st.apply(E::RunStarted {
+                run: live,
+                name: "void-gui:run".into(),
+                steps: 1,
+            });
+            st.apply(E::RunStep {
+                run: live,
+                index: 0,
+                label: "moon run void-gui:run".into(),
+                base_dirs: vec![proj.clone()],
+            });
+            st.apply(E::RunOutput {
+                run: live,
+                text: "\x1b[32m   Compiling\x1b[0m egui v0.37.0\n\x1b[36m    Building\x1b[0m [=====>      ] 211/412\r\x1b[36m    Building\x1b[0m [=========>  ] 380/412: void-gui".into(),
+            });
+            st.runs_warning = Some(
+                "runs.toml was unreadable (expected `]`); kept as runs.toml.bad-1 and started fresh"
+                    .into(),
+            );
+        }
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Runs);
+        let first = h.state().state.runs.groups[0].configs[0].id.clone();
+        let runs = h.state().state.runs.clone();
+        h.state_mut().runs.edit_config(&runs, &first);
+        h.state_mut().runs.show_envs = true;
+        h.set_size(egui::vec2(1400.0, 1000.0));
+        for _ in 0..8 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("runs.png")).unwrap();
+        // The finished run's tab in front.
+        let path = h
+            .state()
+            .dock
+            .find_tab(&Tab::RunOutput {
+                run: void_core::runner::RunId(9001),
+            })
+            .unwrap();
+        let _ = h.state_mut().dock.set_active_tab(path);
+        for _ in 0..4 {
+            h.step();
+        }
+        h.render()
+            .unwrap()
+            .save(out.join("run-output.png"))
+            .unwrap();
+        // The environments, with the config editor closed and the env pill's menu open.
+        h.state_mut().runs = Default::default();
+        h.state_mut().runs.show_envs = true;
+        for _ in 0..4 {
+            h.step();
+        }
+        h.get_by_label_contains("\u{E288}dev").click();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("runs-envs.png")).unwrap();
         h.set_size(egui::vec2(1400.0, 860.0));
     }
 

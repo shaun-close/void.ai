@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use void_core::config::Config;
 use void_core::engine::{DeltaKind, Event};
 use void_core::model::{Conversation, ConversationId, ConversationMeta, Workspace};
+use void_core::runner::RunId;
 use void_core::store::WorkspaceEntry;
+
+use crate::panels::run_output::{Finished, RunView, StepInfo};
 
 /// A reply arriving right now.
 #[derive(Clone, Debug, Default)]
@@ -84,6 +87,19 @@ pub struct UiState {
     /// Answers to chat-view saves, for the editors: `(request, chat, path, error)` with no
     /// error for a save that landed.
     overlay_saves: Vec<OverlaySaveResult>,
+    /// The workspace's moon tasks (empty outside a moon workspace).
+    pub tasks: Vec<void_core::runner::MoonTask>,
+    /// The workspace's run configs and environment profiles, as the engine last saved them.
+    pub runs: void_core::runner::Runs,
+    pub envs: void_core::runner::Envs,
+    /// `RunsLoaded` arrived for this workspace.
+    pub runner_loaded: bool,
+    /// A runs/env file was corrupt and set aside (the Runs panel shows it until dismissed).
+    pub runs_warning: Option<String>,
+    /// Runs since void started (finished ones until their tab closes).
+    pub run_views: std::collections::BTreeMap<RunId, RunView>,
+    /// Runs started since the app last looked (each gets an output tab).
+    started_runs: Vec<RunId>,
 }
 
 /// The engine's answer to one `SaveToOverlay`.
@@ -127,6 +143,13 @@ impl Default for UiState {
             quiet: Default::default(),
             changed_chats: Vec::new(),
             overlay_saves: Vec::new(),
+            tasks: Vec::new(),
+            runs: Default::default(),
+            envs: Default::default(),
+            runner_loaded: false,
+            runs_warning: None,
+            run_views: Default::default(),
+            started_runs: Vec::new(),
         }
     }
 }
@@ -180,6 +203,10 @@ impl UiState {
                 let streaming: Vec<_> = self.streams.keys().copied().collect();
                 self.loaded.retain(|id, _| streaming.contains(id));
                 self.layout = Some(layout);
+                // Its runs and tasks follow (`RunsLoaded`, `Tasks`).
+                self.runner_loaded = false;
+                self.runs_warning = None;
+                self.tasks.clear();
                 for w in warnings {
                     self.error(w);
                 }
@@ -381,13 +408,59 @@ impl UiState {
             } => {
                 self.turn_status.insert(conversation, status);
             }
-            // The runner's UI arrives in M3b task 3.
-            Event::Tasks(_)
-            | Event::RunsLoaded { .. }
-            | Event::RunStarted { .. }
-            | Event::RunStep { .. }
-            | Event::RunOutput { .. }
-            | Event::RunFinished { .. } => {}
+            Event::Tasks(tasks) => self.tasks = tasks,
+            Event::RunsLoaded {
+                runs,
+                envs,
+                warning,
+            } => {
+                self.runs = runs;
+                self.envs = envs;
+                self.runner_loaded = true;
+                if let Some(w) = warning {
+                    self.error(w.clone());
+                    self.runs_warning = Some(w);
+                }
+            }
+            Event::RunStarted { run, name, steps } => {
+                self.run_views.insert(run, RunView::new(name, steps));
+                self.started_runs.push(run);
+            }
+            Event::RunStep {
+                run,
+                index,
+                label,
+                base_dirs,
+            } => {
+                if let Some(v) = self.run_views.get_mut(&run) {
+                    v.step(index, StepInfo { label, base_dirs });
+                }
+            }
+            Event::RunOutput { run, text } => {
+                if let Some(v) = self.run_views.get_mut(&run) {
+                    v.term.push(&text);
+                }
+            }
+            Event::RunFinished {
+                run,
+                ok,
+                failed_step,
+                exit_code,
+                stopped,
+                error,
+                duration_ms,
+            } => {
+                if let Some(v) = self.run_views.get_mut(&run) {
+                    v.finish(Finished {
+                        ok,
+                        failed_step,
+                        exit_code,
+                        stopped,
+                        error,
+                        duration_ms,
+                    });
+                }
+            }
         }
     }
 
@@ -432,6 +505,18 @@ impl UiState {
 
     pub fn take_changed_chats(&mut self) -> Vec<ConversationId> {
         std::mem::take(&mut self.changed_chats)
+    }
+
+    pub fn take_started_runs(&mut self) -> Vec<RunId> {
+        std::mem::take(&mut self.started_runs)
+    }
+
+    /// Runs still going, oldest first.
+    pub fn active_runs(&self) -> impl Iterator<Item = (RunId, &RunView)> {
+        self.run_views
+            .iter()
+            .filter(|(_, v)| v.finished.is_none())
+            .map(|(id, v)| (*id, v))
     }
 
     pub fn take_overlay_saves(&mut self) -> Vec<OverlaySaveResult> {

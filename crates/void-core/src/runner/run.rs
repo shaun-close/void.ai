@@ -21,7 +21,10 @@ use super::env::Envs;
 use super::moon::MoonTask;
 
 /// One run (a config or an ad-hoc task), unique for the engine's lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Serializable so a GUI layout can name a run's output tab (ids restart with the engine).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RunId(pub u64);
 
 impl std::fmt::Display for RunId {

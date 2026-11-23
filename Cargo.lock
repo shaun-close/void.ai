@@ -5157,6 +5157,7 @@ dependencies = [
  "void-core",
  "void-editor",
  "void-vim",
+ "vte",
 ]
 
 [[package]]
@@ -5172,6 +5173,16 @@ version = "0.1.0"
 dependencies = [
  "ropey",
  "void-editor",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]
