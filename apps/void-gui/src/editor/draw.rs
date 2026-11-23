@@ -222,7 +222,11 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
         }
     }
 
-    let font = FontId::monospace(theme::body_size() - 1.0);
+    // The size comes from this context's own style, never the process-wide `body_size()`:
+    // another context (a second window, a test harness) applying a different size would
+    // otherwise change `row_h` between frames, and the scroll offset (kept in points) would
+    // then map to the wrong line.
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     let (glyph_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
     let row_h = (glyph_h * 1.35).round();
     let whole = ui.available_rect_before_wrap();
@@ -441,7 +445,7 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
 
     // Gutter numbers.
     let gp = ui.painter_at(gutter);
-    let small = FontId::monospace(theme::body_size() - 2.0);
+    let small = FontId::monospace(font.size - 1.0);
     let first = drawn.first().map_or(0, |r| r.line);
     let labels = if relative {
         relative_line_numbers(cursor_line, first..first + drawn.len())

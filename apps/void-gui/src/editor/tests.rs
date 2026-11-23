@@ -284,8 +284,9 @@ fn editor_big_file_first_frame_fast() {
     let t = Instant::now();
     until_within(&mut h, "background parse", PARSE_WAIT, highlighted(&file));
     println!("background parse: {:?} more", t.elapsed());
-    // Jumping to the end. (The view, before and after, goes in the failure message: under a
-    // loaded gate the view has been seen left at line ~83 200 with the cursor on the last line.)
+    // Jumping to the end. (It used to land thousands of lines short now and then, when a
+    // parallel test changed the process-wide font size; see
+    // `jump_to_end_across_a_font_size_change`.)
     let key = (file.clone(), EditorView::Disk);
     let view = |h: &Harness<'_, VoidApp>| h.state().editors.doc(&key).map(|d| d.core.view.clone());
     let before = view(&h);
@@ -972,5 +973,40 @@ fn e2e_editor_round_trip() {
         std::fs::read(&file).unwrap(),
         original,
         "undo and :w restore the exact bytes"
+    );
+}
+
+/// `G` while the font size changes under the editor (here: another egui context applying a
+/// different size, as the chat panel's tests do in parallel): the last line must still show.
+#[test]
+fn jump_to_end_across_a_font_size_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("long.rs");
+    let src: String = (0..20_000)
+        .map(|i| format!("fn f{i}(x: u32) -> u32 {{ x + {i} }} // line {i}\n"))
+        .collect();
+    std::fs::write(&file, &src).unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    let key = (file.clone(), EditorView::Disk);
+    until(&mut h, "parse", |a| {
+        a.editors.doc(&key).is_some_and(|d| d.highlighted())
+    });
+    let size = h.state().state.config.font_size;
+    let other = egui::Context::default();
+    crate::theme::apply(&other, void_core::config::Theme::Dark, size - 1.0);
+    h.step();
+    crate::theme::apply(&other, void_core::config::Theme::Dark, size);
+    h.event(Event::Text("G".into()));
+    h.step();
+    h.step();
+    let doc = h.state().editors.doc(&key).unwrap();
+    assert_eq!(doc.core.line_col().0, 19_999);
+    assert!(
+        shown(&h).contains("line 19999"),
+        "G didn't show the last line: view {:?}, first line shown {:?}",
+        doc.core.view,
+        shown(&h).lines().next()
     );
 }
