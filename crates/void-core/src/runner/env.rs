@@ -140,7 +140,11 @@ fn run_cmd(cmd: &str, timeout: Duration) -> Result<String, String> {
         return Err(format!("command timed out after {} s", timeout.as_secs()));
     };
     let grace = Duration::from_secs(1);
-    let stdout = out.recv_timeout(grace).unwrap_or_default();
+    // A helper that escaped the group (its own session) can hold stdout open: then the value
+    // is unknown, so neither it nor stderr (which could echo it unredacted) is used.
+    let Ok(stdout) = out.recv_timeout(grace) else {
+        return Err("the command's output didn't close (a background process kept it open)".into());
+    };
     let stderr = err.recv_timeout(grace).unwrap_or_default();
     let value = stdout.trim().to_string();
     if status.success() {
@@ -254,6 +258,43 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
+    }
+
+    #[test]
+    fn corrupt_env_toml_warning_never_quotes_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env.toml");
+        // Forgot `value =`: a bare string, and a bare integer.
+        for (body, secret) in [
+            (
+                "[[profiles]]\nname = \"dev\"\n[profiles.vars]\nAPI_KEY = \"sk-live-SECRET123\"\n",
+                "sk-live-SECRET123",
+            ),
+            (
+                "[[profiles]]\nname = \"dev\"\n[profiles.vars.PIN]\nvalue = 918273\n",
+                "918273",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let (envs, warn) = Envs::load(&path).unwrap();
+            assert!(envs.profiles.is_empty());
+            let warn = warn.unwrap();
+            assert!(!warn.contains(secret), "{warn}");
+            assert!(warn.contains("env.toml") && warn.contains("line"), "{warn}");
+        }
+    }
+
+    #[test]
+    fn cmd_output_left_open_is_an_error_not_empty() {
+        // A helper in its own session keeps stdout open past the group kill.
+        let envs = profile(&[(
+            "TOKEN",
+            EnvValue::Cmd("echo tok-xyz; setsid sleep 3 &".into()),
+        )]);
+        let e = envs.resolve("dev").unwrap_err();
+        assert!(e.contains("dev") && e.contains("TOKEN"), "{e}");
+        assert!(e.contains("didn't close"), "{e}");
+        assert!(!e.contains("tok-xyz"), "{e}");
     }
 
     fn mode(p: &Path) -> u32 {

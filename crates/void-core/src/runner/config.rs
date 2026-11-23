@@ -102,6 +102,17 @@ pub(crate) fn load_toml<T: Default + for<'de> Deserialize<'de>>(
     match toml::from_str(&text) {
         Ok(v) => Ok((v, None)),
         Err(e) => {
+            // toml's messages quote the offending value ("unknown variant `sk-…`",
+            // "integer `1234`"), so a private file's warning says only where it broke.
+            let why = if private {
+                let at = e.span().map(|s| {
+                    let line = text[..s.start.min(text.len())].matches('\n').count() + 1;
+                    format!(" at line {line}")
+                });
+                format!("isn't a valid profile file{}", at.unwrap_or_default())
+            } else {
+                e.message().to_string()
+            };
             let msg = match fsutil::set_aside(path) {
                 Ok(bad) => {
                     if private {
@@ -112,14 +123,14 @@ pub(crate) fn load_toml<T: Default + for<'de> Deserialize<'de>>(
                     format!(
                         "{} was unreadable ({}); kept as {} and started fresh",
                         path.display(),
-                        e.message(),
+                        why,
                         bad.display()
                     )
                 }
                 Err(io) => format!(
                     "{} was unreadable ({}) and couldn't be set aside: {io}",
                     path.display(),
-                    e.message()
+                    why
                 ),
             };
             Ok((T::default(), Some(msg)))
