@@ -11,16 +11,21 @@ use egui::{RichText, Ui};
 use void_core::config::EditorSettings;
 use void_editor::{Lang, Syntax, Tree};
 
+mod chat;
 pub mod draw;
 mod host;
 pub mod input;
 mod paint;
 pub mod state;
 mod status;
+mod views;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_tests;
 
+pub use chat::{ChatOverlays, OverlaySave};
 pub use host::file_name;
 pub use state::Doc;
 
@@ -45,8 +50,10 @@ pub enum EditorAction {
     CloseAll { force: bool },
     /// `:wa`.
     SaveAll,
-    /// `:e` / `:e!` with no file: reload from disk.
+    /// `:e` / `:e!` with no file: reload from disk (or the chat's version).
     Reload { tab: u32, force: bool },
+    /// `:w` / `:w!` in a chat view (Disk views save in place).
+    Save { tab: u32, force: bool },
 }
 
 /// A dirty tab the user asked to close: Save / Discard / Cancel.
@@ -123,6 +130,12 @@ pub struct EditorStore {
     pub focused_widget: Option<egui::Id>,
     /// One of the app's own dialogs (quit, delete from the file tree) is up.
     pub dialog: bool,
+    /// The folder workspace's chat layers (None in Scratch: no chat views there).
+    pub overlays: Option<ChatOverlays>,
+    /// Chats whose agent turn is running (their views can't be saved).
+    pub busy_chats: std::collections::HashSet<void_core::model::ConversationId>,
+    /// Chat-view saves for the app to send to the engine.
+    pub overlay_saves: Vec<OverlaySave>,
 }
 
 impl EditorStore {
@@ -140,6 +153,9 @@ impl EditorStore {
             settings: EditorSettings::default(),
             focused_widget: None,
             dialog: false,
+            overlays: None,
+            busy_chats: Default::default(),
+            overlay_saves: Vec::new(),
         }
     }
 
@@ -170,10 +186,13 @@ impl EditorStore {
         self.failed.get(key).map(String::as_str)
     }
 
-    /// Load the buffer for `key` unless it's open. Only Disk views load anything for now.
+    /// Load the buffer for `key` unless it's open: the file, or a chat's version of it.
     pub fn open(&mut self, key: &DocKey) -> Result<(), String> {
-        if self.docs.contains_key(key) || key.1 != EditorView::Disk {
+        if self.docs.contains_key(key) {
             return Ok(());
+        }
+        if key.1 != EditorView::Disk {
+            return self.open_chat(key);
         }
         match Doc::open(&key.0) {
             Ok(doc) => {
@@ -224,14 +243,15 @@ impl EditorStore {
             .is_some_and(|d| d.core.disk == state::DiskState::Deleted)
     }
 
+    /// Save to disk, or (a chat view) to the chat's pending changes through the engine.
     pub fn save(&mut self, key: &DocKey) -> Result<String, String> {
+        if key.1 != EditorView::Disk {
+            return self.save_chat(key, false);
+        }
         let doc = self
             .docs
             .get_mut(key)
             .ok_or_else(|| "That file isn't open".to_string())?;
-        if key.1 != EditorView::Disk {
-            return Err("Saving a chat view isn't available yet".into());
-        }
         let r = doc.core.save(&key.0);
         doc.core.message = Some(match &r {
             Ok(m) => state::Msg::info(m.clone()),
@@ -243,6 +263,9 @@ impl EditorStore {
     /// Reload a buffer from disk (keeps the cursor line; the buffer ends up clean). For
     /// external changes (Task 7) and `:e!`.
     pub fn reload(&mut self, key: &DocKey) -> Result<(), String> {
+        if key.1 != EditorView::Disk {
+            return self.reload_chat(key);
+        }
         let doc = self
             .docs
             .get_mut(key)
@@ -276,11 +299,12 @@ impl EditorStore {
     }
 
     /// Files under `from` were renamed to `to`: their buffers move along (edits and undo kept).
+    /// Chat views stay: a rename on disk doesn't move a chat's pending changes.
     pub fn rename_path(&mut self, from: &Path, to: &Path) {
         let moved: Vec<DocKey> = self
             .docs
             .keys()
-            .filter(|k| k.0.starts_with(from))
+            .filter(|k| k.1 == EditorView::Disk && k.0.starts_with(from))
             .cloned()
             .collect();
         for key in moved {
@@ -406,10 +430,6 @@ pub fn lang_icon(path: &Path) -> &'static str {
 pub fn show(ui: &mut Ui, p: &mut Panels, tab: u32, path: &Path, view: &EditorView) {
     let pal = theme::palette_of(ui);
     let key: DocKey = (path.to_path_buf(), view.clone());
-    if let EditorView::Chat(_) = view {
-        message(ui, &pal, icon::CHAT, "Chat views aren't available yet");
-        return;
-    }
     if p.editors.doc(&key).is_none() && p.editors.failure(&key).is_none() {
         let _ = p.editors.open(&key);
     }

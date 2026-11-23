@@ -1,11 +1,13 @@
 //! Drawing an editor tab: only the visible lines, with the gutter, selections, search
 //! matches and the cursor; then the `:` line and the status line. Mouse clicks and drags.
 
+use egui::RichText;
 use egui::accesskit::Role;
 use egui::{
     CornerRadius, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
     pos2, vec2,
 };
+use void_core::model::ConversationId;
 use void_vim::Mode;
 
 use super::host::{Ctx, Host};
@@ -14,7 +16,8 @@ use super::paint::{
     Row, TEXT_PAD, accessible_text, layout_row, matching_bracket, search_matches, selected_cols,
 };
 use super::state::Doc;
-use super::{DocKey, input, status};
+use super::{DocKey, input, status, views};
+use crate::layout::EditorView;
 use crate::panels::Panels;
 use crate::theme::{self, with_alpha};
 
@@ -24,42 +27,64 @@ const BANNER_H: f32 = 28.0;
 /// What a banner button does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerAction {
-    /// Take the file on disk (the buffer's edits are dropped, as one undo step).
+    /// Take the file on disk, or the chat's version (the buffer's edits are dropped, as one
+    /// undo step).
     Reload,
     /// Keep the buffer; don't ask again about this version of the file.
     KeepMine,
     /// Save the buffer over the outside changes (`:w!`).
     Overwrite,
+    /// Show this chat's pending change to the file in Review.
+    Review(ConversationId),
+    /// Switch the tab to this chat's version of the file.
+    ViewChat(ConversationId),
 }
 
-/// A strip above the text: a notice, or a question with buttons.
+/// A strip above the text: a notice, or a question with buttons (and, for several chats, a
+/// menu of them).
 pub struct Banner {
     pub icon: &'static str,
     pub text: String,
     pub color: fn(&theme::Palette) -> egui::Color32,
     pub buttons: Vec<(&'static str, BannerAction)>,
+    /// Chats to pick from, each with Review / View void's version.
+    pub menu: Vec<(String, ConversationId)>,
 }
 
-/// The banners an open buffer shows, top to bottom. (Task 8 adds "pending changes" here.)
-pub fn banners(doc: &Doc) -> Vec<Banner> {
+/// The banners an open buffer shows, top to bottom; `chat`: the tab shows a chat's version
+/// (its "disk" is the chat's pending changes).
+pub fn banners(doc: &Doc, chat: bool) -> Vec<Banner> {
     use super::state::DiskState;
     let mut out = Vec::new();
+    let (changed, deleted) = if chat {
+        (
+            "void changed its version while you have unsaved edits",
+            "Not in void's version any more. The text is still here; saving puts it back",
+        )
+    } else {
+        (
+            "Changed on disk while you have unsaved edits",
+            "Deleted on disk. The text is still here; saving puts the file back",
+        )
+    };
     match doc.core.disk {
         DiskState::Changed => out.push(Banner {
             icon: theme::icon::WARNING,
-            text: "Changed on disk while you have unsaved edits".into(),
+            text: changed.into(),
             color: |p| p.warn,
             buttons: vec![
                 ("Reload", BannerAction::Reload),
                 ("Keep mine", BannerAction::KeepMine),
                 ("Overwrite", BannerAction::Overwrite),
             ],
+            menu: Vec::new(),
         }),
         DiskState::Deleted => out.push(Banner {
             icon: theme::icon::TRASH,
-            text: "Deleted on disk. The text is still here; saving puts the file back".into(),
+            text: deleted.into(),
             color: |p| p.err,
             buttons: Vec::new(),
+            menu: Vec::new(),
         }),
         DiskState::InSync => {}
     }
@@ -69,6 +94,7 @@ pub fn banners(doc: &Doc) -> Vec<Banner> {
             text: n.clone(),
             color: |p| p.warn,
             buttons: Vec::new(),
+            menu: Vec::new(),
         });
     }
     out
@@ -78,44 +104,51 @@ fn banner(ui: &mut Ui, pal: &theme::Palette, r: Rect, b: &Banner) -> Option<Bann
     let color = (b.color)(pal);
     ui.painter()
         .rect_filled(r, CornerRadius::same(4), with_alpha(color, 26));
+    // Buttons on the right; the text takes what's left (cut short on a narrow tab), so a
+    // banner stays one line high.
     let mut child = ui.new_child(
         UiBuilder::new()
             .max_rect(r.shrink2(vec2(6.0, 1.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    child.label(theme::itext_styled(
-        b.icon,
-        &b.text,
-        theme::small_size(),
-        color,
-    ));
     let mut hit = None;
-    for (label, action) in &b.buttons {
+    if !b.menu.is_empty() {
+        child.menu_button(
+            theme::itext_small(theme::icon::CHATS, "Pick a chat"),
+            |ui| {
+                for (title, c) in &b.menu {
+                    ui.label(RichText::new(title).small().color(pal.text_dim));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Review").clicked() {
+                            hit = Some(BannerAction::Review(*c));
+                            ui.close();
+                        }
+                        if ui.small_button("View void's version").clicked() {
+                            hit = Some(BannerAction::ViewChat(*c));
+                            ui.close();
+                        }
+                    });
+                }
+            },
+        );
+    }
+    for (label, action) in b.buttons.iter().rev() {
         if child.small_button(*label).clicked() {
             hit = Some(*action);
         }
     }
+    child.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add(
+            egui::Label::new(theme::itext_styled(
+                b.icon,
+                &b.text,
+                theme::small_size(),
+                color,
+            ))
+            .truncate(),
+        );
+    });
     hit
-}
-
-fn apply_banner(doc: &mut Doc, path: &std::path::Path, action: BannerAction) {
-    match action {
-        BannerAction::Reload => {
-            doc.core.message = Some(match doc.reload(path) {
-                Ok(()) => {
-                    super::state::Msg::info(format!("\"{}\" reloaded", super::file_name(path)))
-                }
-                Err(e) => super::state::Msg::error(format!("Couldn't reload: {e}")),
-            });
-        }
-        BannerAction::KeepMine => doc.keep_mine(path),
-        BannerAction::Overwrite => {
-            doc.core.message = Some(match doc.core.save_forced(path) {
-                Ok(m) => super::state::Msg::info(m),
-                Err(e) => super::state::Msg::error(e),
-            });
-        }
-    }
 }
 
 pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
@@ -149,6 +182,17 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
             )
         });
     }
+    let chat = match key.1 {
+        EditorView::Chat(c) => Some(c),
+        EditorView::Disk => None,
+    };
+    // Disk tabs: which chats have pending changes to this file.
+    let pending = views::pending_banner(p, key);
+    let header_h = if p.editors.overlays.is_some() {
+        views::HEADER_H
+    } else {
+        0.0
+    };
     let store = &mut *p.editors;
     let Some(doc) = store.docs.get_mut(key) else {
         return;
@@ -181,9 +225,12 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     let font = FontId::monospace(theme::body_size() - 1.0);
     let (glyph_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
     let row_h = (glyph_h * 1.35).round();
-    let full = ui.available_rect_before_wrap();
-    ui.allocate_rect(full, Sense::hover());
-    let banners = banners(doc);
+    let whole = ui.available_rect_before_wrap();
+    ui.allocate_rect(whole, Sense::hover());
+    let header_rect = Rect::from_min_size(whole.min, vec2(whole.width(), header_h));
+    let full = Rect::from_min_max(pos2(whole.left(), whole.top() + header_h), whole.max);
+    let mut banners = banners(doc, chat.is_some());
+    banners.extend(pending);
     let notice_h = banners.len() as f32 * BANNER_H;
     let status_h = 26.0;
     let prompt_h = if doc.core.prompt.is_some() {
@@ -212,9 +259,6 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
         if let Some(a) = banner(ui, &pal, r, b) {
             clicked = Some(a);
         }
-    }
-    if let Some(a) = clicked {
-        apply_banner(doc, &key.0, a);
     }
 
     // The visual-block shape comes from the engine.
@@ -458,7 +502,15 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     doc.views.insert(tab, doc.core.view.clone());
 
     let status = Rect::from_min_max(pos2(full.left(), full.bottom() - status_h + 2.0), full.max);
-    status::status_line(ui, doc, vim, status, &pal);
+    status::status_line(ui, doc, vim, chat.is_some(), status, &pal);
+
+    if header_h > 0.0 {
+        views::header(ui, p, tab, key, header_rect);
+    }
+    if let Some(a) = clicked {
+        views::banner_action(p, tab, key, a);
+        ui.ctx().request_repaint();
+    }
 }
 
 /// The char a pointer position falls on (clamped to the drawn rows).

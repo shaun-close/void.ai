@@ -162,7 +162,8 @@ impl VoidApp {
     pub(super) fn follow_rename(&mut self, from: &Path, to: &Path) {
         self.editors.rename_path(from, to);
         for (_, tab) in self.dock.iter_all_tabs_mut() {
-            if let crate::layout::Tab::Editor { path, .. } = tab
+            if let crate::layout::Tab::Editor { path, view, .. } = tab
+                && *view == EditorView::Disk
                 && path.starts_with(from)
             {
                 *path = crate::editor::moved_path(path, from, to);

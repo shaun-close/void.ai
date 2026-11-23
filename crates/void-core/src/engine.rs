@@ -95,6 +95,15 @@ pub enum Command {
     /// Summarise the conversation now.
     Compact(ConversationId),
     ClearSandboxCaches,
+    /// The user saved a chat view: write `content` into the conversation's pending changes
+    /// (refused while its turn is active). `path` is workspace-relative or absolute inside it.
+    SaveToOverlay {
+        conversation: ConversationId,
+        path: PathBuf,
+        content: String,
+    },
+    /// A `Changes` event for every conversation in this workspace that has pending changes.
+    ListWorkspaceChanges,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +198,11 @@ pub enum Event {
     TurnState {
         conversation: ConversationId,
         active: bool,
+    },
+    /// A `SaveToOverlay` landed; `path` is as the command gave it.
+    OverlaySaved {
+        conversation: ConversationId,
+        path: PathBuf,
     },
 }
 
@@ -1076,6 +1090,17 @@ impl State {
                     }
                 }
             }
+            Command::SaveToOverlay {
+                conversation,
+                path,
+                content,
+            } => self.save_to_overlay(conversation, path, content),
+            Command::ListWorkspaceChanges => {
+                let ws = self.workspace.clone();
+                for meta in self.store.list(&ws.id).0 {
+                    self.emit_changes(&ws, meta.id);
+                }
+            }
             Command::SaveConfig(config) => match save_config(&self.config_path, &config) {
                 Ok(()) => {
                     let sandbox_changed = config.sandbox != self.config.sandbox;
@@ -1107,6 +1132,75 @@ impl State {
                 });
             }
         }
+    }
+
+    /// A chat-view save: into the conversation's pending changes, never the real file, and
+    /// never while its turn runs (the agent's layer may be mounted, and Retry would undo it).
+    fn save_to_overlay(&mut self, id: ConversationId, path: PathBuf, content: String) {
+        let ws = self.workspace.clone();
+        let Some(root) = ws.root.clone() else {
+            self.emit(Event::Error(
+                "Chat views need a folder workspace (File › Open Folder)".into(),
+            ));
+            return;
+        };
+        if self.busy(id) {
+            self.emit(Event::Error(
+                "void is working in this chat — save to Disk, or wait".into(),
+            ));
+            return;
+        }
+        if self
+            .conversation(id)
+            .is_none_or(|c| c.workspace_id != ws.id)
+        {
+            self.emit(Event::Error(
+                "That chat isn't in this workspace any more".into(),
+            ));
+            return;
+        }
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path.clone(),
+        };
+        let inside = !rel.as_os_str().is_empty()
+            && rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !inside {
+            self.emit(Event::Error(format!(
+                "{} is outside the workspace",
+                path.display()
+            )));
+            return;
+        }
+        let Some(ov) = self.overlay_for(&ws, id) else {
+            self.emit(Event::Error(
+                "Couldn't open the chat's pending changes".into(),
+            ));
+            return;
+        };
+        let name = rel.display().to_string();
+        match ov.write(&rel, content.as_bytes()) {
+            Ok(()) => {
+                if let Err(e) = ov.note_user_edit(&rel) {
+                    self.emit(Event::Error(format!(
+                        "Saved {name}, but couldn't tell the agent: {e}"
+                    )));
+                }
+                self.emit(Event::OverlaySaved {
+                    conversation: id,
+                    path,
+                });
+            }
+            Err(e) => self.emit(Event::Error(format!(
+                "Couldn't save {name} to the chat's pending changes: {e}"
+            ))),
+        }
+        self.emit(Event::Changes {
+            conversation: id,
+            changes: ov.changes(),
+        });
     }
 
     fn open_workspace(&mut self, ws: Workspace) {
@@ -2711,6 +2805,159 @@ mod tests {
             .filter(|m| m.role == Role::User)
             .count();
         assert_eq!(users, 1, "the second message was refused, not queued");
+    }
+
+    #[test]
+    fn save_to_overlay_writes_and_notes() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "edit",
+                    serde_json::json!({"path": "a.txt", "old_string": "pineapple", "new_string": "mango"}),
+                ),
+                say("edited"),
+                call("c2", "read", serde_json::json!({"path": "a.txt"})),
+                say("read"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "change it");
+        a.finish_with("edited");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        a.r.handle.send(Command::SaveToOverlay {
+            conversation: a.conv,
+            path: "a.txt".into(),
+            content: "mango and kiwi\n".into(),
+        });
+        let conv = a.conv;
+        a.r.until(|e| {
+            matches!(e, Event::OverlaySaved { conversation, path }
+                if *conversation == conv && path == std::path::Path::new("a.txt"))
+        });
+        a.r.until(|e| matches!(e, Event::Changes { conversation, .. } if *conversation == conv));
+        assert_eq!(
+            a.overlay().read(std::path::Path::new("a.txt")).unwrap(),
+            b"mango and kiwi\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(a.ws.join("a.txt")).unwrap(),
+            "pineapple\n",
+            "a chat-view save never touches the real file"
+        );
+        // A path outside the workspace is refused.
+        a.r.handle.send(Command::SaveToOverlay {
+            conversation: a.conv,
+            path: "../escape.txt".into(),
+            content: "x".into(),
+        });
+        match a.r.until(|e| matches!(e, Event::Error(_))) {
+            Event::Error(m) => assert!(m.contains("outside"), "{m}"),
+            _ => unreachable!(),
+        }
+        // The agent hears about the edit at its next turn, once.
+        a.r.send(a.conv, "look again");
+        match a.r.until(|e| matches!(e, Event::ToolFinished { .. })) {
+            Event::ToolFinished { output, .. } => {
+                assert!(
+                    output
+                        .content
+                        .starts_with("The user edited a.txt in your pending changes"),
+                    "{output:?}"
+                );
+                assert!(output.content.contains("mango and kiwi"), "{output:?}");
+            }
+            _ => unreachable!(),
+        }
+        a.finish_with("read");
+        assert!(a.overlay().take_rejections().is_empty());
+    }
+
+    #[test]
+    fn chat_view_save_refused_during_turn() {
+        let rules = defaults_with(Rule {
+            tool: "write".into(),
+            prefix: None,
+            action: Action::Ask,
+        });
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "B"}),
+                ),
+                say("ok"),
+            ],
+            50,
+            Some(rules),
+            1000,
+        );
+        a.r.send(a.conv, "write");
+        let id = match a.r.until(|e| matches!(e, Event::ApprovalNeeded(_))) {
+            Event::ApprovalNeeded(req) => req.id,
+            _ => unreachable!(),
+        };
+        a.r.handle.send(Command::SaveToOverlay {
+            conversation: a.conv,
+            path: "a.txt".into(),
+            content: "hijack\n".into(),
+        });
+        match a.r.until(|e| {
+            assert!(
+                !matches!(e, Event::OverlaySaved { .. }),
+                "saved during a turn"
+            );
+            matches!(e, Event::Error(_))
+        }) {
+            Event::Error(m) => assert!(m.contains("void is working in this chat"), "{m}"),
+            _ => unreachable!(),
+        }
+        let ov = a.overlay();
+        assert!(!ov.upper().join("a.txt").exists(), "no overlay write");
+        assert_eq!(
+            ov.read(std::path::Path::new("a.txt")).unwrap(),
+            b"pineapple\n"
+        );
+        assert!(
+            ov.take_rejections().is_empty(),
+            "no note for a refused save"
+        );
+        a.r.handle.send(Command::Approve {
+            id,
+            decision: Decision::Once,
+        });
+        a.finish_with("ok");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+    }
+
+    #[test]
+    fn list_workspace_changes_reports_every_chat_with_an_overlay() {
+        let mut a = agent_rig(vec![say("hi")], 50, None, 1000);
+        let other = a.r.new_conversation();
+        let _quiet = a.r.new_conversation();
+        let w = a.r.store.workspace_for(&a.ws).unwrap();
+        for c in [a.conv, other] {
+            Overlay::open(&a.r.store.overlay_dir(&w.id, &c), &a.ws)
+                .unwrap()
+                .write(std::path::Path::new("a.txt"), b"x\n")
+                .unwrap();
+        }
+        a.r.handle.send(Command::ListWorkspaceChanges);
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < 2 {
+            if let Event::Changes {
+                conversation,
+                changes,
+            } = a.r.until(|e| matches!(e, Event::Changes { .. }))
+            {
+                assert_eq!(changes.len(), 1);
+                seen.insert(conversation);
+            }
+        }
+        assert!(seen.contains(&a.conv) && seen.contains(&other));
     }
 
     #[test]

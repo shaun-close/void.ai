@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use void_core::model::ConversationId;
+
 use super::VoidApp;
 use crate::editor::state::Msg;
 use crate::editor::{CloseRequest, DocKey, EditorAction, file_name};
@@ -179,16 +181,16 @@ impl VoidApp {
                 }
             }
             EditorAction::SaveAll => {
-                let keys: Vec<DocKey> = self
-                    .editors
-                    .keys()
-                    .filter(|k| k.1 == EditorView::Disk)
-                    .cloned()
-                    .collect();
+                let keys: Vec<DocKey> = self.editors.keys().cloned().collect();
                 for k in keys {
                     if self.editors.is_dirty(&k) {
                         let _ = self.editors.save(&k);
                     }
+                }
+            }
+            EditorAction::Save { tab, force } => {
+                if let Some(key) = self.editor_key(tab) {
+                    let _ = self.editors.save_chat(&key, force);
                 }
             }
             EditorAction::Reload { tab, force } => {
@@ -205,6 +207,90 @@ impl VoidApp {
                 };
                 self.editor_message(&key, msg);
             }
+        }
+    }
+
+    /// Show another version of a tab's file. The old view's unsaved edits stay in their
+    /// buffer (switching back brings them back; quitting asks about them).
+    pub(super) fn switch_editor_view(&mut self, tab: u32, view: EditorView) {
+        let Some(old) = self.editor_key(tab) else {
+            return;
+        };
+        if old.1 == view {
+            return;
+        }
+        let dirty = self.editors.is_dirty(&old);
+        for (_, t) in self.dock.iter_all_tabs_mut() {
+            if let Tab::Editor { id, view: v, .. } = t
+                && *id == tab
+            {
+                *v = view.clone();
+            }
+        }
+        let key: DocKey = (old.0.clone(), view);
+        let _ = self.editors.open(&key);
+        if dirty {
+            let from = match old.1 {
+                EditorView::Disk => "the Disk view".to_string(),
+                EditorView::Chat(c) => format!("void's version in {}", self.state.chat_title(c)),
+            };
+            self.editor_message(
+                &key,
+                Msg::info(format!(
+                    "Unsaved edits in {from} are kept: switch back to save them"
+                )),
+            );
+        }
+        self.focus_editor_tab(tab);
+    }
+
+    /// Chats an editor tab can show the version of: those with pending changes (listed when
+    /// the workspace opened) or open in a Chat tab, in the list's order.
+    pub(super) fn view_chats(&self) -> Vec<ConversationId> {
+        if self.state.workspace.root.is_none() {
+            return Vec::new();
+        }
+        let open: Vec<ConversationId> = self
+            .dock
+            .iter_all_tabs()
+            .filter_map(|(_, t)| match t {
+                Tab::Chat {
+                    conversation: Some(c),
+                    ..
+                } => Some(*c),
+                _ => None,
+            })
+            .collect();
+        self.state
+            .conversations
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| self.state.changes.contains_key(id) || open.contains(id))
+            .collect()
+    }
+
+    /// Engine news for chat views: saves that landed or failed, chats whose changes moved.
+    pub(super) fn chat_view_events(&mut self) {
+        for (conv, path) in self.state.take_overlay_saved() {
+            self.editors.overlay_saved(conv, &path);
+        }
+        if let Some(e) = self.state.take_errors().pop() {
+            self.editors.overlay_save_failed(&e);
+        }
+        let changed = self.state.take_changed_chats();
+        if !changed.is_empty() {
+            self.editors.check_overlays(&changed);
+        }
+    }
+
+    /// Send the chat-view saves queued this frame.
+    pub(super) fn send_overlay_saves(&mut self) {
+        for s in std::mem::take(&mut self.editors.overlay_saves) {
+            self.engine.send(void_core::engine::Command::SaveToOverlay {
+                conversation: s.conversation,
+                path: s.path,
+                content: s.content,
+            });
         }
     }
 

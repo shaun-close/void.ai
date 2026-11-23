@@ -296,6 +296,8 @@ pub struct Doc {
     /// Each tab's own scroll position (tabs on one buffer share the text and the cursor). The
     /// tab being drawn swaps its view into `core.view`.
     pub views: std::collections::HashMap<u32, View>,
+    /// A chat-view save sent to the engine: the buffer version and the text's fingerprint.
+    pub chat_save: Option<(u64, Fingerprint)>,
 }
 
 pub fn has_grammar(lang: &Lang) -> bool {
@@ -345,6 +347,7 @@ impl Doc {
             hl_cache: None,
             typing: false,
             views: Default::default(),
+            chat_save: None,
         }
     }
 
@@ -519,7 +522,13 @@ impl Doc {
     /// Replace the text with the file on disk (keeping the cursor line), as one undo step;
     /// marks follow. The buffer is clean afterwards.
     pub fn reload(&mut self, path: &Path) -> std::io::Result<()> {
-        let disk = Buffer::from_file(path)?;
+        self.reload_from(Buffer::from_file(path)?);
+        Ok(())
+    }
+
+    /// Replace the text with `disk`'s (the file, or a chat's version of it); see
+    /// [`Doc::reload`].
+    pub fn reload_from(&mut self, disk: Buffer) {
         let c = &mut self.core;
         let (line, _) = c.line_col();
         let old_len = c.len();
@@ -544,7 +553,6 @@ impl Doc {
         c.disk = DiskState::InSync;
         c.kept = None;
         self.hl_cache = None;
-        Ok(())
     }
 }
 

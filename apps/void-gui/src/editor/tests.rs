@@ -27,7 +27,7 @@ fn harness(root: &Path) -> Harness<'static, VoidApp> {
     h
 }
 
-fn until(h: &mut Harness<'_, VoidApp>, what: &str, done: impl Fn(&VoidApp) -> bool) {
+pub(super) fn until(h: &mut Harness<'_, VoidApp>, what: &str, done: impl Fn(&VoidApp) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         h.step();
@@ -40,7 +40,7 @@ fn until(h: &mut Harness<'_, VoidApp>, what: &str, done: impl Fn(&VoidApp) -> bo
 }
 
 /// What the editor widget currently shows (its visible lines).
-fn shown(h: &Harness<'_, VoidApp>) -> String {
+pub(super) fn shown(h: &Harness<'_, VoidApp>) -> String {
     h.get_by_role(Role::MultilineTextInput)
         .value()
         .unwrap_or_default()
@@ -57,7 +57,7 @@ fn editor_tabs(app: &VoidApp) -> Vec<u32> {
 }
 
 /// Type `s` and let two frames pass (tab titles show what the frame before them did).
-fn text(h: &mut Harness<'_, VoidApp>, s: &str) {
+pub(super) fn text(h: &mut Harness<'_, VoidApp>, s: &str) {
     h.event(Event::Text(s.into()));
     h.step();
     h.step();

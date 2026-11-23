@@ -925,6 +925,16 @@ impl Overlay {
         )
     }
 
+    /// Tell the agent at its next turn that the user edited `rel` in these pending changes.
+    /// Repeated saves before that turn make one note.
+    pub fn note_user_edit(&self, rel: &Path) -> io::Result<()> {
+        let text = format!("The user edited {} in your pending changes", rel.display());
+        if self.meta().rejected.contains(&text) {
+            return Ok(());
+        }
+        self.note(text)
+    }
+
     /// Rejection notes not yet passed to the agent (and forget them).
     pub fn take_rejections(&self) -> Vec<String> {
         let m = self.meta();
@@ -1444,6 +1454,19 @@ mod tests {
         assert!(matches!(t.ov.resolve(Path::new("w")), Entry::File(_)));
         assert!(t.ov.restore_checkpoint().unwrap());
         assert!(matches!(t.ov.resolve(Path::new("w")), Entry::Missing));
+    }
+
+    #[test]
+    fn user_edit_notes_are_reported_once_each() {
+        let t = setup();
+        t.ov.write(Path::new("src/x.rs"), b"1").unwrap();
+        t.ov.note_user_edit(Path::new("src/x.rs")).unwrap();
+        t.ov.note_user_edit(Path::new("src/x.rs")).unwrap();
+        assert_eq!(
+            t.ov.take_rejections(),
+            ["The user edited src/x.rs in your pending changes"]
+        );
+        assert!(t.ov.take_rejections().is_empty());
     }
 
     #[test]

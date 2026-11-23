@@ -40,6 +40,15 @@ impl Fingerprint {
         }
     }
 
+    /// Bytes with no file behind them (a chat's pending version): compared by content only.
+    pub fn of_bytes(bytes: &[u8]) -> Fingerprint {
+        Fingerprint {
+            len: bytes.len() as u64,
+            modified: None,
+            hash: xxhash_rust::xxh3::xxh3_64(bytes),
+        }
+    }
+
     fn same_stat(&self, meta: &fs::Metadata) -> bool {
         self.len == meta.len() && self.modified.is_some() && self.modified == meta.modified().ok()
     }

@@ -105,6 +105,11 @@ impl Buffer {
         self.saved_version = self.version;
     }
 
+    /// The text as of `version` was saved (a save that finished after more edits: still dirty).
+    pub fn mark_saved_at(&mut self, version: u64) {
+        self.saved_version = version;
+    }
+
     /// Replace the char `range` with `text`, recording it for undo. Returns the change in the
     /// coordinates tree-sitter needs.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> Edit {

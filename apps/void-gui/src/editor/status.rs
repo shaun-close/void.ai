@@ -24,7 +24,8 @@ fn mode_label(doc: &Doc, vim: bool) -> (&'static str, fn(&Palette) -> Color32) {
 }
 
 /// The editor: input (when focused), the text area, the `:` line and the status line.
-pub fn status_line(ui: &mut Ui, doc: &Doc, vim: bool, rect: Rect, pal: &Palette) {
+/// `chat`: the tab shows a chat's version of the file (marked in the accent colour).
+pub fn status_line(ui: &mut Ui, doc: &Doc, vim: bool, chat: bool, rect: Rect, pal: &Palette) {
     let mut ui = ui.new_child(UiBuilder::new().max_rect(rect));
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
@@ -37,6 +38,10 @@ pub fn status_line(ui: &mut Ui, doc: &Doc, vim: bool, rect: Rect, pal: &Palette)
             .show(ui, |ui| {
                 ui.label(RichText::new(mode).monospace().small().color(color));
             });
+        if chat {
+            ui.label(RichText::new("chat view").small().color(pal.accent2))
+                .on_hover_text("Saving writes this chat's pending changes, not the file");
+        }
         let st = doc.vim.state();
         if vim && !st.pending.is_empty() {
             ui.label(

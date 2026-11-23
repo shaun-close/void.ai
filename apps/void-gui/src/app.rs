@@ -23,7 +23,7 @@ mod disk;
 mod editors;
 
 pub struct VoidApp {
-    engine: EngineHandle,
+    pub(crate) engine: EngineHandle,
     store: Store,
     pub(crate) state: UiState,
     pub(crate) dock: DockState<Tab>,
@@ -40,7 +40,7 @@ pub struct VoidApp {
     list: crate::panels::conversations::ListUi,
     backends: crate::panels::backends::BackendsUi,
     md: egui_commonmark::CommonMarkCache,
-    review: crate::panels::review::ReviewUi,
+    pub(crate) review: crate::panels::review::ReviewUi,
     /// A first message waiting for the conversation it asked the engine to create.
     pending_start: Option<(u32, String)>,
     /// Quitting with unsaved editor buffers: the dialog is up / the user said quit anyway.
@@ -145,16 +145,34 @@ impl VoidApp {
                 }
             }
             self.saved_layout = layout::to_text(&self.dock);
+            // Chat views read this workspace's layers; banners need every chat's changes.
+            self.editors.overlays =
+                self.state
+                    .workspace
+                    .root
+                    .clone()
+                    .map(|root| crate::editor::ChatOverlays {
+                        store: self.store.clone(),
+                        workspace: self.state.workspace.id.clone(),
+                        root,
+                    });
+            self.engine.send(Command::ListWorkspaceChanges);
         }
         for gone in self.state.take_deleted() {
             for (_, tab) in self.dock.iter_all_tabs_mut() {
-                if let Tab::Chat { conversation, .. } = tab
-                    && *conversation == Some(gone)
-                {
-                    *conversation = None;
+                match tab {
+                    Tab::Chat { conversation, .. } if *conversation == Some(gone) => {
+                        *conversation = None;
+                    }
+                    // Its pending changes went with it: show the file on disk.
+                    Tab::Editor { view, .. } if *view == EditorView::Chat(gone) => {
+                        *view = EditorView::Disk;
+                    }
+                    _ => {}
                 }
             }
         }
+        self.chat_view_events();
         if self.state.take_review_request() {
             layout::ensure_tab(&mut self.dock, Tab::Review);
         }
@@ -245,6 +263,16 @@ impl VoidApp {
             }
             Action::Renamed { from, to } => {
                 self.follow_rename(&from, &to);
+                return;
+            }
+            Action::ReviewFile { conversation, path } => {
+                self.review.conversation = Some(conversation);
+                self.review.selected = Some(path);
+                layout::ensure_tab(&mut self.dock, Tab::Review);
+                return;
+            }
+            Action::SwitchEditorView { tab, view } => {
+                self.switch_editor_view(tab, view);
                 return;
             }
         };
@@ -575,6 +603,13 @@ impl eframe::App for VoidApp {
         self.editors.settings = self.state.config.editor.clone();
         self.editors.dialog = self.quit_dialog || self.files.confirm_delete.is_some();
         self.editors.focused_widget = None;
+        self.editors.busy_chats = self
+            .state
+            .active_turns
+            .iter()
+            .chain(self.state.streams.keys())
+            .copied()
+            .collect();
         self.poll_disk(&ctx);
         self.editors.poll(&ctx);
         self.global_save(&ctx);
@@ -595,6 +630,9 @@ impl eframe::App for VoidApp {
         self.close_dialog(&ctx);
         self.quit_dialog(&ctx);
         crate::panels::files::delete_dialog(&ctx, &mut self.files, &mut self.state);
+        // Chat-view saves made this frame (Ctrl+S, :w, dialogs) go to the engine now, before
+        // a quit could end the app.
+        self.send_overlay_saves();
         // One clipboard for the app: text egui copies (text fields, copy buttons) goes through the
         // same `editor::Clipboard` that pastes and Vim's "+ / "* registers read.
         let clipboard = &self.editors.clipboard;
@@ -643,6 +681,7 @@ impl VoidApp {
             .last_editor
             .and_then(|id| self.editor_key(id))
             .map(|(path, _)| path);
+        let view_chats = self.view_chats();
         let mut panels = Panels {
             state: &mut self.state,
             engine: &self.engine,
@@ -657,6 +696,7 @@ impl VoidApp {
             focused_editor,
             files: &mut self.files,
             active_file,
+            view_chats,
         };
         DockArea::new(&mut self.dock)
             .style(theme::dock_style(ui.style().as_ref(), &pal))
@@ -1173,6 +1213,37 @@ impl Parser {
             h.step();
         }
         h.render().unwrap().save(out.join("files.png")).unwrap();
+
+        // A file the agent changed: its Disk tab with the pending-changes banner, then the
+        // chat's version of it.
+        let sse = proj.join("src/backend/sse.rs");
+        h.state_mut()
+            .open_editor(sse.clone(), EditorView::Disk, Some(4));
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render()
+            .unwrap()
+            .save(out.join("editor-pending.png"))
+            .unwrap();
+        // "View void's version" switches the same tab.
+        let tab = h.state().last_editor.unwrap();
+        h.state_mut().apply_action(Action::SwitchEditorView {
+            tab,
+            view: EditorView::Chat(aid),
+        });
+        until(&mut h, 10, "chat view highlighted", |a| {
+            a.editors
+                .doc(&(sse.clone(), EditorView::Chat(aid)))
+                .is_some_and(|d| d.highlighted())
+        });
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render()
+            .unwrap()
+            .save(out.join("editor-chat-view.png"))
+            .unwrap();
     }
 
     /// Offline: an approval card's "Allow once" sends Approve; the engine answers with

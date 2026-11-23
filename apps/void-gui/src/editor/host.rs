@@ -31,22 +31,22 @@ impl Host<'_, '_> {
     }
 
     /// `:w` (`force`: `:w!`, over outside changes too).
+    /// A chat view saves through the app (the engine writes the chat's pending changes).
     fn write(&mut self, force: bool) {
-        let msg = match self.cx.view {
-            EditorView::Disk => {
-                let r = if force {
-                    self.core.save_forced(self.cx.path)
-                } else {
-                    self.core.save(self.cx.path)
-                };
-                match r {
-                    Ok(m) => Msg::info(m),
-                    Err(e) => Msg::error(e),
-                }
-            }
-            EditorView::Chat(_) => Msg::error("Saving a chat view isn't available yet"),
+        if let EditorView::Chat(_) = self.cx.view {
+            let tab = self.cx.tab;
+            self.cx.actions.push(EditorAction::Save { tab, force });
+            return;
+        }
+        let r = if force {
+            self.core.save_forced(self.cx.path)
+        } else {
+            self.core.save(self.cx.path)
         };
-        self.core.message = Some(msg);
+        self.core.message = Some(match r {
+            Ok(m) => Msg::info(m),
+            Err(e) => Msg::error(e),
+        });
     }
 }
 

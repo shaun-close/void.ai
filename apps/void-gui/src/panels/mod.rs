@@ -55,6 +55,13 @@ pub enum Action {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
     },
+    /// Bring Review forward on this chat's change to `path` (workspace-relative).
+    ReviewFile {
+        conversation: ConversationId,
+        path: std::path::PathBuf,
+    },
+    /// Show another version of an editor tab's file (Disk, or a chat's).
+    SwitchEditorView { tab: u32, view: EditorView },
 }
 
 pub struct Panels<'a> {
@@ -74,6 +81,9 @@ pub struct Panels<'a> {
     pub files: &'a mut files::FilesUi,
     /// The file in the editor tab focused last (the Files panel highlights and reveals it).
     pub active_file: Option<std::path::PathBuf>,
+    /// Chats an editor tab can switch to: those with a layer of pending changes, or open in a
+    /// Chat tab.
+    pub view_chats: Vec<ConversationId>,
 }
 
 impl egui_dock::TabViewer for Panels<'_> {

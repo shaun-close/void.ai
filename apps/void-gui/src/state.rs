@@ -66,6 +66,17 @@ pub struct UiState {
     created: Option<ConversationId>,
     /// Conversations deleted since the app last looked (their tabs need clearing).
     deleted: Vec<ConversationId>,
+    /// Chats whose first `Changes` after the workspace opened only reports what was already
+    /// pending (no Review pop-up for that).
+    quiet: std::collections::HashSet<ConversationId>,
+    /// Chats whose pending changes were reported since the app last looked (chat views
+    /// re-read their files).
+    changed_chats: Vec<ConversationId>,
+    /// Chat-view saves that landed (`OverlaySaved`), for the editors.
+    overlay_saved: Vec<(ConversationId, std::path::PathBuf)>,
+    /// Errors since the app last looked (a chat-view save waiting on the engine may have been
+    /// refused).
+    errors: Vec<String>,
 }
 
 impl Default for UiState {
@@ -95,6 +106,10 @@ impl Default for UiState {
             layout: None,
             created: None,
             deleted: Vec::new(),
+            quiet: Default::default(),
+            changed_chats: Vec::new(),
+            overlay_saved: Vec::new(),
+            errors: Vec::new(),
         }
     }
 }
@@ -117,6 +132,11 @@ impl UiState {
                 warnings,
             } => {
                 self.workspace = workspace;
+                // Pending changes are per workspace (banners match them by relative path).
+                let here: std::collections::HashSet<_> =
+                    conversations.iter().map(|m| m.id).collect();
+                self.changes.retain(|id, _| here.contains(id));
+                self.quiet = here;
                 self.conversations = conversations;
                 self.recent = recent;
                 let streaming: Vec<_> = self.streams.keys().copied().collect();
@@ -177,7 +197,10 @@ impl UiState {
                 self.tests.insert(profile_id, result);
             }
             Event::ConfigSaved => self.info("Settings saved."),
-            Event::Error(e) => self.error(e),
+            Event::Error(e) => {
+                self.errors.push(e.clone());
+                self.error(e)
+            }
             Event::Info(m) => self.info(m),
             Event::SandboxStatus(a) => self.sandbox = Some(a),
             Event::ToolStarted {
@@ -228,9 +251,15 @@ impl UiState {
                 conversation,
                 changes,
             } => {
-                if !changes.is_empty() && self.reviewed.insert(conversation) {
+                if self.quiet.remove(&conversation) {
+                    // Already pending when the workspace opened: not news.
+                    if !changes.is_empty() {
+                        self.reviewed.insert(conversation);
+                    }
+                } else if !changes.is_empty() && self.reviewed.insert(conversation) {
                     self.review_request = true;
                 }
+                self.changed_chats.push(conversation);
                 let before = self.changes.get(&conversation).into_iter().flatten();
                 self.touched
                     .extend(before.chain(&changes).map(|c| c.path.clone()));
@@ -253,12 +282,16 @@ impl UiState {
                 active,
             } => {
                 if active {
+                    self.quiet.remove(&conversation);
                     self.active_turns.insert(conversation);
                 } else {
                     self.active_turns.remove(&conversation);
                 }
             }
             Event::ReviewError { error, .. } => self.error(error),
+            Event::OverlaySaved { conversation, path } => {
+                self.overlay_saved.push((conversation, path));
+            }
             Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
         }
     }
@@ -300,6 +333,44 @@ impl UiState {
 
     pub fn take_deleted(&mut self) -> Vec<ConversationId> {
         std::mem::take(&mut self.deleted)
+    }
+
+    pub fn take_changed_chats(&mut self) -> Vec<ConversationId> {
+        std::mem::take(&mut self.changed_chats)
+    }
+
+    pub fn take_overlay_saved(&mut self) -> Vec<(ConversationId, std::path::PathBuf)> {
+        std::mem::take(&mut self.overlay_saved)
+    }
+
+    pub fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
+    }
+
+    /// Chats with pending changes to `rel` (workspace-relative), oldest chat first.
+    pub fn pending_for(&self, rel: &std::path::Path) -> Vec<ConversationId> {
+        let mut ids: Vec<ConversationId> = self
+            .changes
+            .iter()
+            .filter(|(_, c)| c.iter().any(|c| c.path == rel))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A chat's title as the list shows it.
+    pub fn chat_title(&self, id: ConversationId) -> String {
+        self.loaded
+            .get(&id)
+            .map(|c| c.title.clone())
+            .or_else(|| {
+                self.conversations
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.title.clone())
+            })
+            .unwrap_or_else(|| "chat".into())
     }
 
     /// Apply one change to the saved config (and the draft), returning the config to persist,
@@ -515,6 +586,45 @@ mod tests {
         });
         assert!(!s.take_review_request(), "only the first time");
         assert_eq!(s.changes[&id].len(), 1);
+    }
+
+    #[test]
+    fn changes_pending_at_open_dont_ask_for_review() {
+        let mut s = UiState::default();
+        let ws = Workspace::scratch();
+        let old = Conversation::new(ws.id.clone());
+        let change = void_core::overlay::Change {
+            path: "a.txt".into(),
+            kind: void_core::overlay::ChangeKind::Modified,
+            ignored: false,
+            conflict: false,
+            link: None,
+        };
+        s.apply(Event::WorkspaceOpened {
+            workspace: ws,
+            conversations: vec![old.meta()],
+            recent: vec![],
+            layout: None,
+            warnings: vec![],
+        });
+        s.apply(Event::Changes {
+            conversation: old.id,
+            changes: vec![change.clone()],
+        });
+        assert!(!s.take_review_request(), "listed at open");
+        assert_eq!(s.pending_for(std::path::Path::new("a.txt")), [old.id]);
+        assert_eq!(s.take_changed_chats(), [old.id]);
+        // A turn's changes in a chat that had none at open still ask.
+        let other = void_core::model::ConversationId::new();
+        s.apply(Event::TurnState {
+            conversation: other,
+            active: true,
+        });
+        s.apply(Event::Changes {
+            conversation: other,
+            changes: vec![change],
+        });
+        assert!(s.take_review_request());
     }
 
     #[test]

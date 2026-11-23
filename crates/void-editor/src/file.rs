@@ -13,13 +13,20 @@ impl Buffer {
         let meta = fs::metadata(path)?;
         let bytes = fs::read(path)?;
         let disk = Fingerprint::new(&meta, &bytes);
+        let mut b = Buffer::from_bytes(bytes);
+        b.disk = Some(disk);
+        Ok(b)
+    }
+
+    /// A buffer over a file's bytes, read-only (lossy, with a notice) when they aren't text,
+    /// as [`Buffer::from_file`] does. `disk` is left unset.
+    pub fn from_bytes(bytes: Vec<u8>) -> Buffer {
         let has_nul = bytes.iter().take(8192).any(|&b| b == 0);
         let (text, valid) = match String::from_utf8(bytes) {
             Ok(text) => (text, true),
             Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
         };
         let mut b = Buffer::new(&text);
-        b.disk = Some(disk);
         if has_nul || !valid {
             b.read_only = true;
             b.notice = Some(if valid {
@@ -28,7 +35,22 @@ impl Buffer {
                 "Not valid UTF-8: opened read-only".to_string()
             });
         }
-        Ok(b)
+        b
+    }
+
+    /// The text as it would be saved: the file's line ending and final newline restored.
+    pub fn file_text(&self) -> String {
+        let mut out = String::with_capacity(self.rope().len_bytes() + 16);
+        for chunk in self.rope().chunks() {
+            out.push_str(chunk);
+        }
+        if self.final_newline {
+            out.push('\n');
+        }
+        match self.line_ending {
+            LineEnding::Lf => out,
+            LineEnding::CrLf => out.replace('\n', "\r\n"),
+        }
     }
 
     /// Write atomically, restoring the file's line ending and final newline, then mark saved.
@@ -39,22 +61,7 @@ impl Buffer {
                 "buffer is read-only",
             ));
         }
-        let eol = match self.line_ending {
-            LineEnding::Lf => "\n",
-            LineEnding::CrLf => "\r\n",
-        };
-        let mut out = String::with_capacity(self.rope().len_bytes() + 16);
-        for chunk in self.rope().chunks() {
-            out.push_str(chunk);
-        }
-        if self.final_newline {
-            out.push('\n');
-        }
-        let out = if eol == "\n" {
-            out
-        } else {
-            out.replace('\n', eol)
-        };
+        let out = self.file_text();
         atomic_write(path, out.as_bytes())?;
         self.disk = fs::metadata(path)
             .ok()
@@ -70,6 +77,17 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
+
+    #[test]
+    fn file_text_restores_line_endings() {
+        for bytes in [&b"a\r\nb\r\n"[..], b"a\nb", b"", b"x\n"] {
+            let b = Buffer::from_bytes(bytes.to_vec());
+            assert_eq!(b.file_text().as_bytes(), bytes);
+            assert!(!b.read_only);
+        }
+        let b = Buffer::from_bytes(vec![0xff, b'a']);
+        assert!(b.read_only && b.notice.is_some());
+    }
 
     #[test]
     fn crlf_round_trip() {
