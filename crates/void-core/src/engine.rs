@@ -30,7 +30,7 @@ use crate::model::{
 use crate::overlay::{Change, Hunk, Overlay};
 use crate::permissions::{Action, ApprovalRequest, Decision, Permissions};
 use crate::runner::run::RunUpdate;
-use crate::runner::{Envs, MoonTask, RunId, Runs};
+use crate::runner::{Envs, MoonTask, RunId, RunOrigin, Runs};
 use crate::sandbox::{Availability, Sandbox};
 use crate::store::{Store, WorkspaceEntry};
 use crate::tools::{Registry, ToolCtx, ToolOutput};
@@ -274,6 +274,8 @@ pub enum Event {
         run: RunId,
         name: String,
         steps: usize,
+        /// What started it (a re-run of this run sends the matching command).
+        origin: RunOrigin,
     },
     /// Step `index` (0-based) started; `label` is its command line. `base_dirs`: where the
     /// step's output paths are relative to, in order — pass them to `parse_locations`.

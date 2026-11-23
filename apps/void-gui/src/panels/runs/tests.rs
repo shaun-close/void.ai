@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use void_core::engine::{Command, Event};
-use void_core::runner::{EnvProfile, EnvValue, Envs, RunId};
+use void_core::runner::{
+    EnvProfile, EnvValue, Envs, Group, OnFailure, RunConfig, RunId, RunOrigin, Runs, Step,
+    StepConfig,
+};
 
 use crate::app::VoidApp;
 use crate::layout::{EditorView, Tab};
@@ -68,6 +71,10 @@ fn run_output_location_opens_editor() {
             run,
             name: "check".into(),
             steps: 1,
+            origin: RunOrigin::Task {
+                target: "app:check".into(),
+                args: vec![],
+            },
         });
         st.apply(Event::RunStep {
             run,
@@ -224,4 +231,110 @@ fn ctrl_shift_f10_reruns_last() {
             .as_ref()
             .is_some_and(|s| s.text.contains("Nothing to re-run"))
     });
+}
+
+/// Finish a scripted run (its tab then offers Re-run).
+fn script_run(h: &mut Harness<'_, VoidApp>, run: RunId, name: &str, origin: RunOrigin) {
+    let st = &mut h.state_mut().state;
+    st.apply(Event::RunStarted {
+        run,
+        name: name.into(),
+        steps: 1,
+        origin,
+    });
+    st.apply(Event::RunFinished {
+        run,
+        ok: true,
+        failed_step: None,
+        exit_code: Some(0),
+        stopped: false,
+        error: None,
+        duration_ms: 5,
+    });
+    steps(h, 3);
+}
+
+/// Whether the shown output tab's Re-run button is enabled.
+fn rerun_enabled(h: &Harness<'_, VoidApp>) -> bool {
+    let label = format!("{}Re-run", crate::theme::icon::ARROW_CLOCKWISE);
+    !h.get_by_label(&label).accesskit_node().is_disabled()
+}
+
+fn click_rerun(h: &Harness<'_, VoidApp>) {
+    let label = format!("{}Re-run", crate::theme::icon::ARROW_CLOCKWISE);
+    h.get_by_label(&label).click();
+}
+
+/// Two configs share a name: the output tab's Re-run runs the one that ran, by id.
+#[test]
+fn output_rerun_runs_exactly_what_ran() {
+    let (t, ws) = workspace();
+    let mut h = harness(t.path(), &ws);
+    let cfg = || {
+        RunConfig::new(
+            "test",
+            vec![StepConfig {
+                step: Step::Shell {
+                    command: "true".into(),
+                },
+                on_failure: OnFailure::Stop,
+            }],
+        )
+    };
+    let (first, second) = (cfg(), cfg());
+    h.state().engine.send(Command::SaveRuns(Runs {
+        groups: vec![Group {
+            name: "g".into(),
+            configs: vec![first, second.clone()],
+        }],
+    }));
+    until(&mut h, "configs", |a| {
+        a.state
+            .runs
+            .groups
+            .first()
+            .is_some_and(|g| g.configs.len() == 2)
+    });
+    let ran = RunOrigin::Config {
+        id: second.id.clone(),
+    };
+    script_run(&mut h, RunId(950), "test", ran.clone());
+    click_rerun(&h);
+    // (Its tab takes over the finished run's, which is then forgotten.)
+    until(&mut h, "the re-run started", |a| {
+        a.state.run_views.keys().any(|id| *id != RunId(950))
+    });
+    let again: Vec<RunOrigin> = h
+        .state()
+        .state
+        .run_views
+        .iter()
+        .filter(|(id, _)| **id != RunId(950))
+        .map(|(_, v)| v.origin.clone())
+        .collect();
+    assert_eq!(again, [ran]);
+}
+
+/// A run of a config that's since been deleted can't be re-run; a task always can.
+#[test]
+fn output_rerun_disabled_when_its_config_is_gone() {
+    let (t, ws) = workspace();
+    let mut h = harness(t.path(), &ws);
+    script_run(
+        &mut h,
+        RunId(960),
+        "app:build",
+        RunOrigin::Config { id: "gone".into() },
+    );
+    assert!(!rerun_enabled(&h));
+    script_run(
+        &mut h,
+        RunId(961),
+        "renamed",
+        RunOrigin::Task {
+            target: "app:build".into(),
+            args: vec!["--release".into()],
+        },
+    );
+    assert!(rerun_enabled(&h));
 }

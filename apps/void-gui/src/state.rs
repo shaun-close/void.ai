@@ -422,8 +422,14 @@ impl UiState {
                     self.runs_warning = Some(w);
                 }
             }
-            Event::RunStarted { run, name, steps } => {
-                self.run_views.insert(run, RunView::new(name, steps));
+            Event::RunStarted {
+                run,
+                name,
+                steps,
+                origin,
+            } => {
+                self.run_views
+                    .insert(run, RunView::new(name, steps, origin));
                 self.started_runs.push(run);
             }
             Event::RunStep {

@@ -33,6 +33,19 @@ impl std::fmt::Display for RunId {
     }
 }
 
+/// What started a run: a saved config or one moon task. Re-running it sends the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOrigin {
+    /// `RunConfig::id`.
+    Config {
+        id: String,
+    },
+    Task {
+        target: String,
+        args: Vec<String>,
+    },
+}
+
 /// A file location found in a line of output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {

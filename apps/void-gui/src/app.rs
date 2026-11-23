@@ -233,21 +233,21 @@ impl VoidApp {
     }
 
     /// Bring `run`'s output tab forward, opening one if needed: in place of a finished run of
-    /// the same name (`reuse`, for a new run), else beside the other output tabs, else in a
-    /// new strip below the editors/chats. Keyboard focus stays where it was.
+    /// the same config or task (`reuse`, for a new run), else beside the other output tabs,
+    /// else in a new strip below the editors/chats. Keyboard focus stays where it was.
     fn show_run_output(&mut self, run: RunId, reuse: bool) {
         if let Some(path) = self.dock.find_tab(&Tab::RunOutput { run }) {
             let _ = self.dock.set_active_tab(path);
             return;
         }
         let focused = self.dock.focused_leaf();
-        let name = self.state.run_views.get(&run).map(|v| v.name.clone());
+        let origin = self.state.run_views.get(&run).map(|v| v.origin.clone());
         let views = &self.state.run_views;
         let stale = reuse
             .then(|| {
                 self.dock.find_tab_from(|t| {
                     matches!(t, Tab::RunOutput { run: old } if views.get(old).is_some_and(|v| {
-                        v.finished.is_some() && Some(&v.name) == name.as_ref()
+                        v.finished.is_some() && Some(&v.origin) == origin.as_ref()
                     }))
                 })
             })
@@ -1769,6 +1769,9 @@ impl Parser {
                 run: done,
                 name: "Check everything".into(),
                 steps: 3,
+                origin: void_core::runner::RunOrigin::Config {
+                    id: check.id.clone(),
+                },
             });
             st.apply(E::RunStep {
                 run: done,
@@ -1804,6 +1807,10 @@ impl Parser {
                 run: live,
                 name: "void-gui:run".into(),
                 steps: 1,
+                origin: void_core::runner::RunOrigin::Task {
+                    target: "void-gui:run".into(),
+                    args: vec![],
+                },
             });
             st.apply(E::RunStep {
                 run: live,

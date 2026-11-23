@@ -11,7 +11,7 @@ use std::time::Instant;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, RichText, Sense, Ui};
 use void_core::engine::Command;
-use void_core::runner::{Location, RunId};
+use void_core::runner::{Location, RunId, RunOrigin};
 
 use super::{Action, Panels};
 use crate::state::UiState;
@@ -405,6 +405,8 @@ pub struct StepInfo {
 /// A run as its output tab shows it.
 pub struct RunView {
     pub name: String,
+    /// What started it (Re-run sends the same).
+    pub origin: RunOrigin,
     pub steps: usize,
     pub current: Option<usize>,
     pub step_info: Vec<StepInfo>,
@@ -414,9 +416,10 @@ pub struct RunView {
 }
 
 impl RunView {
-    pub fn new(name: String, steps: usize) -> Self {
+    pub fn new(name: String, steps: usize, origin: RunOrigin) -> Self {
         Self {
             name,
+            origin,
             steps,
             current: None,
             step_info: vec![StepInfo::default(); steps],
@@ -531,27 +534,24 @@ impl std::fmt::Debug for RunView {
     }
 }
 
-/// The command that runs this run's config or task again. Runs don't say where they came
-/// from, so it's matched by name: a config called that, else the moon target it names.
-pub fn rerun_command(state: &UiState, run: RunId) -> Option<Command> {
-    let name = &state.run_views.get(&run)?.name;
-    if let Some(c) = state
-        .runs
-        .groups
-        .iter()
-        .flat_map(|g| &g.configs)
-        .find(|c| c.name == *name)
-    {
-        return Some(Command::RunConfig {
-            config_id: c.id.clone(),
-        });
+/// The command that runs exactly what this run ran again: its config (by id) or its task.
+/// Err says why it can't (its config was deleted since).
+pub fn rerun_command(state: &UiState, run: RunId) -> Result<Command, &'static str> {
+    let view = state.run_views.get(&run).ok_or("This run is gone")?;
+    match &view.origin {
+        RunOrigin::Config { id } => {
+            if super::runs::find_config(&state.runs, id).is_none() {
+                return Err("Its run config has been deleted");
+            }
+            Ok(Command::RunConfig {
+                config_id: id.clone(),
+            })
+        }
+        RunOrigin::Task { target, args } => Ok(Command::RunTask {
+            target: target.clone(),
+            args: args.clone(),
+        }),
     }
-    let mut words = name.split_whitespace();
-    let target = words.next().filter(|t| t.contains(':'))?;
-    Some(Command::RunTask {
-        target: target.to_string(),
-        args: words.map(str::to_string).collect(),
-    })
 }
 
 fn status_look(pal: &Palette, status: RunStatus) -> (&'static str, Color32) {
@@ -618,7 +618,7 @@ fn header(
     engine: &void_core::engine::EngineHandle,
     run: RunId,
     view: &RunView,
-    rerun: Option<Command>,
+    rerun: Result<Command, &'static str>,
 ) {
     let status = view.status();
     let (glyph, color) = status_look(pal, status);
@@ -655,13 +655,18 @@ fn header(
                 .request_repaint_after(std::time::Duration::from_millis(250));
         } else {
             let r = ui.add_enabled(
-                rerun.is_some(),
+                rerun.is_ok(),
                 egui::Button::new(theme::itext(icon::ARROW_CLOCKWISE, "Re-run")),
             );
-            if r.clicked()
-                && let Some(cmd) = rerun
-            {
-                engine.send(cmd);
+            match rerun {
+                Ok(cmd) => {
+                    if r.on_hover_text("Run it again").clicked() {
+                        engine.send(cmd);
+                    }
+                }
+                Err(why) => {
+                    r.on_disabled_hover_text(why);
+                }
             }
         }
         if ui

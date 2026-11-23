@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Command, Event, Msg, State};
 use crate::runner::run::{ChainSpec, RunUpdate, Sink, run_chain};
-use crate::runner::{Envs, MoonTask, OnFailure, RunId, Runs, Step, StepConfig, discover};
+use crate::runner::{
+    Envs, MoonTask, OnFailure, RunId, RunOrigin, Runs, Step, StepConfig, discover,
+};
 
 #[derive(Default)]
 pub(super) struct RunsState {
@@ -25,7 +27,7 @@ pub(super) struct RunsState {
     active: HashMap<RunId, ActiveRun>,
     next_id: u64,
     /// What `RerunLast` repeats (in the current workspace).
-    last: Option<Request>,
+    last: Option<RunOrigin>,
     /// Only the newest discovery's result counts.
     tasks_generation: u64,
     /// The workspace's moon tasks as last discovered (for moon steps' project folders).
@@ -38,17 +40,11 @@ struct ActiveRun {
     started: Instant,
 }
 
-#[derive(Clone)]
-enum Request {
-    Config(String),
-    Task { target: String, args: Vec<String> },
-}
-
 impl State {
     pub(super) fn run_command(&mut self, cmd: Command) {
         match cmd {
-            Command::RunConfig { config_id } => self.start_run(Request::Config(config_id)),
-            Command::RunTask { target, args } => self.start_run(Request::Task { target, args }),
+            Command::RunConfig { config_id } => self.start_run(RunOrigin::Config { id: config_id }),
+            Command::RunTask { target, args } => self.start_run(RunOrigin::Task { target, args }),
             Command::StopRun(run) => {
                 if let Some(a) = self.runs.active.get(&run) {
                     a.cancel.cancel();
@@ -199,7 +195,7 @@ impl State {
         }
     }
 
-    fn start_run(&mut self, req: Request) {
+    fn start_run(&mut self, req: RunOrigin) {
         let Some(root) = self.workspace.root.clone() else {
             self.emit(Event::Error(
                 "Runs need a workspace folder — open one first.".into(),
@@ -207,7 +203,7 @@ impl State {
             return;
         };
         let (name, steps, profile) = match &req {
-            Request::Config(id) => {
+            RunOrigin::Config { id } => {
                 let found = self
                     .runs
                     .runs
@@ -223,7 +219,7 @@ impl State {
                 };
                 (c.name.clone(), c.steps.clone(), c.env_profile.clone())
             }
-            Request::Task { target, args } => {
+            RunOrigin::Task { target, args } => {
                 let name = std::iter::once(target.as_str())
                     .chain(args.iter().map(String::as_str))
                     .collect::<Vec<_>>()
@@ -241,13 +237,14 @@ impl State {
         let env = profile
             .or_else(|| self.runs.envs.active.clone())
             .map(|p| (self.runs.envs.clone(), p));
-        self.runs.last = Some(req);
+        self.runs.last = Some(req.clone());
         self.runs.next_id += 1;
         let run = RunId(self.runs.next_id);
         self.emit(Event::RunStarted {
             run,
             name,
             steps: steps.len(),
+            origin: req,
         });
         let tx = self.tx.clone();
         let sink: Sink = Arc::new(move |update| {
@@ -328,7 +325,8 @@ mod tests {
     use super::super::{Command, Engine, EngineHandle, EngineOptions, Event};
     use crate::backend::make_backend;
     use crate::runner::{
-        EnvProfile, EnvValue, Envs, Group, OnFailure, RunConfig, RunId, Runs, Step, StepConfig,
+        EnvProfile, EnvValue, Envs, Group, OnFailure, RunConfig, RunId, RunOrigin, Runs, Step,
+        StepConfig,
     };
     use crate::store::Store;
 
@@ -422,7 +420,9 @@ mod tests {
 
         fn started(&mut self) -> (RunId, String, usize) {
             match self.until(|e| matches!(e, Event::RunStarted { .. })) {
-                Event::RunStarted { run, name, steps } => (run, name, steps),
+                Event::RunStarted {
+                    run, name, steps, ..
+                } => (run, name, steps),
                 _ => unreachable!(),
             }
         }
@@ -816,6 +816,35 @@ mod tests {
         assert_eq!((name.as_str(), steps), ("again", 1));
         let ev = r.finish(second);
         assert_eq!(output(&ev), "v=2\n");
+    }
+
+    /// `RunStarted` says exactly what started the run (two configs can share a name; a
+    /// config can be named like a task), and a re-run repeats that.
+    #[test]
+    fn run_started_carries_its_origin() {
+        let mut r = rig();
+        let origin = |r: &mut Rig| match r.until(|e| matches!(e, Event::RunStarted { .. })) {
+            Event::RunStarted { origin, .. } => origin,
+            _ => unreachable!(),
+        };
+        let a = RunConfig::new("test", vec![shell("true")]);
+        let b = RunConfig::new("test", vec![shell("true")]);
+        r.save(vec![a, b.clone()]);
+        r.handle.send(Command::RunConfig {
+            config_id: b.id.clone(),
+        });
+        assert_eq!(origin(&mut r), RunOrigin::Config { id: b.id.clone() });
+        let task = RunOrigin::Task {
+            target: "app:build".into(),
+            args: vec!["--release".into()],
+        };
+        r.handle.send(Command::RunTask {
+            target: "app:build".into(),
+            args: vec!["--release".into()],
+        });
+        assert_eq!(origin(&mut r), task);
+        r.handle.send(Command::RerunLast);
+        assert_eq!(origin(&mut r), task);
     }
 
     #[test]
