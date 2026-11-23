@@ -416,3 +416,34 @@ fn env_draft_released_after_a_normalising_save() {
     );
     assert!(h.query_by_label_contains("Changed elsewhere").is_none());
 }
+
+/// A config pinned to a deleted profile keeps the reference, and its editor says so.
+#[test]
+fn editor_shows_a_missing_profile() {
+    let (t, ws) = workspace();
+    let mut h = harness(t.path(), &ws);
+    let mut cfg = RunConfig::new("deploy", vec![]);
+    cfg.env_profile = Some("staging".into());
+    h.state().engine.send(Command::SaveEnvs(Envs {
+        active: Some("prod".into()),
+        profiles: vec![EnvProfile {
+            name: "prod".into(),
+            vars: Default::default(),
+        }],
+    }));
+    h.state().engine.send(Command::SaveRuns(Runs {
+        groups: vec![Group {
+            name: "g".into(),
+            configs: vec![cfg.clone()],
+        }],
+    }));
+    until(&mut h, "loaded", |a| {
+        a.state.envs.profiles.len() == 1 && a.state.runs.groups.len() == 1
+    });
+    show_runs(&mut h);
+    let runs = h.state().state.runs.clone();
+    h.state_mut().runs.edit_config(&runs, &cfg.id);
+    steps(&mut h, 3);
+    assert!(h.query_by_value("staging (missing)").is_some());
+    assert!(h.query_by_label_contains("won't run").is_some());
+}

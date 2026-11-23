@@ -220,6 +220,17 @@ impl State {
                     ));
                     return;
                 };
+                // A pinned profile that's gone is refused here: never the active one instead.
+                if let Some(p) = &c.env_profile
+                    && !self.runs.envs.profiles.iter().any(|e| e.name == *p)
+                {
+                    let name = c.name.clone();
+                    self.emit(Event::Error(format!(
+                        "Run config '{name}' uses environment profile '{p}', which doesn't \
+                         exist any more. Pick a profile in the config's editor."
+                    )));
+                    return;
+                }
                 (c.name.clone(), c.steps.clone(), c.env_profile.clone())
             }
             RunOrigin::Task { target, args } => {
@@ -794,6 +805,40 @@ mod tests {
             error.contains("broken") && error.contains("TOKEN"),
             "{error}"
         );
+    }
+
+    /// A config pinned to a profile that's since been deleted is refused, naming the profile,
+    /// before anything runs: it never falls back to the active profile.
+    #[test]
+    fn pinned_profile_gone_refuses_the_run() {
+        let mut r = rig();
+        r.set_envs(envs(
+            &[("prod", &[("DB", EnvValue::Value("prod-db".into()))])],
+            Some("prod"),
+        ));
+        let marker = r.root.join("ran");
+        let mut cfg = RunConfig::new(
+            "migrate",
+            vec![shell(&format!("touch {}", marker.display()))],
+        );
+        cfg.env_profile = Some("staging".into());
+        r.save(vec![cfg.clone()]);
+        let before = r.seen.len();
+        r.handle.send(Command::RunConfig {
+            config_id: cfg.id.clone(),
+        });
+        let Event::Error(e) = r.until(|e| matches!(e, Event::Error(_))) else {
+            unreachable!()
+        };
+        assert!(e.contains("staging") && e.contains("migrate"), "{e}");
+        assert!(!e.contains("prod-db"), "{e}");
+        assert!(
+            !r.seen[before..]
+                .iter()
+                .any(|e| matches!(e, Event::RunStarted { .. })),
+            "the run never started"
+        );
+        assert!(!marker.exists());
     }
 
     #[test]

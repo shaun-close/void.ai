@@ -719,11 +719,16 @@ fn editor(ui: &mut Ui, pal: &Palette, state: &UiState, runs_ui: &mut RunsUi, tod
                 ui.add(TextEdit::singleline(&mut d.cfg.name).desired_width(f32::INFINITY));
                 ui.end_row();
                 ui.label("Environment");
-                let shown = d
+                let missing = d
                     .cfg
                     .env_profile
                     .clone()
-                    .unwrap_or_else(|| "the active profile".into());
+                    .filter(|p| !state.envs.profiles.iter().any(|e| e.name == *p));
+                let shown = match (&d.cfg.env_profile, &missing) {
+                    (_, Some(p)) => RichText::new(format!("{p} (missing)")).color(pal.warn),
+                    (Some(p), None) => RichText::new(p),
+                    (None, None) => RichText::new("the active profile"),
+                };
                 egui::ComboBox::from_id_salt("runs-edit-env")
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
@@ -737,6 +742,18 @@ fn editor(ui: &mut Ui, pal: &Palette, state: &UiState, runs_ui: &mut RunsUi, tod
                         }
                     });
                 ui.end_row();
+                if let Some(p) = missing {
+                    ui.label("");
+                    ui.label(
+                        RichText::new(format!(
+                            "Profile '{p}' was deleted: this config won't run until you pick \
+                             another."
+                        ))
+                        .color(pal.warn)
+                        .small(),
+                    );
+                    ui.end_row();
+                }
             });
         ui.add_space(4.0);
         ui.label(RichText::new("Steps").color(pal.text_dim).small())
@@ -1257,16 +1274,8 @@ fn apply(p: &mut Panels, d: Do) {
             match draft.to_envs(&p.state.envs.profiles, p.state.envs.active.as_deref()) {
                 Ok((envs, renames)) => {
                     p.runs.envs_error = None;
-                    // Configs follow a renamed profile; one whose profile went uses the active one.
                     let mut runs = p.state.runs.clone();
-                    for c in runs.groups.iter_mut().flat_map(|g| &mut g.configs) {
-                        if let Some((_, new)) = renames
-                            .iter()
-                            .find(|(old, _)| c.env_profile.as_deref() == Some(old.as_str()))
-                        {
-                            c.env_profile = new.clone();
-                        }
-                    }
+                    follow_renames(&mut runs, &renames);
                     if runs != p.state.runs {
                         save_runs(p, runs);
                     }
@@ -1281,6 +1290,20 @@ fn apply(p: &mut Panels, d: Do) {
             p.runs.envs = None;
             p.runs.envs_error = None;
             p.runs.revealed.clear();
+        }
+    }
+}
+
+/// Configs follow a renamed profile. One whose profile was deleted keeps the reference: the
+/// engine refuses to run it and its editor says the profile is missing, so it never quietly
+/// runs against whichever profile happens to be active.
+fn follow_renames(runs: &mut Runs, renames: &[(String, Option<String>)]) {
+    for c in runs.groups.iter_mut().flat_map(|g| &mut g.configs) {
+        if let Some((_, Some(new))) = renames
+            .iter()
+            .find(|(old, _)| c.env_profile.as_deref() == Some(old.as_str()))
+        {
+            c.env_profile = Some(new.clone());
         }
     }
 }
@@ -1405,6 +1428,40 @@ mod unit {
                 .unwrap_err()
                 .contains("twice")
         );
+    }
+
+    /// Configs follow a renamed profile; one whose profile was deleted keeps pointing at it
+    /// (so it can't silently run against another profile).
+    #[test]
+    fn configs_follow_renames_but_keep_deleted_profiles() {
+        let pin = |name: &str, p: Option<&str>| {
+            let mut c = RunConfig::new(name, vec![]);
+            c.env_profile = p.map(str::to_string);
+            c
+        };
+        let mut runs = Runs {
+            groups: vec![Group {
+                name: "g".into(),
+                configs: vec![
+                    pin("a", Some("dev")),
+                    pin("b", Some("staging")),
+                    pin("c", None),
+                ],
+            }],
+        };
+        follow_renames(
+            &mut runs,
+            &[
+                ("dev".to_string(), Some("local".to_string())),
+                ("staging".to_string(), None),
+            ],
+        );
+        let got: Vec<_> = runs.groups[0]
+            .configs
+            .iter()
+            .map(|c| c.env_profile.as_deref())
+            .collect();
+        assert_eq!(got, [Some("local"), Some("staging"), None]);
     }
 
     #[test]
