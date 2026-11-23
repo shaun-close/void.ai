@@ -1,5 +1,9 @@
 //! Running a chain of steps (UI-free): each step in its own process group, output streamed,
 //! Stop = SIGTERM then SIGKILL. Plus the compiler-location parser and the moon-config path test.
+//!
+//! Leftover processes: anything a step leaves running in its process group is killed when
+//! the step ends; `setsid` daemons are unaffected (they left the group). Otherwise a
+//! background job would keep the output pipe open and the chain couldn't move on.
 
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::config::{OnFailure, Step, StepConfig};
 use super::env::Envs;
+use super::moon::MoonTask;
 
 /// One run (a config or an ad-hoc task), unique for the engine's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -28,7 +33,7 @@ impl std::fmt::Display for RunId {
 /// A file location found in a line of output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
-    /// Absolute (the workspace root joined with what was printed).
+    /// Absolute (the base dir it was found in, joined with what was printed).
     pub path: PathBuf,
     /// 1-based, as printed.
     pub line: usize,
@@ -39,11 +44,20 @@ pub struct Location {
 }
 
 /// The file locations in one line of output: rustc's `--> src/x.rs:3:5`, tsc's
-/// `src/x.ts(3,5)`, and generic `path:line:col` / `path:line`. Only files that exist under
-/// `root` count, printed relative to it or absolute inside it. ANSI escapes are skipped when
-/// matching; `span` is in byte offsets of the **original** `line` (so it can include escapes
-/// that sat inside the location).
-pub fn parse_locations(line: &str, root: &Path) -> Vec<Location> {
+/// `src/x.ts(3,5)`, and generic `path:line:col` / `path:line`.
+///
+/// `bases` are the folders relative paths are tried against, in order (a run step's
+/// `base_dirs`: its moon project's folder, then the workspace root); the first that holds the
+/// file wins. Only existing files inside one of `bases` count (`..` is fine as long as it
+/// stays inside), whether printed relative or absolute.
+///
+/// ANSI escapes are skipped when matching; `span` is in byte offsets of the **original**
+/// `line` (so it can include escapes that sat inside the location).
+pub fn parse_locations<P: AsRef<Path>>(line: &str, bases: &[P]) -> Vec<Location> {
+    let bases: Vec<&Path> = bases.iter().map(AsRef::as_ref).collect();
+    if bases.is_empty() {
+        return Vec::new();
+    }
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?P<path>[^\s:()\[\]{}<>"'`,;|=]+)(?:\((?P<tl>\d+),(?P<tc>\d+)\)|:(?P<l>\d+)(?::(?P<c>\d+))?)"#,
@@ -64,7 +78,7 @@ pub fn parse_locations(line: &str, root: &Path) -> Vec<Location> {
             if line_no == 0 {
                 return None;
             }
-            let path = under_root(Path::new(&m["path"]), root)?;
+            let path = find_file(Path::new(&m["path"]), &bases)?;
             let span = map[whole.start()]..map[whole.end() - 1] + 1;
             Some(Location {
                 path,
@@ -76,22 +90,34 @@ pub fn parse_locations(line: &str, root: &Path) -> Vec<Location> {
         .collect()
 }
 
-/// `printed` as an absolute path inside `root`, if it names a file there. No `..`.
-fn under_root(printed: &Path, root: &Path) -> Option<PathBuf> {
-    let rel = if printed.is_absolute() {
-        printed.strip_prefix(root).ok()?
-    } else {
-        printed
-    };
-    let mut path = root.to_path_buf();
-    for c in rel.components() {
+/// The existing file `printed` names: absolute, or relative to the first base that has it;
+/// always inside one of `bases`.
+fn find_file(printed: &Path, bases: &[&Path]) -> Option<PathBuf> {
+    let bases: Vec<PathBuf> = bases.iter().filter_map(|b| normalize(b)).collect();
+    let inside = |p: &PathBuf| bases.iter().any(|b| p.starts_with(b)) && p.is_file();
+    if printed.is_absolute() {
+        return normalize(printed).filter(inside);
+    }
+    bases
+        .iter()
+        .find_map(|b| normalize(&b.join(printed)).filter(inside))
+}
+
+/// `p` with `.` and `..` resolved lexically (None if `..` climbs past the top).
+fn normalize(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
         match c {
-            Component::Normal(n) => path.push(n),
             Component::CurDir => {}
-            _ => return None,
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            c => out.push(c),
         }
     }
-    path.is_file().then_some(path)
+    Some(out)
 }
 
 /// `line` without ANSI escapes (CSI, OSC such as hyperlinks, two-byte escapes), and for each
@@ -159,6 +185,24 @@ pub fn is_moon_config_path(rel: &Path) -> bool {
         .is_some_and(|n| *n == "moon.yml" || *n == "moon.yaml")
 }
 
+/// Where a step's relative paths are looked up, in order: a moon task's project folder (moon
+/// runs it there, so tsc and the like print paths relative to it), then the workspace root.
+/// Shell steps (and moon tasks that run from the workspace root, or whose project folder
+/// isn't known) get the root alone.
+pub fn step_base_dirs(step: &Step, root: &Path, tasks: &[MoonTask]) -> Vec<PathBuf> {
+    if let Step::Moon { target, .. } = step
+        && let Some(task) = tasks.iter().find(|t| t.target == *target)
+        && !task.run_from_workspace_root
+        && let Some(source) = task.source.as_deref()
+        && let Some(dir) = normalize(&root.join(source))
+        && dir != root
+        && dir.starts_with(root)
+    {
+        return vec![dir, root.to_path_buf()];
+    }
+    vec![root.to_path_buf()]
+}
+
 /// What a running chain reports, in order: for each step `Step` then its `Output`, then one
 /// `Finished`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +210,8 @@ pub enum RunUpdate {
     Step {
         index: usize,
         label: String,
+        /// For [`parse_locations`] on this step's output.
+        base_dirs: Vec<PathBuf>,
     },
     Output(String),
     Finished {
@@ -185,6 +231,8 @@ pub struct ChainSpec {
     pub steps: Vec<StepConfig>,
     pub root: PathBuf,
     pub env: Option<(Envs, String)>,
+    /// moon's tasks (for the project folders of moon steps).
+    pub tasks: Vec<MoonTask>,
 }
 
 /// Output is sent at most this often (or when this much has piled up).
@@ -206,7 +254,9 @@ pub fn step_label(step: &Step) -> String {
 }
 
 /// Run the chain to the end (or Stop via `cancel`), reporting through `sink`. Not sandboxed:
-/// each step runs as the user, in `root`, with void's environment plus the profile's.
+/// each step runs as the user, in `root`, with void's environment plus the profile's (and
+/// proto's shims/bin on PATH). Anything a step leaves running in its process group is
+/// killed when the step ends; `setsid` daemons are unaffected.
 pub async fn run_chain(spec: ChainSpec, cancel: CancellationToken, sink: Sink) {
     let finish = |ok, failed_step, exit_code, stopped, error| {
         sink(RunUpdate::Finished {
@@ -249,6 +299,7 @@ pub async fn run_chain(spec: ChainSpec, cancel: CancellationToken, sink: Sink) {
         sink(RunUpdate::Step {
             index,
             label: step_label(&sc.step),
+            base_dirs: step_base_dirs(&sc.step, &spec.root, &spec.tasks),
         });
         match run_step(&sc.step, &spec.root, &env, &cancel, &sink).await {
             StepEnd::Ok => {}
@@ -331,8 +382,17 @@ async fn run_step(
         Ok(r) => r,
         Err(e) => return fail(format!("couldn't make a pipe: {e}")),
     };
+    // proto's shims and bin go on PATH (after the profile's own PATH, if it sets one).
+    let path = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| std::env::var_os("PATH"));
+    let path = super::moon::home().and_then(|h| super::moon::proto_path(path.as_deref(), &h));
     cmd.current_dir(root)
         .envs(env.iter().map(|(k, v)| (k, v)))
+        .envs(path.map(|p| ("PATH", p)))
         .stdin(Stdio::null())
         .process_group(0)
         .kill_on_drop(true);
@@ -483,7 +543,7 @@ mod tests {
 
         // rustc
         let line = "  --> src/x.rs:3:5";
-        let got = parse_locations(line, root);
+        let got = parse_locations(line, &[root]);
         assert_eq!(
             got,
             vec![Location {
@@ -497,7 +557,7 @@ mod tests {
 
         // tsc
         let line = "web/src/x.ts(12,7): error TS2322: Type 'string' is not assignable";
-        let got = parse_locations(line, root);
+        let got = parse_locations(line, &[root]);
         assert_eq!(got.len(), 1);
         assert_eq!(
             (got[0].path.clone(), got[0].line, got[0].col),
@@ -507,7 +567,7 @@ mod tests {
 
         // generic path:line:col and path:line, several per line
         let line = "lib/a.c:10:2: warning: see README.md:4 and src/x.rs:9";
-        let got = parse_locations(line, root);
+        let got = parse_locations(line, &[root]);
         let short: Vec<_> = got
             .iter()
             .map(|l| (l.path.clone(), l.line, l.col, &line[l.span.clone()]))
@@ -523,20 +583,100 @@ mod tests {
 
         // absolute paths under the root count; outside it, or missing, they don't
         let abs = format!("panicked at {}:7:9:", at("src/x.rs").display());
-        let got = parse_locations(&abs, root);
+        let got = parse_locations(&abs, &[root]);
         assert_eq!((got[0].path.clone(), got[0].line), (at("src/x.rs"), 7));
-        assert!(parse_locations("/etc/passwd:1:1", root).is_empty());
-        assert!(parse_locations("src/missing.rs:1:1", root).is_empty());
-        assert!(parse_locations("../x/src/x.rs:1:1", root).is_empty());
-        assert!(parse_locations("at 12:30:45 http://localhost:8080/x", root).is_empty());
-        assert!(parse_locations("src/x.rs:0:1", root).is_empty());
+        assert!(parse_locations("/etc/passwd:1:1", &[root]).is_empty());
+        assert!(parse_locations("src/missing.rs:1:1", &[root]).is_empty());
+        assert!(parse_locations("../x/src/x.rs:1:1", &[root]).is_empty());
+        assert!(parse_locations("at 12:30:45 http://localhost:8080/x", &[root]).is_empty());
+        assert!(parse_locations("src/x.rs:0:1", &[root]).is_empty());
 
         // ANSI colours are skipped, the span is in the original line's bytes
         let line = "\x1b[1m\x1b[94m  --> \x1b[0msrc/x.rs\x1b[0m:3:5";
-        let got = parse_locations(line, root);
+        let got = parse_locations(line, &[root]);
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].line, got[0].col), (3, Some(5)));
         assert_eq!(&line[got[0].span.clone()], "src/x.rs\x1b[0m:3:5");
+    }
+
+    #[test]
+    fn locations_try_the_project_folder_then_the_root() {
+        let dir = root_with(&[
+            "web/src/app.ts",
+            "web/src/both.ts",
+            "src/both.ts",
+            "README.md",
+            "lib/util.ts",
+        ]);
+        let root = dir.path();
+        let bases = [root.join("web"), root.to_path_buf()];
+        let found = |line: &str| -> Vec<(PathBuf, usize)> {
+            parse_locations(line, &bases)
+                .into_iter()
+                .map(|l| (l.path, l.line))
+                .collect()
+        };
+        // Relative to the project (tsc run by moon in web/).
+        assert_eq!(
+            found("src/app.ts(3,5): error TS2322"),
+            vec![(root.join("web/src/app.ts"), 3)]
+        );
+        // Relative to the root still works.
+        assert_eq!(found("see README.md:7"), vec![(root.join("README.md"), 7)]);
+        // In both: the project's wins.
+        assert_eq!(
+            found("src/both.ts:2:1"),
+            vec![(root.join("web/src/both.ts"), 2)]
+        );
+        // Up out of the project but still inside the root.
+        assert_eq!(
+            found("../lib/util.ts:4"),
+            vec![(root.join("lib/util.ts"), 4)]
+        );
+        // Never outside the root.
+        assert!(found("../../etc/passwd:1").is_empty());
+        let nothing: [PathBuf; 0] = [];
+        assert!(parse_locations("README.md:1", &nothing).is_empty());
+    }
+
+    #[test]
+    fn moon_steps_look_in_their_project_folder() {
+        let root = Path::new("/ws");
+        let task = |target: &str, source: Option<&str>, from_root: bool| MoonTask {
+            project: target.split(':').next().unwrap().into(),
+            id: target.split(':').nth(1).unwrap().into(),
+            target: target.into(),
+            command: "x".into(),
+            description: None,
+            source: source.map(str::to_string),
+            run_from_workspace_root: from_root,
+        };
+        let tasks = [
+            task("web:check", Some("apps/web"), false),
+            task("web:lint", Some("apps/web"), true),
+            task("workspace:format", Some("."), false),
+            task("odd:x", None, false),
+        ];
+        let moon = |target: &str| Step::Moon {
+            target: target.into(),
+            args: vec![],
+        };
+        let dirs = |step: Step| step_base_dirs(&step, root, &tasks);
+        assert_eq!(
+            dirs(moon("web:check")),
+            vec![PathBuf::from("/ws/apps/web"), PathBuf::from("/ws")]
+        );
+        for only_root in [
+            moon("web:lint"),
+            moon("workspace:format"),
+            moon("odd:x"),
+            moon("unknown:task"),
+            Step::Shell {
+                command: "tsc".into(),
+            },
+        ] {
+            assert_eq!(dirs(only_root), vec![PathBuf::from("/ws")]);
+        }
     }
 
     #[test]

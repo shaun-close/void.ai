@@ -1,0 +1,40 @@
+{
+  "projects": [
+    {
+      "id": "void-core",
+      "source": "crates/void-core",
+      "language": "rust",
+      "layer": "library"
+    },
+    {
+      "id": "void-editor",
+      "source": "crates/void-editor",
+      "language": "rust",
+      "layer": "library"
+    },
+    {
+      "id": "void-gui",
+      "source": "apps/void-gui",
+      "language": "rust",
+      "layer": "application"
+    },
+    {
+      "id": "void-sandbox",
+      "source": "crates/void-sandbox",
+      "language": "rust",
+      "layer": "application"
+    },
+    {
+      "id": "void-vim",
+      "source": "crates/void-vim",
+      "language": "rust",
+      "layer": "library"
+    },
+    {
+      "id": "workspace",
+      "source": ".",
+      "language": "rust",
+      "layer": "configuration"
+    }
+  ]
+}

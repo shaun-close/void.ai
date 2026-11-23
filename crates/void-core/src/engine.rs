@@ -114,11 +114,15 @@ pub enum Command {
     },
     /// A `Changes` event for every conversation in this workspace that has pending changes.
     ListWorkspaceChanges,
-    /// Run a saved config (by `RunConfig::id`) of the current workspace.
+    /// Run a saved config (by `RunConfig::id`) of the current workspace. Not sandboxed;
+    /// anything a step leaves running in its process group is killed when the step ends;
+    /// `setsid` daemons are unaffected.
     RunConfig {
         config_id: String,
     },
-    /// Run one moon task (`project:task`) with the active environment profile.
+    /// Run one moon task (`project:task`) with the active environment profile. Not
+    /// sandboxed; anything a step leaves running in its process group is killed when the
+    /// step ends; `setsid` daemons are unaffected.
     RunTask {
         target: String,
         args: Vec<String>,
@@ -271,11 +275,13 @@ pub enum Event {
         name: String,
         steps: usize,
     },
-    /// Step `index` (0-based) started; `label` is its command line.
+    /// Step `index` (0-based) started; `label` is its command line. `base_dirs`: where the
+    /// step's output paths are relative to, in order — pass them to `parse_locations`.
     RunStep {
         run: RunId,
         index: usize,
         label: String,
+        base_dirs: Vec<PathBuf>,
     },
     /// Output of the run's current step (stdout and stderr merged, as written; may hold
     /// ANSI escapes and `\r`, and end mid-line).

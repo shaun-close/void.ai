@@ -28,6 +28,8 @@ pub(super) struct RunsState {
     last: Option<Request>,
     /// Only the newest discovery's result counts.
     tasks_generation: u64,
+    /// The workspace's moon tasks as last discovered (for moon steps' project folders).
+    tasks: Vec<MoonTask>,
 }
 
 struct ActiveRun {
@@ -86,6 +88,7 @@ impl State {
         let mut errors = Vec::new();
         let st = &mut self.runs;
         st.last = None;
+        st.tasks.clear();
         (st.runs, st.runs_unreadable) = match Runs::load(&runs_path) {
             Ok((runs, warning)) => {
                 warnings.extend(warning);
@@ -169,6 +172,7 @@ impl State {
             .clone()
             .filter(|r| r.join(".moon").is_dir())
         else {
+            self.runs.tasks.clear();
             self.emit(Event::Tasks(Vec::new()));
             return;
         };
@@ -187,7 +191,10 @@ impl State {
             return;
         }
         match result {
-            Ok(tasks) => self.emit(Event::Tasks(tasks)),
+            Ok(tasks) => {
+                self.runs.tasks = tasks.clone();
+                self.emit(Event::Tasks(tasks));
+            }
             Err(e) => self.emit(Event::Error(format!("Couldn't list moon tasks: {e}"))),
         }
     }
@@ -247,7 +254,12 @@ impl State {
             let _ = tx.send(Msg::Run { run, update });
         });
         let cancel = CancellationToken::new();
-        let spec = ChainSpec { steps, root, env };
+        let spec = ChainSpec {
+            steps,
+            root,
+            env,
+            tasks: self.runs.tasks.clone(),
+        };
         let task = tokio::spawn(run_chain(spec, cancel.clone(), sink));
         self.runs.active.insert(
             run,
@@ -264,7 +276,16 @@ impl State {
             return;
         }
         match update {
-            RunUpdate::Step { index, label } => self.emit(Event::RunStep { run, index, label }),
+            RunUpdate::Step {
+                index,
+                label,
+                base_dirs,
+            } => self.emit(Event::RunStep {
+                run,
+                index,
+                label,
+                base_dirs,
+            }),
             RunUpdate::Output(text) => self.emit(Event::RunOutput { run, text }),
             RunUpdate::Finished {
                 ok,
@@ -537,6 +558,12 @@ mod tests {
         );
         let root = r.root.canonicalize().unwrap();
         assert_eq!(output(&ev), format!("one\ntwo\n{}\n", root.display()));
+        // Shell steps resolve output paths against the workspace root only.
+        for e in &ev {
+            if let Event::RunStep { base_dirs, .. } = e {
+                assert_eq!(base_dirs, &vec![root.clone()]);
+            }
+        }
         // Each step's output comes after its RunStep and before the next one.
         let order: Vec<String> = ev
             .iter()
@@ -924,6 +951,12 @@ mod tests {
             matches!(&tasks, Event::Tasks(t) if t.iter().any(|t| t.target == "workspace:format")),
             "{tasks:?}"
         );
+        // Each task knows its project's folder.
+        let Event::Tasks(tasks) = tasks else {
+            unreachable!()
+        };
+        let gui = tasks.iter().find(|t| t.target == "void-gui:run").unwrap();
+        assert_eq!(gui.source.as_deref(), Some("apps/void-gui"));
         r.handle.send(Command::RunTask {
             target: "workspace:format".into(),
             args: vec![],
@@ -946,5 +979,10 @@ mod tests {
             vec![(0, "moon run workspace:format".to_string())]
         );
         assert!(finished(&ev).0, "{out}");
+        // A root-level project: paths are relative to the workspace root.
+        let root = repo.canonicalize().unwrap();
+        assert!(ev.iter().any(
+            |e| matches!(e, Event::RunStep { base_dirs, .. } if *base_dirs == vec![root.clone()])
+        ));
     }
 }
