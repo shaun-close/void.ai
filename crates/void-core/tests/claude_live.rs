@@ -16,7 +16,7 @@
 //!
 //! The profile's command is a wrapper around the real `claude` that copies its stdout (control
 //! responses reduced to their envelope, so no account details) and stderr into a package-cache
-//! dir, which the sandbox mounts with a host-visible layer, so the test can report the real
+//! dir, whose writes land in a layer under void's data dir, so the test can report the real
 //! stream shapes.
 
 use std::fs;
@@ -85,6 +85,7 @@ struct Progress {
 
 struct Live {
     ws: PathBuf,
+    /// The host-visible side of the wrapper's log dir.
     rawlog: PathBuf,
     store: Store,
     handle: EngineHandle,
@@ -143,6 +144,13 @@ exit $code
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// Where the sandbox keeps a package cache's writes (as `Sandbox::caches` names the layer).
+fn data_layer(data: &Path, cache: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let name = hex::encode(Sha256::digest(cache.as_os_str().as_encoded_bytes()));
+    data.join("cache-overlay").join(&name[..12]).join("upper")
 }
 
 /// overlayfs leaves a mode-000 `work/work` behind, which stops a plain recursive delete.
@@ -226,6 +234,7 @@ impl Live {
         };
         let cfg_path = root.join("config/config.toml");
         save_config(&cfg_path, &cfg).unwrap();
+        let store_root = data.clone();
         let store = Store::new(data);
         let bridge = Arc::new(AllowOnce::default());
         let handle = Engine::start_with_options(
@@ -240,7 +249,8 @@ impl Live {
         );
         let mut live = Live {
             ws: ws.clone(),
-            rawlog,
+            // What the wrapper writes lands in the cache's layer under void's data dir.
+            rawlog: data_layer(&store_root, &rawlog),
             store,
             handle,
             bridge,
