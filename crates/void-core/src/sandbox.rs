@@ -549,25 +549,29 @@ impl Sandbox {
     /// the bottom: the read-only root, the throwaway home layer, package caches, the chat's
     /// workspace overlay, `rw_binds`, the hidden paths (minus `unhide`), then void.ai's own
     /// writable directories (target dir, Scratch cwd), which live under its hidden data dir.
-    pub fn spawn_args(&self, plan: &SpawnPlan) -> Vec<OsString> {
+    ///
+    /// Fails (instead of quietly dropping a mount) when the home layer or an `rw_binds` target
+    /// can't be resolved, or when the workspace or Scratch cwd lies inside an `rw_binds` path.
+    pub fn spawn_args(&self, plan: &SpawnPlan) -> Result<Vec<OsString>, String> {
+        let home = self.check_spawn(plan)?;
+        let binds = plan
+            .rw_binds
+            .iter()
+            .map(|b| {
+                std::fs::canonicalize(b.path())
+                    .map_err(|e| format!("can't bind {}: {e}", b.path().display()))
+            })
+            .collect::<Result<Vec<PathBuf>, String>>()?;
         let mut a = Args::default();
         self.args_base(&mut a);
         // Throwaway writable home: writes land in an invisible tmpfs, gone with the process.
-        let home = std::fs::canonicalize(&self.home).ok();
-        if let Some(h) = &home {
-            let h = h.as_os_str();
-            a.push(&["--overlay-src".as_ref(), h, "--tmp-overlay".as_ref(), h]);
-        }
+        let h = home.as_os_str();
+        a.push(&["--overlay-src".as_ref(), h, "--tmp-overlay".as_ref(), h]);
         let caches = self.caches();
         self.args_caches(&mut a, &caches);
         if let Some(o) = &plan.overlay {
             self.args_overlay(&mut a, &o.workspace, &o.upper, &o.work);
         }
-        let binds: Vec<PathBuf> = plan
-            .rw_binds
-            .iter()
-            .filter_map(|b| std::fs::canonicalize(b.path()).ok())
-            .collect();
         for b in &binds {
             a.push(&["--bind".as_ref(), b.as_os_str(), b.as_os_str()]);
         }
@@ -591,17 +595,55 @@ impl Sandbox {
             None => writes.push(cwd),
         }
         writes.extend(caches.iter().map(|(c, _)| c.as_os_str()));
-        writes.extend(home.iter().map(|h| h.as_os_str()));
+        writes.push(h);
         writes.extend(binds.iter().map(|b| b.as_os_str()));
         self.args_helper(&mut a, &writes);
         a.extend(&plan.argv);
-        a.0
+        Ok(a.0)
+    }
+
+    /// The checks `spawn` makes before touching anything; returns the canonical home.
+    ///
+    /// A workspace (or Scratch cwd) at or beneath a read-write bind is refused: the bind of the
+    /// host tree is mounted over the chat overlay and the read-only `.git`, so edits would reach
+    /// the host directly. The reverse (binds inside the workspace, e.g. workspace == `$HOME`) is
+    /// fine: the binds sit on top, so Claude Code's saves reach its real files, not Review.
+    fn check_spawn(&self, plan: &SpawnPlan) -> Result<PathBuf, String> {
+        let home = std::fs::canonicalize(&self.home).map_err(|e| {
+            format!(
+                "can't set up the throwaway home layer on {}: {e}",
+                self.home.display()
+            )
+        })?;
+        let dir = match &plan.overlay {
+            Some(o) => &o.workspace,
+            None => &plan.cwd,
+        };
+        let real = resolve(dir);
+        for b in &plan.rw_binds {
+            let bind = resolve(b.path());
+            if real.starts_with(&bind) {
+                return Err(format!(
+                    "can't open {} here: it is inside Claude Code's state ({}), which is bound \
+                     read-write, so edits would bypass the chat overlay and Review",
+                    dir.display(),
+                    bind.display()
+                ));
+            }
+        }
+        Ok(home)
     }
 
     /// Start a long-lived process in the sandbox (no timeout; stdio piped; own process
     /// group). Holds the cache lock for as long as the returned [`Spawned`] lives, so other
     /// commands wait; when the lock is taken, `on_wait` is called once before waiting for it
     /// (the caller's "waiting for sandbox" signal).
+    ///
+    /// **Call this from a tokio runtime worker thread (a task on the runtime), never from
+    /// `spawn_blocking` or a short-lived thread.** bwrap runs with `--die-with-parent`, which
+    /// is `PR_SET_PDEATHSIG`: it fires when the *thread* that forked bwrap exits, not the
+    /// process. Blocking-pool threads are retired after idling, which would SIGKILL a turn that
+    /// is still running.
     pub async fn spawn(
         &self,
         plan: SpawnPlan,
@@ -613,6 +655,7 @@ impl Sandbox {
         if plan.argv.is_empty() {
             return Err("nothing to run".into());
         }
+        self.check_spawn(&plan)?;
         let caches = self.caches();
         let lock = if caches.is_empty() {
             None
@@ -645,7 +688,7 @@ impl Sandbox {
         let mut cmd = tokio::process::Command::new(bwrap);
         cmd.arg("--info-fd")
             .arg(w.to_string())
-            .args(self.spawn_args(&plan))
+            .args(self.spawn_args(&plan)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -864,6 +907,25 @@ fn watch_teardown(
         drop(lock);
         let _ = gone.send(true);
     });
+}
+
+/// `p` with symlinks resolved as far as it exists (the rest appended as written), so paths
+/// that `spawn` hasn't created yet can still be compared.
+fn resolve(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// `(comm, ppid, pgrp)` from /proc/<pid>/stat.
@@ -1248,7 +1310,7 @@ mod tests {
     fn spawn_args_unhide_and_bind_claude_state() {
         let tmp = tempfile::tempdir().unwrap();
         let (sb, home, plan) = claude_rig(tmp.path());
-        let a = strs(&sb.spawn_args(&plan));
+        let a = strs(&sb.spawn_args(&plan).unwrap());
         let p = |x: &Path| x.canonicalize().unwrap().to_string_lossy().into_owned();
         let (h, claude, cj) = (
             p(&home),
@@ -1291,7 +1353,7 @@ mod tests {
     fn spawn_keeps_void_agent_hiding() {
         let tmp = tempfile::tempdir().unwrap();
         let (sb, home, plan) = claude_rig(tmp.path());
-        let _ = sb.spawn_args(&plan);
+        sb.spawn_args(&plan).unwrap();
         let ov = plan.overlay.unwrap();
         let run = RunPlan {
             workspace: ov.workspace,
@@ -1322,7 +1384,7 @@ mod tests {
         let scratch = tmp.path().join("data/scratch/chat1");
         plan.overlay = None;
         plan.cwd = scratch.clone();
-        let a = strs(&sb.spawn_args(&plan));
+        let a = strs(&sb.spawn_args(&plan).unwrap());
         let s = scratch.to_string_lossy().into_owned();
         let ws = tmp.path().join("home/proj").canonicalize().unwrap();
         assert!(
@@ -1343,13 +1405,87 @@ mod tests {
             tmp.path().join("home"),
             sb.settings().clone(),
         );
-        let b = strs(&ll.spawn_args(&plan));
+        let b = strs(&ll.spawn_args(&plan).unwrap());
         let h = pos(&b, &["/x/void-sandbox-exec"]).unwrap();
         assert!(pos(&b[h..], &["--write", &s]).is_some());
         assert!(pos(&b[h..], &["--write", "/tmp"]).is_some());
         let home = tmp.path().join("home").canonicalize().unwrap();
         assert!(pos(&b[h..], &["--write", &home.to_string_lossy()]).is_some());
         assert_eq!(&b[b.len() - 3..], ["--", "claude", "-p"]);
+    }
+
+    /// The rig's sandbox with a bwrap that doesn't exist: `spawn` can only fail, and a refusal
+    /// has to come from the checks, never from trying to start anything.
+    fn no_bwrap(sb: &Sandbox, home: &Path, data: &Path) -> Sandbox {
+        Sandbox::with_paths(
+            Some("/nonexistent/bwrap".into()),
+            None,
+            data.to_path_buf(),
+            home.to_path_buf(),
+            sb.settings().clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn spawn_workspace_inside_claude_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, home, mut plan) = claude_rig(tmp.path());
+        let sb = no_bwrap(&sb, &home, &tmp.path().join("data"));
+        plan.argv = vec!["true".into()];
+        fs::create_dir_all(home.join(".claude/ws/.git")).unwrap();
+        for ws in [home.join(".claude/ws"), home.join(".claude")] {
+            let mut p = plan.clone();
+            let o = p.overlay.as_mut().unwrap();
+            o.workspace = ws.clone();
+            p.cwd = ws.clone();
+            let err = sb.spawn(p, || {}).await.err().unwrap();
+            assert!(
+                err.contains("inside Claude Code's state"),
+                "{}: {err}",
+                ws.display()
+            );
+        }
+        let mut p = plan.clone();
+        p.overlay = None;
+        p.cwd = home.join(".claude/scratch");
+        let err = sb.spawn(p, || {}).await.err().unwrap();
+        assert!(err.contains("inside Claude Code's state"), "scratch: {err}");
+        // The reverse is fine: the state binds sit on top of a workspace that contains them.
+        let mut p = plan.clone();
+        p.overlay.as_mut().unwrap().workspace = home.clone();
+        p.cwd = home.clone();
+        let err = sb.spawn(p, || {}).await.err().unwrap();
+        assert!(
+            err.contains("can't start bubblewrap"),
+            "home as workspace: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_unresolvable_rw_bind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, home, mut plan) = claude_rig(tmp.path());
+        let sb = no_bwrap(&sb, &home, &tmp.path().join("data"));
+        plan.argv = vec!["true".into()];
+        fs::remove_file(home.join(".claude.json")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), home.join(".claude.json")).unwrap();
+        let err = sb.spawn(plan, || {}).await.err().unwrap();
+        assert!(err.contains(".claude.json"), "{err}");
+        assert!(!err.contains("can't start bubblewrap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_without_a_home_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sb, _home, mut plan) = claude_rig(tmp.path());
+        let missing = tmp.path().join("no-such-home");
+        let sb = no_bwrap(&sb, &missing, &tmp.path().join("data"));
+        plan.argv = vec!["true".into()];
+        plan.rw_binds.clear();
+        plan.unhide.clear();
+        let err = sb.spawn(plan, || {}).await.err().unwrap();
+        assert!(err.contains("home"), "{err}");
+        assert!(!err.contains("can't start bubblewrap"), "{err}");
     }
 
     #[test]

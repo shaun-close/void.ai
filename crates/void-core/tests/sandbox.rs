@@ -476,6 +476,36 @@ async fn spawn_workspace_writes_go_to_chat_upper() {
     assert!(r.data.join("ws/sandbox-target/built").exists());
 }
 
+/// Workspace == $HOME: Claude Code's state binds sit on top of the chat overlay, so its saves
+/// reach the host file (not the chat upper, not Review) while other edits go to the upper.
+#[tokio::test]
+async fn spawn_workspace_home_keeps_claude_state_on_host() {
+    let Some(mut r) = home_rig(&[]).await else {
+        return;
+    };
+    r.ws = r.home.clone();
+    let (code, out) = r
+        .script(
+            r#"printf '{"h":1}' > ~/.claude.json && echo s > ~/.claude/state && echo e > edit && echo ok"#,
+            true,
+        )
+        .await;
+    assert_eq!(code, Some(0), "{out}");
+    let upper = r.data.join("chats/c1/upper");
+    assert_eq!(
+        fs::read_to_string(r.home.join(".claude.json")).unwrap(),
+        r#"{"h":1}"#
+    );
+    assert_eq!(
+        fs::read_to_string(r.home.join(".claude/state")).unwrap(),
+        "s\n"
+    );
+    assert!(!upper.join(".claude.json").exists());
+    assert!(!upper.join(".claude").exists());
+    assert_eq!(fs::read_to_string(upper.join("edit")).unwrap(), "e\n");
+    assert!(!r.home.join("edit").exists());
+}
+
 #[tokio::test]
 async fn spawn_scratch_runs_in_its_own_dir() {
     let Some(r) = home_rig(&[]).await else { return };
