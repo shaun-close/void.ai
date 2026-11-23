@@ -47,6 +47,13 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
             });
             ui.add_space(6.0);
             theme::card(ui, |ui| {
+                ui.label(RichText::new("Editor").color(pal.text_dim).small());
+                ui.checkbox(&mut c.editor.vim, "Vim keys")
+                    .on_hover_text("Off: plain editing (arrows, Shift to select, Ctrl+Z / Ctrl+Y)");
+                ui.checkbox(&mut c.editor.relative_numbers, "Relative line numbers");
+            });
+            ui.add_space(6.0);
+            theme::card(ui, |ui| {
                 ui.label(RichText::new("Model").color(pal.text_dim).small());
                 ui.horizontal(|ui| {
                     ui.label("Default profile");

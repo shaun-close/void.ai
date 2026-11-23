@@ -18,6 +18,7 @@ pub mod icon {
     pub const COPY: &str = "\u{E1CA}";
     pub const CHECK_CIRCLE: &str = "\u{E184}";
     pub const CIRCLE: &str = "\u{E18A}";
+    pub const FILE_CODE: &str = "\u{E914}";
     pub const FILE_TEXT: &str = "\u{E23A}";
     pub const GIT_DIFF: &str = "\u{E27C}";
     pub const HAND: &str = "\u{E298}";

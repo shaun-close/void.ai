@@ -15,7 +15,7 @@ pub mod settings;
 
 use void_core::engine::Command;
 
-use crate::layout::Tab;
+use crate::layout::{EditorView, Tab};
 use crate::state::UiState;
 use crate::theme::{self, icon};
 
@@ -43,6 +43,12 @@ pub enum Action {
     ShowInNewTab(ConversationId),
     /// A Chat tab with no conversation sent its first message: create one, then send.
     StartChat { tab: u32, text: String },
+    /// Open a workspace file (relative to the workspace root) in an editor tab.
+    OpenFile(std::path::PathBuf),
+    /// Another tab on the same buffer as this editor tab.
+    DuplicateEditor(u32),
+    /// The user closed this editor tab.
+    CloseEditor(u32),
 }
 
 pub struct Panels<'a> {
@@ -56,6 +62,9 @@ pub struct Panels<'a> {
     pub review: &'a mut review::ReviewUi,
     /// The conversation in the focused Chat tab (highlighted in the list).
     pub focused: Option<ConversationId>,
+    pub editors: &'a mut crate::editor::EditorStore,
+    /// The editor tab the dock has focused, if it's one.
+    pub focused_editor: Option<u32>,
 }
 
 impl egui_dock::TabViewer for Panels<'_> {
@@ -64,6 +73,7 @@ impl egui_dock::TabViewer for Panels<'_> {
     fn id(&mut self, tab: &mut Tab) -> Id {
         match tab {
             Tab::Chat { id, .. } => Id::unique(("chat", *id)),
+            Tab::Editor { id, .. } => Id::unique(("editor", *id)),
             other => Id::unique(other.kind()),
         }
     }
@@ -100,7 +110,51 @@ impl egui_dock::TabViewer for Panels<'_> {
                     theme::itext(icon::GIT_DIFF, "Review")
                 }
             }
+            Tab::Editor { path, view, .. } => {
+                let key = (path.clone(), view.clone());
+                let mut name = crate::editor::file_name(path);
+                if let EditorView::Chat(_) = view {
+                    name.push_str(" · chat");
+                }
+                if self.editors.is_dirty(&key) {
+                    name.push_str(" ●");
+                }
+                theme::itext(crate::editor::lang_icon(path), &name)
+            }
         }
+    }
+
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        if let Tab::Editor { path, .. } = tab {
+            response.clone().on_hover_text(path.display().to_string());
+        }
+    }
+
+    fn context_menu(&mut self, ui: &mut Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
+        if let Tab::Editor { id, path, .. } = tab {
+            if ui
+                .button(theme::itext(icon::LAYOUT, "Open in another tab"))
+                .clicked()
+            {
+                self.actions.push(Action::DuplicateEditor(*id));
+                ui.close();
+            }
+            if ui.button(theme::itext(icon::COPY, "Copy path")).clicked() {
+                ui.ctx().copy_text(path.display().to_string());
+                ui.close();
+            }
+        }
+    }
+
+    /// Editor tabs close through the app, which asks Save / Discard / Cancel when the last tab
+    /// on a dirty buffer goes.
+    fn on_close(&mut self, tab: &mut Tab) -> egui_dock::tab_viewer::OnCloseResponse {
+        use egui_dock::tab_viewer::OnCloseResponse;
+        if let Tab::Editor { id, .. } = tab {
+            self.actions.push(Action::CloseEditor(*id));
+            return OnCloseResponse::Ignore;
+        }
+        OnCloseResponse::Close
     }
 
     /// Panels scroll themselves; the dock's own scroll areas would stop text from wrapping.
@@ -118,6 +172,7 @@ impl egui_dock::TabViewer for Panels<'_> {
             Tab::Backends => backends::show(ui, self),
             Tab::Settings => settings::show(ui, self),
             Tab::Review => review::show(ui, self),
+            Tab::Editor { id, path, view } => crate::editor::show(ui, self, *id, path, view),
         }
     }
 }

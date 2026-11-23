@@ -216,6 +216,15 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
                 force: false,
             });
         }
+        if let Some(root) = &p.state.workspace.root
+            && root.join(&path).is_file()
+            && ui
+                .button(theme::itext(icon::FILE_CODE, "Open"))
+                .on_hover_text("Open the file on disk in an editor tab")
+                .clicked()
+        {
+            p.actions.push(super::Action::OpenFile(path.clone()));
+        }
         if ui
             .button(theme::itext_styled(
                 icon::X_CIRCLE,

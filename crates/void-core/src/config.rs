@@ -151,6 +151,26 @@ pub struct Config {
     pub agents: Vec<crate::agent::AgentProfile>,
     pub default_agent: String,
     pub sandbox: crate::sandbox::SandboxSettings,
+    pub editor: EditorSettings,
+}
+
+/// How editor tabs behave.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    /// Vim keys; off means plain editing (arrows, Shift to select, Ctrl+Z/Y).
+    pub vim: bool,
+    /// Line numbers relative to the cursor line (the cursor line shows its own number).
+    pub relative_numbers: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            vim: true,
+            relative_numbers: true,
+        }
+    }
 }
 
 const STRATA_MODEL: &str = "qwen3.8-flash-next-iq3_xxs";
@@ -219,6 +239,7 @@ impl Default for Config {
             agents: crate::agent::default_agents(),
             default_agent: "build".into(),
             sandbox: crate::sandbox::SandboxSettings::default(),
+            editor: EditorSettings::default(),
         }
     }
 }

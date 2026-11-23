@@ -180,25 +180,40 @@ impl Buffer {
 
     /// Undo the last group, returning the cursor from before it.
     pub fn undo(&mut self) -> Option<usize> {
-        self.end_group(0);
-        let g = self.undo.pop()?;
-        for c in g.changes.iter().rev() {
-            self.apply(c.start, c.new.chars().count(), &c.old);
-        }
-        let cursor = g.cursor_before;
-        self.redo.push(g);
-        Some(cursor)
+        self.undo_edits().map(|(cursor, _)| cursor)
     }
 
-    /// Redo the last undone group, returning the cursor from after it.
     pub fn redo(&mut self) -> Option<usize> {
+        self.redo_edits().map(|(cursor, _)| cursor)
+    }
+
+    /// Undo one step; returns the cursor to restore and the edits made, in order (feed them to
+    /// [`crate::Syntax::edit`] to keep a tree in step).
+    pub fn undo_edits(&mut self) -> Option<(usize, Vec<Edit>)> {
+        self.end_group(0);
+        let g = self.undo.pop()?;
+        let edits = g
+            .changes
+            .iter()
+            .rev()
+            .map(|c| self.apply(c.start, c.new.chars().count(), &c.old))
+            .collect();
+        let cursor = g.cursor_before;
+        self.redo.push(g);
+        Some((cursor, edits))
+    }
+
+    /// Redo one step; like [`Buffer::undo_edits`].
+    pub fn redo_edits(&mut self) -> Option<(usize, Vec<Edit>)> {
         let g = self.redo.pop()?;
-        for c in &g.changes {
-            self.apply(c.start, c.old.chars().count(), &c.new);
-        }
+        let edits = g
+            .changes
+            .iter()
+            .map(|c| self.apply(c.start, c.old.chars().count(), &c.new))
+            .collect();
         let cursor = g.cursor_after;
         self.undo.push(g);
-        Some(cursor)
+        Some((cursor, edits))
     }
 
     pub fn line_count(&self) -> usize {
@@ -311,5 +326,39 @@ mod tests {
         assert_eq!(b.line_len(0), 2);
         assert_eq!(b.line_len(1), 0);
         assert_eq!(b.line_len(2), 3);
+    }
+
+    #[test]
+    fn undo_reports_edits() {
+        let mut b = Buffer::new("aé\nb");
+        b.begin_group(0);
+        b.replace(0..0, "x");
+        b.replace(4..5, "🦀z");
+        b.end_group(6);
+        let (cursor, edits) = b.undo_edits().unwrap();
+        assert_eq!(cursor, 0);
+        assert_eq!(b.slice(0..b.rope().len_chars()), "aé\nb");
+        // Undone in reverse order, each in the coordinates of the text it applied to.
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            (edits[0].start, edits[0].old_len, edits[0].new_len),
+            (4, 2, 1)
+        );
+        assert_eq!(
+            (edits[1].start, edits[1].old_len, edits[1].new_len),
+            (0, 1, 0)
+        );
+        let (cursor, edits) = b.redo_edits().unwrap();
+        assert_eq!(cursor, 6);
+        assert_eq!(b.slice(0..b.rope().len_chars()), "xaé\n🦀z");
+        assert_eq!(
+            (edits[0].start, edits[0].old_len, edits[0].new_len),
+            (0, 0, 1)
+        );
+        assert_eq!(
+            (edits[1].start, edits[1].old_len, edits[1].new_len),
+            (4, 1, 2)
+        );
+        assert!(b.redo_edits().is_none());
     }
 }

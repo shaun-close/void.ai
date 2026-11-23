@@ -1,0 +1,357 @@
+//! Editor tabs driven headlessly through the real app (egui_kittest, offline).
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use egui::accesskit::Role;
+use egui::{Event, Key, Modifiers};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+
+use super::draw::relative_line_numbers;
+use super::input::vim_key;
+use crate::app::VoidApp;
+use crate::layout::{EditorView, Tab};
+
+fn harness(root: &Path) -> Harness<'static, VoidApp> {
+    let (cfg, data) = (root.join("config.toml"), root.join("data"));
+    let mut h = Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_max_steps(10)
+        .with_accessibility_check(false)
+        .build_eframe(move |cc| VoidApp::new(cc, None, cfg, data));
+    // The engine opens Scratch and the app applies its layout; editor tabs go in after that.
+    until(&mut h, "workspace", |a| a.state.workspace.name == "Scratch");
+    h.step();
+    h
+}
+
+fn until(h: &mut Harness<'_, VoidApp>, what: &str, done: impl Fn(&VoidApp) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        h.step();
+        if done(h.state()) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// What the editor widget currently shows (its visible lines).
+fn shown(h: &Harness<'_, VoidApp>) -> String {
+    h.get_by_role(Role::MultilineTextInput)
+        .value()
+        .unwrap_or_default()
+}
+
+fn editor_tabs(app: &VoidApp) -> Vec<u32> {
+    app.dock
+        .iter_all_tabs()
+        .filter_map(|(_, t)| match t {
+            Tab::Editor { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Type `s` and let two frames pass (tab titles show what the frame before them did).
+fn text(h: &mut Harness<'_, VoidApp>, s: &str) {
+    h.event(Event::Text(s.into()));
+    h.step();
+    h.step();
+}
+
+fn close(h: &mut Harness<'_, VoidApp>, id: u32) {
+    h.state_mut().close_editor_tab(id);
+    h.step();
+    h.step();
+}
+
+#[test]
+fn editor_opens_file_and_shows_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    assert_eq!(editor_tabs(h.state()).len(), 1);
+    assert!(shown(&h).contains("println!(\"hi\");"), "{:?}", shown(&h));
+    // Tab title and status line.
+    assert!(h.query_by_label_contains("main.rs").is_some());
+    assert!(h.query_by_label("NORMAL").is_some());
+    assert!(h.query_by_label("1:1").is_some());
+    assert!(h.query_by_label("Rust").is_some());
+    assert!(h.query_by_label("LF").is_some());
+    // Opening the same file again focuses the tab instead of adding one.
+    h.state_mut().open_editor(file, EditorView::Disk, Some(2));
+    h.step();
+    assert_eq!(editor_tabs(h.state()).len(), 1);
+    assert!(h.query_by_label("2:5").is_some(), "line 2, first non-blank");
+}
+
+#[test]
+fn editor_vim_edit_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "world\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "ihello ");
+    assert!(h.query_by_label("INSERT").is_some());
+    h.key_press(Key::Escape);
+    h.step();
+    assert!(h.query_by_label("NORMAL").is_some());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "world\n",
+        "nothing written before :w"
+    );
+    assert!(
+        h.query_by_label_contains("notes.txt ●").is_some(),
+        "dirty dot"
+    );
+    text(&mut h, ":");
+    text(&mut h, "w");
+    h.key_press(Key::Enter);
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world\n");
+    assert!(h.query_by_label_contains("notes.txt ●").is_none());
+    assert!(h.query_by_label_contains("written").is_some());
+    // Undo goes through Vim: `u` restores the text (the buffer is dirty again).
+    text(&mut h, "u");
+    assert!(shown(&h).starts_with("world"), "{:?}", shown(&h));
+}
+
+#[test]
+fn editor_two_tabs_share_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    let second = h
+        .state_mut()
+        .open_editor_tab(file.clone(), EditorView::Disk);
+    h.step();
+    h.step();
+    let tabs = editor_tabs(h.state());
+    assert_eq!(tabs.len(), 2);
+    assert!(tabs.contains(&second));
+    assert_eq!(h.state().editors.len(), 1, "one buffer for both tabs");
+    text(&mut h, "dd");
+    assert!(shown(&h).starts_with("two"), "{:?}", shown(&h));
+    // Both titles carry the dirty dot; the other tab shows the same text.
+    assert_eq!(h.query_all_by_label_contains("a.txt ●").count(), 2);
+    let first = tabs.into_iter().find(|t| *t != second).unwrap();
+    h.state_mut().focus_editor_tab(first);
+    h.step();
+    h.step();
+    assert!(shown(&h).starts_with("two"), "{:?}", shown(&h));
+    // Closing one of two tabs on a dirty buffer doesn't ask: the other still holds it.
+    close(&mut h, first);
+    assert!(h.query_by_label_contains("Save changes").is_none());
+    assert_eq!(editor_tabs(h.state()), vec![second]);
+}
+
+#[test]
+fn editor_dirty_close_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("b.txt");
+    std::fs::write(&file, "keep\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "x");
+    let id = editor_tabs(h.state())[0];
+
+    // Cancel keeps the tab and the edit.
+    close(&mut h, id);
+    assert!(h.query_by_label_contains("Save changes to b.txt").is_some());
+    h.get_by_label("Cancel").click();
+    h.step();
+    h.step();
+    assert_eq!(editor_tabs(h.state()), vec![id]);
+    assert!(h.query_by_label_contains("Save changes").is_none());
+
+    // Discard closes without writing.
+    close(&mut h, id);
+    h.get_by_label("Discard").click();
+    h.step();
+    h.step();
+    assert!(editor_tabs(h.state()).is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n");
+    assert_eq!(h.state().editors.len(), 0, "discarded buffer dropped");
+
+    // Save writes, then closes.
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "x");
+    let id = editor_tabs(h.state())[0];
+    close(&mut h, id);
+    h.get_by_label("Save").click();
+    h.step();
+    h.step();
+    assert!(editor_tabs(h.state()).is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "eep\n");
+
+    // A clean tab closes straight away.
+    h.state_mut().open_editor(file, EditorView::Disk, None);
+    h.step();
+    let id = editor_tabs(h.state())[0];
+    close(&mut h, id);
+    assert!(editor_tabs(h.state()).is_empty());
+}
+
+#[test]
+fn editor_big_file_first_frame_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.rs");
+    let mut src = String::with_capacity(4_000_000);
+    for i in 0..100_000 {
+        src.push_str(&format!(
+            "fn f{i}(x: u32) -> u32 {{ x + {i} }} // line {i}\n"
+        ));
+    }
+    std::fs::write(&file, &src).unwrap();
+    let mut h = harness(dir.path());
+    let t = Instant::now();
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    let first = t.elapsed();
+    let bar = if cfg!(debug_assertions) {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(200)
+    };
+    println!("100 000-line file: open + first frame in {first:?} (bar {bar:?})");
+    assert!(shown(&h).contains("fn f0(x: u32)"));
+    assert!(first < bar, "first frame took {first:?}");
+    // Highlighting follows from the background parse.
+    until(&mut h, "background parse", |a| {
+        a.editors
+            .doc(&(file.clone(), EditorView::Disk))
+            .is_some_and(|d| d.highlighted())
+    });
+    // Jumping to the end stays quick too.
+    let t = Instant::now();
+    text(&mut h, "G");
+    println!("G on 100 000 lines: {:?}", t.elapsed());
+    assert!(shown(&h).contains("line 99999"));
+}
+
+#[test]
+fn editor_restore_tolerates_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(dir.path().join("gone.rs"), EditorView::Disk, None);
+    h.step();
+    h.step();
+    assert!(h.query_by_label_contains("Couldn't open").is_some());
+    // The tab survives a layout round trip.
+    let text = crate::layout::to_text(&h.state().dock);
+    assert!(crate::layout::from_text(&text).is_some(), "{text}");
+}
+
+#[test]
+fn relative_numbers_count_from_the_cursor() {
+    assert_eq!(relative_line_numbers(5, 3..8), vec![2, 1, 6, 1, 2]);
+    assert_eq!(relative_line_numbers(0, 0..3), vec![1, 1, 2]);
+    assert_eq!(relative_line_numbers(9, 0..2), vec![9, 8]);
+}
+
+#[test]
+fn key_name_from_egui_events() {
+    let key = |key: Key, modifiers: Modifiers| Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    assert_eq!(
+        vim_key(&key(Key::V, Modifiers::CTRL)).as_deref(),
+        Some("<C-v>")
+    );
+    // eframe turns Ctrl+V, Ctrl+C and Ctrl+X into clipboard events.
+    assert_eq!(vim_key(&Event::Paste("x".into())).as_deref(), Some("<C-v>"));
+    assert_eq!(vim_key(&Event::Copy).as_deref(), Some("<C-c>"));
+    assert_eq!(vim_key(&Event::Cut).as_deref(), Some("<C-x>"));
+    assert_eq!(
+        vim_key(&key(Key::A, Modifiers::SHIFT)).as_deref(),
+        Some("A")
+    );
+    assert_eq!(vim_key(&key(Key::A, Modifiers::NONE)).as_deref(), Some("a"));
+    assert_eq!(
+        vim_key(&key(Key::Escape, Modifiers::NONE)).as_deref(),
+        Some("<Esc>")
+    );
+    assert_eq!(
+        vim_key(&key(Key::OpenBracket, Modifiers::CTRL)).as_deref(),
+        Some("<C-[>")
+    );
+    assert_eq!(
+        vim_key(&key(Key::ArrowLeft, Modifiers::NONE)).as_deref(),
+        Some("<Left>")
+    );
+    assert_eq!(
+        vim_key(&key(Key::Minus, Modifiers::CTRL)).as_deref(),
+        Some("<C-->")
+    );
+    let released = Event::Key {
+        key: Key::A,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    assert_eq!(vim_key(&released), None);
+}
+
+#[test]
+fn editor_quit_with_unsaved_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("q.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "x");
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    h.step();
+    assert!(
+        h.query_by_label_contains("Save changes before quitting")
+            .is_some()
+    );
+    assert!(h.query_by_label_contains("Unsaved: q.txt").is_some());
+    h.get_by_label("Save all").click();
+    h.step();
+    h.step();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "bc\n");
+    assert!(
+        h.query_by_label_contains("Save changes before quitting")
+            .is_none()
+    );
+}

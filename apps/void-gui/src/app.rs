@@ -12,17 +12,22 @@ use void_core::engine::{Command, Engine, EngineHandle};
 use void_core::model::ConversationId;
 use void_core::store::Store;
 
-use crate::layout::{self, Tab};
+use crate::editor::EditorStore;
+use crate::layout::{self, EditorView, Tab};
 use crate::panels::{Action, Panels};
 use crate::state::UiState;
 use crate::theme::{self, icon};
 use egui::RichText;
 
+mod editors;
+
 pub struct VoidApp {
     engine: EngineHandle,
     store: Store,
-    state: UiState,
-    dock: DockState<Tab>,
+    pub(crate) state: UiState,
+    pub(crate) dock: DockState<Tab>,
+    /// Open editor buffers, shared by the tabs that show them.
+    pub(crate) editors: EditorStore,
     inputs: HashMap<u32, String>,
     /// The Chat tab that last had focus; conversations picked in the list open there.
     focused_chat: Option<u32>,
@@ -37,6 +42,9 @@ pub struct VoidApp {
     review: crate::panels::review::ReviewUi,
     /// A first message waiting for the conversation it asked the engine to create.
     pending_start: Option<(u32, String)>,
+    /// Quitting with unsaved editor buffers: the dialog is up / the user said quit anyway.
+    quit_dialog: bool,
+    quit_anyway: bool,
 }
 
 impl VoidApp {
@@ -75,6 +83,11 @@ impl VoidApp {
             store,
             state: UiState::default(),
             dock,
+            editors: EditorStore::new(if cfg!(test) {
+                crate::editor::Clipboard::memory()
+            } else {
+                crate::editor::Clipboard::system()
+            }),
             inputs: HashMap::new(),
             focused_chat: None,
             layout_checked: Instant::now(),
@@ -86,6 +99,8 @@ impl VoidApp {
             md: Default::default(),
             review: Default::default(),
             pending_start: None,
+            quit_dialog: false,
+            quit_anyway: false,
         }
     }
 
@@ -198,6 +213,24 @@ impl VoidApp {
             Action::StartChat { tab, text } => {
                 self.pending_start = Some((tab, text));
                 self.engine.send(Command::NewConversation);
+                return;
+            }
+            Action::OpenFile(path) => {
+                let path = match &self.state.workspace.root {
+                    Some(root) => root.join(path),
+                    None => path,
+                };
+                self.open_editor(path, EditorView::Disk, None);
+                return;
+            }
+            Action::CloseEditor(tab) => {
+                self.close_editor_tab(tab);
+                return;
+            }
+            Action::DuplicateEditor(tab) => {
+                if let Some((path, view)) = self.editor_key(tab) {
+                    self.open_editor_tab(path, view);
+                }
                 return;
             }
         };
@@ -524,6 +557,10 @@ impl eframe::App for VoidApp {
             self.title = title;
         }
 
+        self.editors.settings = self.state.config.editor.clone();
+        self.editors.poll(&ctx);
+        self.global_save(&ctx);
+
         let pal = theme::palette(self.state.config.theme);
         let bar = egui::Frame::new()
             .fill(pal.bg_deep)
@@ -537,6 +574,8 @@ impl eframe::App for VoidApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(pal.bg_deep))
             .show(ui, |ui| self.dock_area(ui));
+        self.close_dialog(&ctx);
+        self.quit_dialog(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -550,6 +589,10 @@ impl VoidApp {
 
         let mut actions = Vec::new();
         let focused = self.focused_conversation();
+        let focused_editor = match self.dock.find_active_focused() {
+            Some((_, Tab::Editor { id, .. })) => Some(*id),
+            _ => None,
+        };
         let mut panels = Panels {
             state: &mut self.state,
             engine: &self.engine,
@@ -560,6 +603,8 @@ impl VoidApp {
             md: &mut self.md,
             review: &mut self.review,
             focused,
+            editors: &mut self.editors,
+            focused_editor,
         };
         DockArea::new(&mut self.dock)
             .style(theme::dock_style(ui.style().as_ref(), &pal))
@@ -572,6 +617,11 @@ impl VoidApp {
         for a in actions {
             self.apply_action(a);
         }
+        for a in std::mem::take(&mut self.editors.actions) {
+            self.apply_editor_action(a);
+        }
+        let shown = self.editor_tab_counts();
+        self.editors.retain_shown(&shown);
         self.maybe_save_layout();
     }
 }
@@ -972,6 +1022,72 @@ mod e2e {
             h.step();
         }
         h.render().unwrap().save(out.join("light.png")).unwrap();
+
+        // An editor tab: Rust, highlighted, Normal mode with a Visual selection.
+        h.state_mut().state.config.theme = void_core::config::Theme::Dark;
+        let src = proj.join("src/backend/chunk.rs");
+        std::fs::write(
+            &src,
+            r#"//! Split a byte stream into Server-Sent Events.
+
+use std::collections::VecDeque;
+
+/// One event: its name (`message` when the stream gave none) and data lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SseEvent {
+    pub name: String,
+    pub data: String,
+}
+
+pub struct Parser {
+    buf: Vec<u8>,
+    after_cr: bool,
+    ready: VecDeque<SseEvent>,
+}
+
+impl Parser {
+    pub fn new() -> Self {
+        Parser { buf: Vec::with_capacity(4096), after_cr: false, ready: VecDeque::new() }
+    }
+
+    /// Feed a chunk; complete events queue up for `next`.
+    pub fn push(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            if self.after_cr && b == b'\n' {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = b == b'\r';
+            match b {
+                b'\r' | b'\n' => self.line(),
+                _ => self.buf.push(b),
+            }
+        }
+    }
+
+    fn line(&mut self) {
+        let text = String::from_utf8_lossy(&self.buf).into_owned();
+        self.buf.clear();
+        if let Some(data) = text.strip_prefix("data: ") {
+            self.ready.push_back(SseEvent { name: "message".into(), data: data.to_string() });
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        h.state_mut()
+            .open_editor(src.clone(), EditorView::Disk, Some(24));
+        until(&mut h, 10, "highlighted", |a| {
+            a.editors
+                .doc(&(src.clone(), EditorView::Disk))
+                .is_some_and(|d| d.highlighted())
+        });
+        h.event(egui::Event::Text("wvjje".into()));
+        for _ in 0..5 {
+            h.step();
+        }
+        h.render().unwrap().save(out.join("editor.png")).unwrap();
     }
 
     /// Offline: an approval card's "Allow once" sends Approve; the engine answers with

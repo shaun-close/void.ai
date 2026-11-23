@@ -1,8 +1,17 @@
 //! The dock's tabs, the default arrangement, and helpers to reopen or persist it.
 
+use std::path::PathBuf;
+
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 use void_core::model::ConversationId;
+
+/// What an editor tab shows of its file: the real file, or a chat's pending version of it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EditorView {
+    Disk,
+    Chat(ConversationId),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tab {
@@ -15,6 +24,12 @@ pub enum Tab {
     Backends,
     Settings,
     Review,
+    /// `id` tells tabs on the same file and view apart (they share one buffer).
+    Editor {
+        id: u32,
+        path: PathBuf,
+        view: EditorView,
+    },
 }
 
 impl Tab {
@@ -25,6 +40,7 @@ impl Tab {
             Tab::Backends => "backends",
             Tab::Settings => "settings",
             Tab::Review => "review",
+            Tab::Editor { .. } => "editor",
         }
     }
 
@@ -32,6 +48,7 @@ impl Tab {
     fn same_slot(&self, other: &Tab) -> bool {
         match (self, other) {
             (Tab::Chat { id: a, .. }, Tab::Chat { id: b, .. }) => a == b,
+            (Tab::Editor { id: a, .. }, Tab::Editor { id: b, .. }) => a == b,
             _ => self.kind() == other.kind(),
         }
     }
@@ -61,6 +78,17 @@ pub fn ensure_tab(d: &mut DockState<Tab>, tab: Tab) {
     } else {
         d.push_to_focused_leaf(tab);
     }
+}
+
+pub fn next_editor_id(d: &DockState<Tab>) -> u32 {
+    d.iter_all_tabs()
+        .filter_map(|(_, t)| match t {
+            Tab::Editor { id, .. } => Some(*id),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 pub fn next_chat_id(d: &DockState<Tab>) -> u32 {
@@ -159,5 +187,30 @@ mod tests {
         let back = from_text(&json).unwrap();
         assert_eq!(to_text(&back), json);
         assert!(from_text("{not json").is_none());
+    }
+
+    #[test]
+    fn editor_tabs_roundtrip() {
+        let mut d = default_layout();
+        ensure_tab(
+            &mut d,
+            Tab::Editor {
+                id: 1,
+                path: "/tmp/a b/é.rs".into(),
+                view: EditorView::Disk,
+            },
+        );
+        ensure_tab(
+            &mut d,
+            Tab::Editor {
+                id: 2,
+                path: "/tmp/x.rs".into(),
+                view: EditorView::Chat(ConversationId::new()),
+            },
+        );
+        let text = to_text(&d);
+        let back = from_text(&text).unwrap();
+        assert_eq!(to_text(&back), text);
+        assert_eq!(next_editor_id(&back), 3);
     }
 }

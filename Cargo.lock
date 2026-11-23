@@ -4930,6 +4930,7 @@ dependencies = [
 name = "void-gui"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "chrono",
  "eframe",
  "egui",
@@ -4939,10 +4940,13 @@ dependencies = [
  "futures-util",
  "rfd",
  "ron",
+ "ropey",
  "serde",
  "serde_json",
  "tempfile",
  "void-core",
+ "void-editor",
+ "void-vim",
 ]
 
 [[package]]
