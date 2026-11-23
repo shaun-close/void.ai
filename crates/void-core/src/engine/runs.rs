@@ -40,6 +40,8 @@ struct ActiveRun {
     cancel: CancellationToken,
     abort: AbortHandle,
     started: Instant,
+    /// Its output gate (also in its sink), flushed when the UI catches up.
+    gate: Arc<Gate>,
 }
 
 impl RunsState {
@@ -281,7 +283,8 @@ impl State {
         });
         let tx = self.tx.clone();
         // A fast printer can't flood the queue (or the UI): see `run_budget`.
-        let gate = Gate::new(self.runs.budget.clone());
+        let gate = Arc::new(Gate::new(self.runs.budget.clone()));
+        let run_gate = gate.clone();
         let sink: Sink = Arc::new(move |update| {
             gate.pass(update, |update| {
                 let _ = tx.send(Msg::Run { run, update });
@@ -301,6 +304,7 @@ impl State {
                 cancel,
                 abort: task.abort_handle(),
                 started: Instant::now(),
+                gate: run_gate,
             },
         );
     }
@@ -344,6 +348,17 @@ impl State {
                     duration_ms: a.started.elapsed().as_millis() as u64,
                 });
             }
+        }
+    }
+
+    /// The UI read run output while some run holds output back: flush what fits now.
+    pub(super) fn flush_held_output(&mut self) {
+        self.runs.budget.woken();
+        for (&run, a) in &self.runs.active {
+            let tx = self.tx.clone();
+            a.gate.flush(|update| {
+                let _ = tx.send(Msg::Run { run, update });
+            });
         }
     }
 
@@ -677,6 +692,110 @@ mod tests {
         let (ok, failed, _, stopped, error) = finished(&ev);
         assert!(!ok && stopped && error.is_none());
         assert_eq!(failed, Some(0));
+    }
+
+    /// Read events as the UI would (without keeping them) until `run`'s output contains
+    /// `needle`; the output seen, or None if `limit` passed first.
+    fn drain_until_output(r: &Rig, run: RunId, needle: &str, limit: Duration) -> Option<String> {
+        let deadline = Instant::now() + limit;
+        let mut tail = String::new();
+        while Instant::now() < deadline {
+            let Some(e) = r.handle.try_recv() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            if let Event::RunOutput { run: x, text } = e
+                && x == run
+            {
+                tail.push_str(&text);
+                if tail.contains(needle) {
+                    return Some(tail);
+                }
+                // Only the newest output matters here.
+                if tail.len() > 1024 * 1024 {
+                    tail.drain(..tail.len() - 256 * 1024);
+                }
+            }
+        }
+        None
+    }
+
+    /// A run floods past the backlog while nobody reads, prints its last line and goes quiet:
+    /// once the UI catches up, that held line arrives without the run printing again.
+    #[test]
+    fn held_output_flushes_once_the_ui_catches_up() {
+        let mut r = rig();
+        let done = r.root.join("done");
+        let cmd = format!(
+            "yes 'a line of flood output' | head -c 20000000; echo THE-LAST-LINE; touch {}; sleep 300",
+            done.display()
+        );
+        let cfg = RunConfig::new("burst", vec![shell(&cmd)]);
+        r.save(vec![cfg.clone()]);
+        r.handle.send(Command::RunConfig {
+            config_id: cfg.id.clone(),
+        });
+        let (run, _, _) = r.started();
+        // Nobody reads while it floods and goes quiet.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "the burst never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let got = drain_until_output(&r, run, "THE-LAST-LINE", Duration::from_secs(20));
+        let got = got.expect("the held last line never arrived");
+        assert!(got.contains("skipped"), "the gap is noted");
+        r.handle.send(Command::StopRun(run));
+        r.finish(run);
+    }
+
+    /// One run keeps the shared backlog full; another's single line, held behind it, still
+    /// arrives while the UI reads.
+    #[test]
+    fn held_output_of_a_quiet_run_beside_a_flooding_one() {
+        let mut r = rig();
+        let flood = RunConfig::new("flood", vec![shell("echo ready; yes 'flood output'")]);
+        let done = r.root.join("quiet-done");
+        let quiet = RunConfig::new(
+            "quiet",
+            vec![shell(&format!(
+                "sleep 0.5; echo QUIET-LINE; touch {}; sleep 300",
+                done.display()
+            ))],
+        );
+        r.save(vec![flood.clone(), quiet.clone()]);
+        r.handle.send(Command::RunConfig {
+            config_id: flood.id.clone(),
+        });
+        let (a, _, _) = r.started();
+        r.output_until(a, "ready");
+        // Nobody reads: the flood fills the backlog before the quiet run prints.
+        r.handle.send(Command::RunConfig {
+            config_id: quiet.id.clone(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "the quiet run never printed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // The quiet run's id is the next one.
+        let b = RunId(a.0 + 1);
+        let got = drain_until_output(&r, b, "QUIET-LINE", Duration::from_secs(20));
+        assert!(got.is_some(), "the quiet run's line never arrived");
+        r.handle.send(Command::StopRun(a));
+        r.handle.send(Command::StopRun(b));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut left = 2;
+        while left > 0 {
+            assert!(Instant::now() < deadline, "the runs didn't stop");
+            match r.handle.try_recv() {
+                Some(Event::RunFinished { .. }) => left -= 1,
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
     }
 
     /// A step printing as fast as it can while nobody reads: what waits for the UI stays

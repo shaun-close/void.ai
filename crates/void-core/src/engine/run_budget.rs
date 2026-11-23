@@ -2,10 +2,12 @@
 //! be read by the UI (in the engine's queue or the event channel) is counted; past
 //! [`QUEUED_MAX`] a run's output is held instead, only its last [`HELD_MAX`] bytes kept, and
 //! sent (after a note saying how much was skipped) once there's room again, or before the
-//! run's next step or its end so nothing is reordered.
+//! run's next step or its end so nothing is reordered. "Room again" doesn't wait for the run
+//! to print more: while any run holds output, the UI reading some wakes the engine, which
+//! flushes every held run (see [`OutputBudget::set_waker`]).
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::runner::run::RunUpdate;
 
@@ -14,13 +16,31 @@ pub const QUEUED_MAX: usize = 4 * 1024 * 1024;
 /// How much of a held-back run's newest output is kept.
 pub const HELD_MAX: usize = 64 * 1024;
 
+type Waker = Box<dyn Fn() + Send + Sync>;
+
 /// Bytes of run output sent towards the UI and not yet received by it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct OutputBudget {
     queued: AtomicUsize,
+    /// Gates holding output back.
+    holding: AtomicUsize,
+    /// A wake was sent and the engine hasn't handled it yet.
+    wake_pending: AtomicBool,
+    waker: OnceLock<Waker>,
 }
 
 impl OutputBudget {
+    /// What to call (once per wake, without blocking) when output reached the UI while some
+    /// run holds output back: the engine then calls [`Gate::flush`] on every run's gate.
+    pub fn set_waker(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.waker.set(Box::new(f));
+    }
+
+    /// The engine is handling the wake: the next release may wake it again.
+    pub(super) fn woken(&self) {
+        self.wake_pending.store(false, Ordering::Release);
+    }
+
     /// Count `n` more bytes if they fit.
     fn try_take(&self, n: usize) -> bool {
         self.queued
@@ -41,10 +61,27 @@ impl OutputBudget {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |q| {
                 Some(q.saturating_sub(n))
             });
+        if self.holding.load(Ordering::Acquire) > 0
+            && !self.wake_pending.swap(true, Ordering::AcqRel)
+        {
+            match self.waker.get() {
+                Some(wake) => wake(),
+                None => self.wake_pending.store(false, Ordering::Release),
+            }
+        }
     }
 
     pub fn queued(&self) -> usize {
         self.queued.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for OutputBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputBudget")
+            .field("queued", &self.queued())
+            .field("holding", &self.holding.load(Ordering::Acquire))
+            .finish()
     }
 }
 
@@ -102,34 +139,58 @@ fn fmt_bytes(n: usize) -> String {
     }
 }
 
-/// One run's gate in front of the engine's queue (its updates arrive one at a time).
+/// One run's gate in front of the engine's queue. Every send happens under its lock, so a
+/// run's updates reach the queue in order whoever (the run, or the engine on a wake) sends.
 pub(super) struct Gate {
     budget: std::sync::Arc<OutputBudget>,
-    held: Mutex<Held>,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    held: Held,
+    /// Counted in the budget's `holding`.
+    counted: bool,
 }
 
 impl Gate {
     pub(super) fn new(budget: std::sync::Arc<OutputBudget>) -> Self {
         Self {
             budget,
-            held: Mutex::new(Held::default()),
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// Keep the budget's count of holding gates in step with `inner`.
+    fn sync(&self, inner: &mut Inner) {
+        let holding = !inner.held.is_empty();
+        if holding != inner.counted {
+            if holding {
+                self.budget.holding.fetch_add(1, Ordering::AcqRel);
+            } else {
+                self.budget.holding.fetch_sub(1, Ordering::AcqRel);
+            }
+            inner.counted = holding;
         }
     }
 
     /// Pass `update` on through `send`, holding output back while the UI is behind.
     pub(super) fn pass(&self, update: RunUpdate, mut send: impl FnMut(RunUpdate)) {
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match update {
             RunUpdate::Output(text) => {
-                if held.is_empty() && self.budget.try_take(text.len()) {
+                if inner.held.is_empty() && self.budget.try_take(text.len()) {
                     send(RunUpdate::Output(text));
                     return;
                 }
-                held.push(&text);
+                inner.held.push(&text);
+                // Counted before the retry: a release from now on wakes the engine.
+                self.sync(&mut inner);
                 // Room again? (The note is at most ~100 bytes; the estimate is corrected.)
-                let estimate = held.text.len() + 128;
+                let estimate = inner.held.text.len() + 128;
                 if self.budget.try_take(estimate) {
-                    let out = held.take();
+                    let out = inner.held.take();
+                    self.sync(&mut inner);
                     self.budget.release(estimate - out.len().min(estimate));
                     if out.len() > estimate {
                         self.budget.force_take(out.len() - estimate);
@@ -139,13 +200,36 @@ impl Gate {
             }
             other => {
                 // A step header or the end comes after everything printed before it.
-                if !held.is_empty() {
-                    let out = held.take();
+                if !inner.held.is_empty() {
+                    let out = inner.held.take();
+                    self.sync(&mut inner);
                     self.budget.force_take(out.len());
                     send(RunUpdate::Output(out));
                 }
                 send(other);
             }
+        }
+    }
+
+    /// The UI read some output: send what's held if the backlog is under the limit (it may
+    /// then pass it by one held tail per run, never more).
+    pub(super) fn flush(&self, mut send: impl FnMut(RunUpdate)) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.held.is_empty() || self.budget.queued() >= QUEUED_MAX {
+            return;
+        }
+        let out = inner.held.take();
+        self.sync(&mut inner);
+        self.budget.force_take(out.len());
+        send(RunUpdate::Output(out));
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        if inner.counted {
+            self.budget.holding.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -199,6 +283,46 @@ mod tests {
         assert!(tail.len() <= HELD_MAX + 200);
         assert!(matches!(sent[n + 1], RunUpdate::Finished { .. }));
         assert!(budget.queued() <= QUEUED_MAX + HELD_MAX + 200);
+    }
+
+    /// Held output doesn't wait for the run to print again: the UI reading wakes the engine
+    /// (once until it's handled), whose flush sends it; a dropped gate stops counting.
+    #[test]
+    fn reading_wakes_held_gates() {
+        let budget = Arc::new(OutputBudget::default());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let w = wakes.clone();
+        budget.set_waker(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        });
+        let gate = Gate::new(budget.clone());
+        let mut sent = Vec::new();
+        budget.force_take(QUEUED_MAX);
+        gate.pass(RunUpdate::Output("last line\n".into()), |u| sent.push(u));
+        assert!(sent.is_empty());
+        // Still full: a flush sends nothing.
+        gate.flush(|u| sent.push(u));
+        assert!(sent.is_empty());
+        budget.release(1024);
+        budget.release(1024);
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "one wake until it's handled"
+        );
+        budget.woken();
+        gate.flush(|u| sent.push(u));
+        assert_eq!(outputs(&sent), ["last line\n"]);
+        // Nothing held: reading doesn't wake.
+        budget.release(1024);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        // A gate dropped while holding stops counting.
+        let g2 = Gate::new(budget.clone());
+        budget.force_take(QUEUED_MAX);
+        g2.pass(RunUpdate::Output("x\n".into()), |_| {});
+        assert_eq!(budget.holding.load(Ordering::SeqCst), 1);
+        drop(g2);
+        assert_eq!(budget.holding.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -383,6 +383,12 @@ impl Engine {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = std_mpsc::channel();
         let output_budget = Arc::new(run_budget::OutputBudget::default());
+        {
+            let tx = tx.clone();
+            output_budget.set_waker(move || {
+                let _ = tx.send(Msg::FlushHeldOutput);
+            });
+        }
         let home = options.home.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -509,6 +515,8 @@ enum Msg {
         run: RunId,
         update: RunUpdate,
     },
+    /// The UI read run output while a run holds some back (see `run_budget`).
+    FlushHeldOutput,
     /// moon task discovery finished.
     Tasks {
         generation: u64,
@@ -658,6 +666,7 @@ impl State {
                 }
                 Msg::ClaudePermission(m) => self.claude_permission(m),
                 Msg::Run { run, update } => self.run_update(run, update),
+                Msg::FlushHeldOutput => self.flush_held_output(),
                 Msg::Tasks { generation, result } => self.tasks_found(generation, result),
                 Msg::Claude {
                     conversation,
