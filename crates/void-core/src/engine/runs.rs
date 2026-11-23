@@ -125,6 +125,8 @@ impl State {
     fn save_runs(&mut self, runs: Runs) {
         if let Some(e) = &self.runs.runs_unreadable {
             self.emit(Event::Error(format!("Not saving run configs: {e}")));
+            // What's kept, for a UI that showed the change already.
+            self.emit_runs_loaded(None);
             return;
         }
         let (path, _) = self.store.runner_paths(&self.workspace.id);
@@ -143,6 +145,7 @@ impl State {
             self.emit(Event::Error(format!(
                 "Not saving environment profiles: {e}"
             )));
+            self.emit_runs_loaded(None);
             return;
         }
         let (_, path) = self.store.runner_paths(&self.workspace.id);
@@ -955,6 +958,42 @@ mod tests {
         assert!(runs_path.is_dir());
         // env.toml is fine, so it still saves.
         r.set_envs(Envs::default());
+    }
+
+    /// A refused save is answered with what's really kept, so a UI that showed the change
+    /// early goes back to it.
+    #[test]
+    fn refused_save_reports_the_state_kept() {
+        let mut r = rig();
+        let id = r.store.workspace_for(&r.root).unwrap().id;
+        let (runs_path, env_path) = r.store.runner_paths(&id);
+        std::fs::create_dir_all(&runs_path).unwrap();
+        std::fs::create_dir_all(&env_path).unwrap();
+        r.handle.send(Command::OpenWorkspace(None));
+        r.until(|e| matches!(e, Event::RunsLoaded { .. }));
+        r.handle.send(Command::OpenWorkspace(Some(r.root.clone())));
+        r.until(|e| matches!(e, Event::RunsLoaded { .. }));
+        let runs = Runs {
+            groups: vec![Group {
+                name: "g".into(),
+                configs: vec![RunConfig::new("x", vec![shell("true")])],
+            }],
+        };
+        r.handle.send(Command::SaveRuns(runs));
+        r.until(|e| matches!(e, Event::Error(m) if m.contains("Not saving run configs")));
+        match r.next_within(Duration::from_secs(5)) {
+            Event::RunsLoaded { runs, .. } => assert!(runs.groups.is_empty()),
+            e => panic!("expected RunsLoaded, got {e:?}"),
+        }
+        r.handle.send(Command::SaveEnvs(envs(
+            &[("dev", &[("V", EnvValue::Value("1".into()))])],
+            Some("dev"),
+        )));
+        r.until(|e| matches!(e, Event::Error(m) if m.contains("Not saving environment")));
+        match r.next_within(Duration::from_secs(5)) {
+            Event::RunsLoaded { envs, .. } => assert_eq!(envs, Envs::default()),
+            e => panic!("expected RunsLoaded, got {e:?}"),
+        }
     }
 
     #[test]

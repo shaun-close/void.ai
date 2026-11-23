@@ -338,3 +338,40 @@ fn output_rerun_disabled_when_its_config_is_gone() {
     );
     assert!(rerun_enabled(&h));
 }
+
+/// The first run's output opens in a new strip split off the editor's leaf; the editor
+/// keeps the focus it had.
+#[test]
+fn output_split_keeps_editor_focus() {
+    let (t, ws) = workspace();
+    let file = ws.join("a.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let mut h = harness(t.path(), &ws);
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    steps(&mut h, 3);
+    let focused_editor = |h: &mut Harness<'_, VoidApp>| {
+        matches!(
+            h.state_mut().dock.find_active_focused(),
+            Some((_, Tab::Editor { path, .. })) if *path == file
+        )
+    };
+    assert!(focused_editor(&mut h), "editor focused to begin with");
+    script_run(
+        &mut h,
+        RunId(970),
+        "app:build",
+        RunOrigin::Task {
+            target: "app:build".into(),
+            args: vec![],
+        },
+    );
+    assert!(
+        h.state()
+            .dock
+            .find_tab(&Tab::RunOutput { run: RunId(970) })
+            .is_some(),
+        "output tab opened"
+    );
+    assert!(focused_editor(&mut h), "editor still focused");
+}

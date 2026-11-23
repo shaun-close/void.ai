@@ -240,7 +240,7 @@ impl VoidApp {
             let _ = self.dock.set_active_tab(path);
             return;
         }
-        let focused = self.dock.focused_leaf();
+        let mut focused = self.dock.focused_leaf();
         let origin = self.state.run_views.get(&run).map(|v| v.origin.clone());
         let views = &self.state.run_views;
         let stale = reuse
@@ -268,12 +268,20 @@ impl VoidApp {
             .find_tab_from(|t| matches!(t, Tab::Editor { .. }))
             .or_else(|| self.dock.find_tab_from(|t| matches!(t, Tab::Chat { .. })))
         {
-            self.dock.split(
-                main.node_path(),
+            let at = main.node_path();
+            let [kept, _] = self.dock.split(
+                at,
                 egui_dock::Split::Below,
                 0.68,
                 egui_dock::Node::leaf_with(vec![Tab::RunOutput { run }]),
             );
+            // Splitting a leaf moves its tabs to a new index (the old one is now the parent).
+            if focused == Some(at) {
+                focused = Some(egui_dock::NodePath {
+                    surface: at.surface,
+                    node: kept,
+                });
+            }
         } else {
             self.dock.push_to_focused_leaf(Tab::RunOutput { run });
         }

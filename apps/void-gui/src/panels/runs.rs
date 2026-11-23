@@ -164,6 +164,18 @@ impl EnvsDraft {
         Self { profiles }
     }
 
+    /// The same names and values (whatever the profiles were called when saved).
+    fn same(&self, other: &EnvsDraft) -> bool {
+        let plain = |d: &EnvsDraft| {
+            let mut d = d.clone();
+            for p in &mut d.profiles {
+                p.was = None;
+            }
+            d
+        };
+        plain(self) == plain(other)
+    }
+
     /// The profiles to save (with `active` following a rename, or cleared when its profile
     /// went), and each of the `saved` profiles' new name when it changed (None: deleted). Errors never quote values.
     #[allow(clippy::type_complexity)]
@@ -326,6 +338,11 @@ pub fn show(ui: &mut Ui, p: &mut Panels) {
 
 fn section(text: &str) -> RichText {
     RichText::new(text).family(egui::FontFamily::Name(theme::BOLD.into()))
+}
+
+/// The ui's small text size (not the process-wide one: tests run several apps at once).
+fn small(ui: &Ui) -> f32 {
+    egui::TextStyle::Small.resolve(ui.style()).size
 }
 
 fn faint(ui: &mut Ui, pal: &Palette, text: &str) {
@@ -759,7 +776,7 @@ fn editor(ui: &mut Ui, pal: &Palette, state: &UiState, runs_ui: &mut RunsUi, tod
             egui::Label::new(theme::itext_styled(
                 icon::WARNING,
                 LEFTOVER_HINT,
-                theme::small_size(),
+                small(ui),
                 pal.text_faint,
             ))
             .wrap(),
@@ -907,10 +924,10 @@ fn environments(
         ui.add_space(4.0);
         // A draft of the profiles: rebuilt from what's saved unless it holds unsaved edits.
         let saved = &state.envs.profiles;
-        let stale = runs_ui
-            .envs
-            .as_ref()
-            .is_some_and(|(base, draft)| base != saved && *draft == EnvsDraft::new(base));
+        let stale = runs_ui.envs.as_ref().is_some_and(|(base, draft)| {
+            base != saved
+                && (draft.same(&EnvsDraft::new(base)) || draft.same(&EnvsDraft::new(saved)))
+        });
         if runs_ui.envs.is_none() || stale {
             runs_ui.envs = Some((saved.clone(), EnvsDraft::new(saved)));
             runs_ui.revealed.clear();
@@ -929,7 +946,7 @@ fn environments(
             draft.profiles.remove(pi);
             runs_ui.revealed.clear();
         }
-        let dirty = *draft != EnvsDraft::new(saved);
+        let dirty = !draft.same(&EnvsDraft::new(saved));
         ui.horizontal_wrapped(|ui| {
             if ui.button(theme::itext(icon::PLUS, "Profile")).clicked() {
                 draft.profiles.push(ProfileDraft {
@@ -962,12 +979,7 @@ fn environments(
             }
         });
         if let Some(e) = &runs_ui.envs_error {
-            ui.label(theme::itext_styled(
-                icon::WARNING,
-                e,
-                theme::small_size(),
-                pal.err,
-            ));
+            ui.label(theme::itext_styled(icon::WARNING, e, small(ui), pal.err));
         }
         faint(
             ui,
@@ -1080,9 +1092,9 @@ fn profile_card(
     delete
 }
 
-/// Persist `runs` (shown at once; the engine's `RunsLoaded` confirms it).
+/// Persist `runs`. The panel shows it once the engine's `RunsLoaded` says it's kept (a
+/// refused save answers with what is).
 fn save_runs(p: &mut Panels, runs: Runs) {
-    p.state.runs = runs.clone();
     p.engine.send(Command::SaveRuns(runs));
 }
 
@@ -1250,9 +1262,9 @@ fn apply(p: &mut Panels, d: Do) {
                     if runs != p.state.runs {
                         save_runs(p, runs);
                     }
-                    p.state.envs = envs.clone();
+                    // The draft stays until `RunsLoaded` shows it saved (or, refused, keeps
+                    // the edits).
                     p.engine.send(Command::SaveEnvs(envs));
-                    p.runs.envs = None;
                 }
                 Err(e) => p.runs.envs_error = Some(e),
             }
@@ -1385,5 +1397,18 @@ mod unit {
                 .unwrap_err()
                 .contains("twice")
         );
+    }
+
+    #[test]
+    fn small_text_follows_the_ui_style() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| {
+            s.text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(21.5));
+        });
+        let mut size = 0.0;
+        let mut out = ctx.run_ui(Default::default(), |ui| size = small(ui));
+        out.textures_delta.clear();
+        assert_eq!(size, 21.5);
     }
 }
