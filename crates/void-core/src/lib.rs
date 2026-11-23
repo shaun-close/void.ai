@@ -10,6 +10,7 @@ pub mod fsutil;
 pub mod model;
 pub mod overlay;
 pub mod permissions;
+pub mod runner;
 pub mod sandbox;
 pub mod store;
 #[cfg(test)]
