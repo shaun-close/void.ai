@@ -1124,6 +1124,113 @@ mod tests {
         assert!(!r.seen.iter().any(|e| matches!(e, Event::Error(_))));
     }
 
+    /// Processes whose command line contains `marker` or whose working directory is under
+    /// `dir` (zombies left out).
+    fn live_matching(marker: &str, dir: &Path) -> Vec<(i32, String)> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| *pid != std::process::id() as i32)
+            .filter_map(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
+                if state == "Z" {
+                    return None;
+                }
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+                (cmd.contains(marker) || cwd.is_some_and(|c| c.starts_with(dir)))
+                    .then_some((pid, cmd))
+            })
+            .collect()
+    }
+
+    /// Stopping a moon step leaves nothing behind: moon, the task's shell and the task's own
+    /// background child all go.
+    #[test]
+    #[ignore = "needs moon (proto) and git; runs a throwaway moon workspace"]
+    fn live_moon_stop_leaves_no_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir_all(root.join(".moon")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        // A unique sleep length marks the task's processes.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let marker = format!("300.{}{nanos:09}", std::process::id());
+        std::fs::write(
+            root.join(".moon/workspace.yml"),
+            "projects:\n  app: 'app'\nvcs:\n  defaultBranch: 'main'\ntelemetry: false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("app/moon.yml"),
+            format!(
+                "tasks:\n  hang:\n    command: \"sh -c 'echo started; sleep {marker} & sleep {marker}'\"\n    options:\n      cache: false\n      shell: false\n"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=void-test",
+                    "-c",
+                    "user.email=void-test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let mut r = start(Some(root.clone()));
+        r.handle.send(Command::RunTask {
+            target: "app:hang".into(),
+            args: vec![],
+        });
+        let (run, _, _) = r.started();
+        // Both sleeps running (moon can take a while to start).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let found = live_matching(&marker, &root);
+            if found.iter().filter(|(_, c)| c.starts_with("sleep")).count() == 2 {
+                eprintln!("running before Stop: {found:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the task never started: {found:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let t = Instant::now();
+        r.handle.send(Command::StopRun(run));
+        let ev = r.finish(run);
+        eprintln!("stopped in {:?}", t.elapsed());
+        assert!(finished(&ev).3, "stopped");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = live_matching(&marker, &root);
+            if left.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "survived Stop: {left:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("nothing left after {:?}", t.elapsed());
+    }
+
     #[test]
     #[ignore = "needs moon (proto) and runs cargo fmt on void.ai"]
     fn live_moon_run_format_check() {
