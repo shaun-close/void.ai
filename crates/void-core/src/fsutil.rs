@@ -14,15 +14,27 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// a symlink) and a rename, creating parent directories. Keeps an existing file's permissions;
 /// new files get 0644.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, None)
+}
+
+/// [`atomic_write`] for secrets: the file is always mode 0600, even when it replaces a looser one.
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, Some(0o600))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
     fs::create_dir_all(parent)?;
-    let perms = fs::metadata(path)
-        .map(|m| m.permissions())
-        .unwrap_or_else(|_| fs::Permissions::from_mode(0o644));
+    let perms = match mode {
+        Some(m) => fs::Permissions::from_mode(m),
+        None => fs::metadata(path)
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| fs::Permissions::from_mode(0o644)),
+    };
     let mut tmp = tempfile::Builder::new()
         .prefix(".void-")
         .suffix(".tmp")

@@ -63,7 +63,8 @@ fn resolve_moon() -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let home = directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())
-        .unwrap_or_default();
+        .filter(|h| h.is_absolute())
+        .ok_or_else(|| NOT_FOUND.to_string())?;
     if let Ok(p) = crate::claude_code::turn::resolve_command("moon", &home) {
         return Ok(p);
     }
@@ -79,15 +80,26 @@ fn resolve_moon() -> Result<std::path::PathBuf, String> {
 /// Run `moon query tasks` in `root` and parse the result.
 pub async fn discover(root: &Path) -> Result<Vec<MoonTask>, String> {
     let moon = resolve_moon()?;
-    let mut cmd = tokio::process::Command::new(moon);
-    cmd.args(["query", "tasks"])
+    let child = tokio::process::Command::new(moon)
+        .args(["query", "tasks"])
         .current_dir(root)
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| "moon query tasks timed out after 30 s".to_string())?
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("couldn't run moon: {e}"))?;
+    let pid = child.id();
+    let out = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+        Ok(r) => r.map_err(|e| format!("couldn't run moon: {e}"))?,
+        Err(_) => {
+            if let Some(pid) = pid {
+                super::kill_group(pid);
+            }
+            return Err("moon query tasks timed out after 30 s".to_string());
+        }
+    };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let err: String = err.trim().chars().take(STDERR_CAP).collect();

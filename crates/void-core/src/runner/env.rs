@@ -6,6 +6,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -53,15 +54,19 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const STDERR_CAP: usize = 200;
 
 impl Envs {
-    /// Load `path`; missing gives none, an unreadable file is set aside with a warning.
-    pub fn load(path: &Path) -> (Self, Option<String>) {
-        load_toml(path)
+    /// Load `path`; missing gives none, a corrupt file is set aside (0600) with a warning.
+    /// `Err` means the file exists but couldn't be read: callers must not `save` over it.
+    pub fn load(path: &Path) -> Result<(Self, Option<String>), String> {
+        load_toml(path, true)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        save_toml(self, path)
+        save_toml(self, path, true)
     }
 
+    /// **Blocking**: each `cmd` variable can take up to 10 s, so callers on an async runtime or
+    /// UI thread must run this on a blocking thread (`spawn_blocking`).
+    ///
     /// The profile's variables as `(name, value)` pairs, in name order. Errors name the
     /// profile and variable, never a value.
     pub fn resolve(&self, name: &str) -> Result<Vec<(String, String)>, String> {
@@ -90,22 +95,28 @@ impl Envs {
     }
 }
 
-/// Run `cmd` through bash (outside any sandbox). The error text is safe to show: stderr is
-/// capped and lines containing the command's own stdout (the would-be value) are redacted.
+/// Run `cmd` through bash (outside any sandbox) in its own process group, killed whole on
+/// timeout. The error text is safe to show: stderr is capped and any line containing the
+/// command's stdout (or a non-trivial line of it) is redacted.
 fn run_cmd(cmd: &str, timeout: Duration) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
     let mut child = Command::new("bash")
         .args(["--noprofile", "--norc", "-c", cmd])
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't start bash: {e}"))?;
-    fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    let pid = child.id();
+    fn drain(mut r: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut b = Vec::new();
             let _ = r.read_to_end(&mut b);
-            String::from_utf8_lossy(&b).into_owned()
-        })
+            let _ = tx.send(String::from_utf8_lossy(&b).into_owned());
+        });
+        rx
     }
     let out = drain(child.stdout.take().expect("piped"));
     let err = drain(child.stderr.take().expect("piped"));
@@ -113,37 +124,42 @@ fn run_cmd(cmd: &str, timeout: Duration) -> Result<String, String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+            Ok(None) if start.elapsed() >= timeout => break None,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("couldn't wait for the command: {e}")),
+            Err(e) => {
+                super::kill_group(pid);
+                return Err(format!("couldn't wait for the command: {e}"));
+            }
         }
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    // Whatever bash left behind (helpers, pipeline members) goes too, so nothing keeps the
+    // pipes open and the readers below finish; they're still only waited for briefly.
+    super::kill_group(pid);
+    let _ = child.wait();
     let Some(status) = status else {
         return Err(format!("command timed out after {} s", timeout.as_secs()));
     };
+    let grace = Duration::from_secs(1);
+    let stdout = out.recv_timeout(grace).unwrap_or_default();
+    let stderr = err.recv_timeout(grace).unwrap_or_default();
     let value = stdout.trim().to_string();
     if status.success() {
         return Ok(value);
     }
+    let secret_lines: Vec<&str> = value
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.chars().count() >= 4)
+        .collect();
     let shown: Vec<&str> = stderr
         .lines()
         .map(|l| {
-            if !value.is_empty() && l.contains(&value) {
-                "[redacted]"
-            } else {
-                l
-            }
+            let hit = (!value.is_empty() && l.contains(&value))
+                || secret_lines.iter().any(|s| l.contains(s));
+            if hit { "[redacted]" } else { l }
         })
         .collect();
     let shown: String = shown.join("\n").trim().chars().take(STDERR_CAP).collect();
-    // A cut could split a redacted marker's neighbour but never reveals the value: lines
-    // containing it were replaced before capping.
     let code = status
         .code()
         .map_or("killed by a signal".to_string(), |c| format!("exit {c}"));
@@ -208,7 +224,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("value = \"v\"") && text.contains("env = \"HOME\""));
         assert!(text.contains("cmd = \"pass show x\""));
-        assert_eq!(Envs::load(&path), (envs, None));
+        assert_eq!(Envs::load(&path).unwrap(), (envs, None));
         let dbg = format!("{:?}", EnvValue::Value("hunter2".into()));
         assert!(!dbg.contains("hunter2"));
     }
@@ -238,5 +254,92 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn env_files_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env.toml");
+        let envs = profile(&[("A", EnvValue::Value("secret".into()))]);
+        envs.save(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // An older, world-readable file is tightened on the next save.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        envs.save(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // A corrupt file keeps its secrets but is set aside private.
+        std::fs::write(&path, "[[[ secret = 1").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, warn) = Envs::load(&path).unwrap();
+        assert!(warn.is_some());
+        let bad = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().contains(".bad-"))
+            .unwrap();
+        assert_eq!(mode(&bad.path()), 0o600);
+    }
+
+    fn alive(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => !s
+                .rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z'),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn cmd_timeout_kills_descendants_and_returns_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let cmd = format!("sleep 30 & echo $! > {}; wait; echo x", pidfile.display());
+        let t = Instant::now();
+        let e = run_cmd(&cmd, Duration::from_millis(500)).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            t.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..50 {
+            if !alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("sleep {pid} survived the timeout");
+    }
+
+    #[test]
+    fn multi_line_value_is_redacted_line_by_line() {
+        let envs = profile(&[(
+            "PEM",
+            EnvValue::Cmd(
+                "printf 'AAAA-first-line\nBBBB-second-line\n'; \
+                 echo 'leak BBBB-second-line here' >&2; echo 'locked vault' >&2; exit 1"
+                    .into(),
+            ),
+        )]);
+        let e = envs.resolve("dev").unwrap_err();
+        assert!(
+            !e.contains("BBBB-second-line") && !e.contains("AAAA-first-line"),
+            "{e}"
+        );
+        assert!(e.contains("locked vault"), "{e}");
     }
 }
