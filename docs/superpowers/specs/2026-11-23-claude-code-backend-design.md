@@ -159,9 +159,14 @@ unknown tool names (name + pretty JSON arguments + result text), with small spec
   write hooks, skills or settings into `~/.claude` that later run outside the sandbox when `claude` is used in a
   terminal; those writes don't go through Review. This is the same exposure as running Claude Code in a terminal.
 - void.ai itself still never reads or writes these files (anti-goal); it only bind-mounts them for `claude`.
-- **Stop condition for the builder:** if Claude Code can't save `~/.claude.json` through a single-file bind mount
-  (e.g. it renames a temp file over it and the rename fails), stop and report — don't pick a fallback (writable
-  `$HOME`, a private `CLAUDE_CONFIG_DIR`, or copying the file back); each has a cost the user hasn't chosen.
+- **Throwaway home layer (the user's decision, 2026-11-23).** A single-file bind of `~/.claude.json` under a
+  read-only `$HOME` doesn't work: Claude Code 2.1.330 refuses to save ("not saved … read-only or protected by a
+  sandbox") because it creates lock/temp files next to the file. So for the `claude` process `$HOME` gets a
+  throwaway writable layer (bwrap `--overlay-src $HOME --tmp-overlay $HOME`, discarded when the process exits),
+  with the real `~/.claude/` and `~/.claude.json` bound read-write on top (written in place) and the hidden paths
+  applied on top of that. Verified with a dummy HOME: `claude mcp add -s user` saved successfully.
+- Accepted caveat: Claude Code's lock file for `~/.claude.json` lands in the throwaway layer, so it isn't shared
+  with a `claude` running in a terminal; simultaneous settings saves from both can overwrite each other.
 - `cwd` is the workspace path, so Claude Code's project key in `~/.claude/projects/` is the real workspace path
   and sessions survive across void restarts.
 - **Long-lived mounts** *(controller's call)*: the chat overlay stays mounted for the whole turn, so while a
