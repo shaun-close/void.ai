@@ -97,6 +97,19 @@ impl Core {
         (line, head - self.buffer.line_start(line))
     }
 
+    /// Edits from the user are allowed; on a read-only buffer, say why not (the text can never
+    /// be saved, so it isn't changed either).
+    pub fn writable(&mut self) -> bool {
+        if self.buffer.read_only {
+            self.message = Some(Msg::error(
+                "E21: Cannot make changes: this file is read-only",
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
     /// Replace `range` and keep the syntax tree's positions in step.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> Edit {
         let edit = self.buffer.replace(range, text);

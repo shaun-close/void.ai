@@ -119,6 +119,10 @@ pub struct EditorStore {
     /// The tab whose editor should take keyboard focus when it's next drawn.
     pub focus: Option<u32>,
     pub settings: EditorSettings,
+    /// The editor widget that had keyboard focus last frame (clipboard keys go to it).
+    pub focused_widget: Option<egui::Id>,
+    /// The app's quit dialog is up.
+    pub quitting: bool,
 }
 
 impl EditorStore {
@@ -134,12 +138,19 @@ impl EditorStore {
             confirm: None,
             focus: None,
             settings: EditorSettings::default(),
+            focused_widget: None,
+            quitting: false,
         }
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.docs.len()
+    }
+
+    /// A dialog (close or quit) is waiting for the user.
+    pub fn modal_open(&self) -> bool {
+        self.confirm.is_some() || self.quitting
     }
 
     pub fn doc(&self, key: &DocKey) -> Option<&Doc> {

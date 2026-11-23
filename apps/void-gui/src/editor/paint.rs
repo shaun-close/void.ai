@@ -251,6 +251,19 @@ pub fn search_matches(doc: &Doc, range: Range<usize>) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// The text of `lines` for screen readers (and tests), each cut like a drawn line.
+pub fn accessible_text(r: &ropey::Rope, lines: impl Iterator<Item = usize>) -> String {
+    let mut out = String::new();
+    for (i, l) in lines.enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = r.line(l);
+        out.extend(line.chars().take(MAX_DRAWN_CHARS).filter(|c| *c != '\n'));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

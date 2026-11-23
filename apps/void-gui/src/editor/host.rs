@@ -45,7 +45,9 @@ impl VimHost for Host<'_, '_> {
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str) {
-        self.core.replace(range, text);
+        if self.core.writable() {
+            self.core.replace(range, text);
+        }
     }
 
     fn begin_group(&mut self) {
@@ -71,6 +73,9 @@ impl VimHost for Host<'_, '_> {
     }
 
     fn newline(&mut self) {
+        if !self.core.writable() {
+            return;
+        }
         let head = self.core.head();
         let text = self.core.newline_text(head);
         self.core.replace(head..head, &text);
@@ -78,6 +83,9 @@ impl VimHost for Host<'_, '_> {
     }
 
     fn tab(&mut self) {
+        if !self.core.writable() {
+            return;
+        }
         let head = self.core.head();
         let unit = self.core.indent.clone();
         self.core.replace(head..head, &unit);

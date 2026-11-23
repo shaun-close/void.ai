@@ -20,6 +20,9 @@ fn main() -> eframe::Result {
             .with_title("void.ai")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
+        // eframe would turn Ctrl+V into nothing when the clipboard holds no text, so Vim never
+        // saw it; the app maps clipboard keys itself (`VoidApp::raw_input_hook`).
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(

@@ -241,6 +241,14 @@ impl VoidApp {
             theme::heading(ui, icon::FLOPPY, "Save changes before quitting?");
             ui.label(format!("Unsaved: {}", names.join(", ")));
             ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Enter saves all, Esc cancels")
+                    .small()
+                    .color(theme::palette_of(ui).text_faint),
+            );
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                choice = Some("save");
+            }
             ui.horizontal(|ui| {
                 if ui.button("Save all").clicked() {
                     choice = Some("save");
@@ -287,10 +295,16 @@ impl VoidApp {
             theme::heading(ui, icon::FLOPPY, &format!("Save changes to {name}?"));
             ui.label("Your changes will be lost if you don't save them.");
             ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Enter saves, Esc cancels")
+                    .small()
+                    .color(theme::palette_of(ui).text_faint),
+            );
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                choice = Some("save");
+            }
             ui.horizontal(|ui| {
-                if theme::primary_button(ui, icon::FLOPPY, "").clicked()
-                    || ui.button("Save").clicked()
-                {
+                if ui.button("Save").clicked() {
                     choice = Some("save");
                 }
                 if ui.button("Discard").clicked() {

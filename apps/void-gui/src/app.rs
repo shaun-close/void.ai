@@ -558,6 +558,8 @@ impl eframe::App for VoidApp {
         }
 
         self.editors.settings = self.state.config.editor.clone();
+        self.editors.quitting = self.quit_dialog;
+        self.editors.focused_widget = None;
         self.editors.poll(&ctx);
         self.global_save(&ctx);
 
@@ -576,6 +578,18 @@ impl eframe::App for VoidApp {
             .show(ui, |ui| self.dock_area(ui));
         self.close_dialog(&ctx);
         self.quit_dialog(&ctx);
+    }
+
+    /// Clipboard shortcuts: keys for a focused editor (Vim's Ctrl+V), clipboard events for
+    /// everything else (see `editor::input::route_clipboard_keys`).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let editor = self.editors.focused_widget.is_some()
+            && ctx.memory(|m| m.focused()) == self.editors.focused_widget;
+        crate::editor::input::route_clipboard_keys(
+            &mut raw_input.events,
+            editor,
+            &self.editors.clipboard,
+        );
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

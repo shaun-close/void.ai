@@ -9,7 +9,8 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::draw::relative_line_numbers;
-use super::input::vim_key;
+use super::input::{route_clipboard_keys, vim_key};
+use super::paint::accessible_text;
 use crate::app::VoidApp;
 use crate::layout::{EditorView, Tab};
 
@@ -291,6 +292,9 @@ fn key_name_from_egui_events() {
     assert_eq!(vim_key(&Event::Paste("x".into())).as_deref(), Some("<C-v>"));
     assert_eq!(vim_key(&Event::Copy).as_deref(), Some("<C-c>"));
     assert_eq!(vim_key(&Event::Cut).as_deref(), Some("<C-x>"));
+    // An image on the clipboard still means Ctrl+V.
+    let image = std::sync::Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::BLACK));
+    assert_eq!(vim_key(&Event::PasteImage(image)).as_deref(), Some("<C-v>"));
     assert_eq!(
         vim_key(&key(Key::A, Modifiers::SHIFT)).as_deref(),
         Some("A")
@@ -354,4 +358,153 @@ fn editor_quit_with_unsaved_asks() {
         h.query_by_label_contains("Save changes before quitting")
             .is_none()
     );
+}
+
+fn ctrl(key: Key) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::CTRL,
+    }
+}
+
+/// eframe's own clipboard shortcuts are off (they swallow Ctrl+V when the clipboard is empty):
+/// in a focused editor Ctrl+C/V/X stay keys for Vim; anywhere else they become clipboard events.
+#[test]
+fn clipboard_keys_route_to_editor_or_widgets() {
+    let clip = super::Clipboard::memory();
+    let mut events = vec![ctrl(Key::V), ctrl(Key::C), ctrl(Key::X)];
+    route_clipboard_keys(&mut events, true, &clip);
+    assert_eq!(events, vec![ctrl(Key::V), ctrl(Key::C), ctrl(Key::X)]);
+
+    clip.set("pasted\r\ntext");
+    let mut events = vec![
+        ctrl(Key::V),
+        ctrl(Key::C),
+        ctrl(Key::X),
+        Event::Text("a".into()),
+    ];
+    route_clipboard_keys(&mut events, false, &clip);
+    assert_eq!(
+        events,
+        vec![
+            Event::Paste("pasted\ntext".into()),
+            Event::Copy,
+            Event::Cut,
+            Event::Text("a".into())
+        ]
+    );
+    // An empty clipboard pastes nothing outside the editor.
+    let clip = super::Clipboard::memory();
+    let mut events = vec![ctrl(Key::V)];
+    route_clipboard_keys(&mut events, false, &clip);
+    assert!(events.is_empty());
+    // Ctrl+Shift+V is not a paste shortcut here.
+    let shifted = Event::Key {
+        key: Key::V,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+    };
+    let mut events = vec![shifted.clone()];
+    route_clipboard_keys(&mut events, false, &clip);
+    assert_eq!(events, vec![shifted]);
+}
+
+/// Through the app's input hook: raw Ctrl+V in a focused editor enters Visual-block mode even
+/// with nothing on the clipboard; in the chat input it pastes.
+#[test]
+fn ctrl_v_reaches_vim_and_still_pastes_in_chat() {
+    use eframe::App as _;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("v.txt");
+    std::fs::write(&file, "abc\ndef\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    let hook = |h: &mut Harness<'_, VoidApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = h.input_mut().clone();
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+        h.step();
+    };
+    h.input_mut().events.push(ctrl(Key::V));
+    hook(&mut h);
+    assert!(h.query_by_label("V-BLOCK").is_some());
+    h.key_press(Key::Escape);
+    h.step();
+
+    // Chat tab in front, its input focused, something on the clipboard.
+    let chat = h
+        .state()
+        .dock
+        .find_tab_from(|t| matches!(t, Tab::Chat { .. }))
+        .unwrap();
+    let _ = h.state_mut().dock.set_active_tab(chat);
+    h.state_mut()
+        .dock
+        .set_focused_node_and_surface(chat.node_path());
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.state().editors.clipboard.set("pasted");
+    h.input_mut().events.push(ctrl(Key::V));
+    hook(&mut h);
+    assert_eq!(
+        h.get_by_role(Role::MultilineTextInput).value().as_deref(),
+        Some("pasted")
+    );
+}
+
+/// While the Save / Discard / Cancel dialog is up, keys don't edit the buffer behind it; Enter
+/// picks Save and Esc Cancel.
+#[test]
+fn editor_ignores_keys_while_dialog_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("m.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut()
+        .open_editor(file.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    text(&mut h, "x");
+    let id = editor_tabs(h.state())[0];
+    let key = (file.clone(), EditorView::Disk);
+    close(&mut h, id);
+    assert!(h.query_by_label_contains("Save changes").is_some());
+    text(&mut h, "x");
+    text(&mut h, "dd");
+    assert_eq!(
+        h.state().editors.doc(&key).unwrap().text(),
+        "ne\ntwo",
+        "buffer unchanged behind the dialog"
+    );
+    h.key_press(Key::Escape);
+    h.step();
+    h.step();
+    assert!(h.query_by_label_contains("Save changes").is_none());
+    assert_eq!(editor_tabs(h.state()), vec![id]);
+    close(&mut h, id);
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert!(editor_tabs(h.state()).is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "ne\ntwo\n");
+}
+
+#[test]
+fn accessible_text_is_bounded() {
+    let line: String = "x".repeat(1_000_000);
+    let rope = ropey::Rope::from_str(&format!("{line}\nshort"));
+    let text = accessible_text(&rope, [0, 1].into_iter());
+    assert!(text.len() < 20_100, "{} bytes", text.len());
+    assert!(text.ends_with("\nshort"));
 }

@@ -10,7 +10,9 @@ use void_vim::Mode;
 
 use super::host::{Ctx, Host};
 pub use super::paint::relative_line_numbers;
-use super::paint::{Row, TEXT_PAD, layout_row, matching_bracket, search_matches, selected_cols};
+use super::paint::{
+    Row, TEXT_PAD, accessible_text, layout_row, matching_bracket, search_matches, selected_cols,
+};
 use super::state::Doc;
 use super::{DocKey, input, status};
 use crate::panels::Panels;
@@ -21,8 +23,11 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     let id = ui.scope_id().with("editor");
     let vim = p.editors.settings.vim;
     let relative = p.editors.settings.relative_numbers;
-    if p.editors.focus == Some(tab)
-        || (p.focused_editor == Some(tab) && ui.memory(|m| m.focused().is_none()))
+    // A dialog is up: keys belong to it, not to the text behind it.
+    let blocked = p.editors.modal_open() || ui.ctx().memory(|m| m.top_modal_layer()).is_some();
+    if !blocked
+        && (p.editors.focus == Some(tab)
+            || (p.focused_editor == Some(tab) && ui.memory(|m| m.focused().is_none())))
     {
         ui.memory_mut(|m| m.request_focus(id));
         if p.editors.focus == Some(tab) {
@@ -31,6 +36,7 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
     }
     let focused = ui.memory(|m| m.has_focus(id));
     if focused {
+        p.editors.focused_widget = Some(id);
         ui.memory_mut(|m| {
             m.set_focus_lock_filter(
                 id,
@@ -60,7 +66,7 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
 
     // Input first, so this frame draws its result.
     let mut follow = false;
-    if focused {
+    if focused && !blocked {
         let events = ui.input(|i| i.events.clone());
         doc.core.view.scrolled = false;
         let before = (doc.core.sel, doc.core.buffer.version());
@@ -331,13 +337,10 @@ pub fn editor(ui: &mut Ui, p: &mut Panels, tab: u32, key: &DocKey) {
             ui.input(|i| i.modifiers.shift),
         );
     }
-    let visible: String = drawn
-        .iter()
-        .map(|r| doc.core.buffer.rope().line(r.line).to_string())
-        .collect();
+    let rope = doc.core.buffer.rope();
     resp.widget_info(|| {
         let mut info = egui::WidgetInfo::labeled(Role::MultilineTextInput, true, "Text editor");
-        info.current_text_value = Some(visible.clone());
+        info.current_text_value = Some(accessible_text(rope, drawn.iter().map(|r| r.line)));
         info
     });
 

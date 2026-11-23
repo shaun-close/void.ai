@@ -11,7 +11,7 @@ use super::state::{Doc, Msg};
 /// releases and keys Vim has no name for.
 pub fn vim_key(ev: &Event) -> Option<String> {
     match ev {
-        Event::Paste(_) => Some("<C-v>".into()),
+        Event::Paste(_) | Event::PasteImage(_) => Some("<C-v>".into()),
         Event::Copy => Some("<C-c>".into()),
         Event::Cut => Some("<C-x>".into()),
         Event::Key {
@@ -47,6 +47,47 @@ fn produces_text(key: Key, m: Modifiers) -> bool {
 
 fn ctrl_shift(m: Modifiers, key: Key, want: Key) -> bool {
     m.ctrl && m.shift && key == want
+}
+
+/// eframe's own clipboard shortcuts are off (`NativeOptions::clipboard_shortcuts`): they turn
+/// Ctrl+V into nothing at all when the clipboard has no text, so Vim would never see it. This
+/// puts them back for everything but a focused editor: Ctrl+C / Ctrl+X / Ctrl+V (and the
+/// Copy / Cut / Paste keys) become clipboard events, so text fields keep working. In a focused
+/// editor (`editor`) they stay keys, for Vim or plain editing.
+pub fn route_clipboard_keys(events: &mut Vec<Event>, editor: bool, clip: &super::Clipboard) {
+    if editor {
+        return;
+    }
+    events.retain_mut(|ev| {
+        let Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = ev
+        else {
+            return true;
+        };
+        let cmd = (modifiers.ctrl || modifiers.command || modifiers.mac_cmd)
+            && !modifiers.alt
+            && !modifiers.shift;
+        *ev = match key {
+            Key::C if cmd => Event::Copy,
+            Key::Copy => Event::Copy,
+            Key::X if cmd => Event::Cut,
+            Key::Cut => Event::Cut,
+            Key::V if cmd => Event::Paste(String::new()),
+            Key::Paste => Event::Paste(String::new()),
+            _ => return true,
+        };
+        if let Event::Paste(text) = ev {
+            match clip.get().filter(|t| !t.is_empty()) {
+                Some(t) => *text = t.replace("\r\n", "\n"),
+                None => return false,
+            }
+        }
+        true
+    });
 }
 
 /// Feed one frame's events to the doc. Returns whether anything was handled.
@@ -129,7 +170,7 @@ fn vim_event(ev: &Event, doc: &mut Doc, cx: &mut Ctx) -> bool {
             }
         }
         Event::Copy if doc.core.prompt.is_some() => answer(doc, cx, None),
-        Event::Copy | Event::Cut | Event::Paste(_) => {
+        Event::Copy | Event::Cut | Event::Paste(_) | Event::PasteImage(_) => {
             if let Some(name) = vim_key(ev) {
                 run_key(doc, cx, &name);
             }
@@ -259,6 +300,9 @@ fn end_typing(doc: &mut Doc) {
 
 /// Replace the selection (or insert at the cursor). Typing runs merge into one undo step.
 fn plain_insert(doc: &mut Doc, text: &str, typing: bool) {
+    if !doc.core.writable() {
+        return;
+    }
     if !typing {
         end_typing(doc);
     }
@@ -420,6 +464,22 @@ fn plain_key(doc: &mut Doc, cx: &mut Ctx, key: Key, m: Modifiers) -> bool {
             end_typing(doc);
             doc.core.sel = (0, doc.core.len());
         }
+        Key::C if ctrl && !m.shift => {
+            if let Some(s) = selected_text(doc) {
+                cx.clipboard.set(&s);
+            }
+        }
+        Key::X if ctrl && !m.shift => {
+            if let Some(s) = selected_text(doc) {
+                cx.clipboard.set(&s);
+                plain_insert(doc, "", false);
+            }
+        }
+        Key::V if ctrl && !m.shift => {
+            if let Some(t) = cx.clipboard.get() {
+                plain_insert(doc, &t, false);
+            }
+        }
         Key::C if ctrl && m.shift => {
             if let Some(s) = selected_text(doc) {
                 cx.clipboard.set(&s);
@@ -437,6 +497,9 @@ fn plain_key(doc: &mut Doc, cx: &mut Ctx, key: Key, m: Modifiers) -> bool {
 
 /// Ctrl+Z / Ctrl+Y with Vim off. Marks follow every edit the history makes.
 fn plain_history(doc: &mut Doc, redo: bool) {
+    if !doc.core.writable() {
+        return;
+    }
     end_typing(doc);
     let done = if redo {
         doc.core.redo()
@@ -484,6 +547,72 @@ mod tests {
 
     fn doc(text: &str) -> Doc {
         Doc::new(Path::new("x.txt"), void_editor::Buffer::new(text))
+    }
+
+    #[test]
+    fn read_only_refuses_edits() {
+        let mut d = doc("abc\ndef");
+        d.core.buffer.read_only = true;
+        run(&mut d, true, &[Event::Text("x".into())]);
+        assert_eq!(d.text(), "abc\ndef");
+        let msg = d.core.message.clone().expect("a message");
+        assert!(msg.error && msg.text.contains("read-only"), "{msg:?}");
+        run(
+            &mut d,
+            true,
+            &[
+                Event::Text("ddihello".into()),
+                press(Key::Enter, Modifiers::NONE),
+            ],
+        );
+        assert_eq!(d.text(), "abc\ndef");
+        let mut d = doc("abc");
+        d.core.buffer.read_only = true;
+        run(
+            &mut d,
+            false,
+            &[
+                Event::Text("zz".into()),
+                press(Key::Backspace, Modifiers::NONE),
+            ],
+        );
+        assert_eq!(d.text(), "abc");
+        assert!(
+            d.core
+                .message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("read-only"))
+        );
+        assert!(!d.core.buffer.is_dirty());
+    }
+
+    #[test]
+    fn plain_ctrl_c_x_v_keys_use_the_clipboard() {
+        let mut d = doc("abc");
+        let clip = Clipboard::memory();
+        let mut actions = Vec::new();
+        let mut cx = Ctx {
+            path: Path::new("/nonexistent/x.txt"),
+            view: &EditorView::Disk,
+            tab: 1,
+            clipboard: &clip,
+            actions: &mut actions,
+        };
+        let ctrl = Modifiers::CTRL;
+        handle(
+            &[
+                press(Key::ArrowRight, Modifiers::SHIFT),
+                press(Key::C, ctrl),
+                press(Key::X, ctrl),
+                press(Key::End, Modifiers::NONE),
+                press(Key::V, ctrl),
+            ],
+            &mut d,
+            &mut cx,
+            false,
+        );
+        assert_eq!(clip.get().as_deref(), Some("a"));
+        assert_eq!(d.text(), "bca");
     }
 
     #[test]
