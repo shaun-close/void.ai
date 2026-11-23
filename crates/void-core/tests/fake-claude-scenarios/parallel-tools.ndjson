@@ -1,0 +1,4 @@
+# Two tool results delivered in a single user frame.
+{"type":"system","subtype":"init","session_id":"sess-4","model":"claude-fake"}
+{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"p1","content":"one"},{"type":"tool_result","tool_use_id":"p2","content":"two"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"sess-4","result":"ok","usage":{"input_tokens":1,"output_tokens":1}}

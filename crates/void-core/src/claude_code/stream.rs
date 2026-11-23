@@ -11,12 +11,24 @@ pub enum CcEvent {
         session: String,
         model: String,
     },
-    TextDelta(String),
-    ThinkingDelta(String),
+    /// `parent` is the subagent tool_use id (None = main thread).
+    TextDelta {
+        text: String,
+        parent: Option<String>,
+    },
+    ThinkingDelta {
+        text: String,
+        parent: Option<String>,
+    },
     /// A complete assistant message; `parent` is the subagent tool_use id (None = main thread).
+    /// `error` is the raw API error code (`authentication_failed`, `rate_limit`, ...).
+    /// `usage` is this single API call's usage (prompt = input + cache read + cache creation):
+    /// use it for the context meter. `Result.usage` is cumulative across the whole turn.
     Assistant {
         parts: Vec<Part>,
         parent: Option<String>,
+        error: Option<String>,
+        usage: Option<Usage>,
     },
     ToolResult {
         call_id: String,
@@ -59,16 +71,7 @@ pub enum CcEvent {
     Other,
 }
 
-/// Parse one stdout line into its first event (`Other` if none). Never panics.
-/// Use [`parse_events`] when a single line can carry several events.
-pub fn parse_line(line: &str) -> CcEvent {
-    parse_events(line)
-        .into_iter()
-        .next()
-        .unwrap_or(CcEvent::Other)
-}
-
-/// Parse one stdout line into every event it carries. A `user` frame with parallel tool
+/// Parse one stdout line into every event it carries (the only public parser). A `user` frame with parallel tool
 /// results yields one `ToolResult` per block. Empty for unrecognised lines.
 pub fn parse_events(line: &str) -> Vec<CcEvent> {
     let line = line.trim();
@@ -128,9 +131,10 @@ fn delta_event(v: &Value) -> Option<CcEvent> {
         return None;
     }
     let d = ev.get("delta")?;
+    let parent = parent_of(v);
     match d.get("type")?.as_str()? {
-        "text_delta" => s(d, "text").map(CcEvent::TextDelta),
-        "thinking_delta" => s(d, "thinking").map(CcEvent::ThinkingDelta),
+        "text_delta" => s(d, "text").map(|text| CcEvent::TextDelta { text, parent }),
+        "thinking_delta" => s(d, "thinking").map(|text| CcEvent::ThinkingDelta { text, parent }),
         _ => None,
     }
 }
@@ -166,6 +170,8 @@ fn assistant_event(v: &Value) -> Option<CcEvent> {
     Some(CcEvent::Assistant {
         parts,
         parent: parent_of(v),
+        error: s(v, "error").or_else(|| s(v.get("message")?, "error")),
+        usage: v.get("message")?.get("usage").map(usage_of),
     })
 }
 
@@ -196,7 +202,10 @@ fn tool_results(v: &Value) -> Vec<CcEvent> {
                     .join("\n"),
                 _ => String::new(),
             };
-            let (content, _) = cap_output(text.as_bytes());
+            let (mut content, cut) = cap_output(text.as_bytes());
+            if cut > 0 {
+                content.insert_str(0, &format!("[… {cut} bytes omitted]\n"));
+            }
             Some(CcEvent::ToolResult {
                 call_id,
                 content,
@@ -207,18 +216,20 @@ fn tool_results(v: &Value) -> Vec<CcEvent> {
         .collect()
 }
 
+/// prompt = input + cache read + cache creation; missing fields count as 0.
+fn usage_of(u: &Value) -> Usage {
+    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    Usage {
+        prompt_tokens: (n("input_tokens")
+            + n("cache_read_input_tokens")
+            + n("cache_creation_input_tokens"))
+        .min(u32::MAX as u64) as u32,
+        completion_tokens: n("output_tokens").min(u32::MAX as u64) as u32,
+    }
+}
+
 fn result_event(v: &Value) -> CcEvent {
-    let n = |u: &Value, k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let usage = match v.get("usage") {
-        Some(u) => Usage {
-            prompt_tokens: (n(u, "input_tokens")
-                + n(u, "cache_read_input_tokens")
-                + n(u, "cache_creation_input_tokens"))
-            .min(u32::MAX as u64) as u32,
-            completion_tokens: n(u, "output_tokens").min(u32::MAX as u64) as u32,
-        },
-        None => Usage::default(),
-    };
+    let usage = v.get("usage").map(usage_of).unwrap_or_default();
     let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     let errors = v.get("errors").and_then(Value::as_array).map(|a| {
         a.iter()
@@ -227,7 +238,11 @@ fn result_event(v: &Value) -> CcEvent {
             .join("\n")
     });
     let message = if is_error {
-        errors.filter(|e| !e.is_empty()).or_else(|| s(v, "result"))
+        errors
+            .filter(|e| !e.is_empty())
+            .or_else(|| s(v, "result").filter(|r| !r.is_empty()))
+            .or_else(|| s(v, "subtype").filter(|r| !r.is_empty()))
+            .or_else(|| Some("error".to_string()))
     } else {
         None
     };
@@ -242,12 +257,16 @@ fn result_event(v: &Value) -> CcEvent {
 
 fn control_request(v: &Value) -> Option<CcEvent> {
     let request_id = s(v, "request_id")?;
-    let req = v.get("request")?;
-    let subtype = s(req, "subtype").unwrap_or_default();
-    if subtype == "can_use_tool" {
+    let req = v.get("request");
+    let subtype = req.and_then(|r| s(r, "subtype")).unwrap_or_default();
+    // Anything not fully parseable still gets an event so the caller can answer it;
+    // otherwise the CLI blocks waiting for a reply.
+    if let (Some(req), "can_use_tool") = (req, subtype.as_str())
+        && let Some(tool) = s(req, "tool_name")
+    {
         return Some(CcEvent::PermissionRequest {
             request_id,
-            tool: s(req, "tool_name")?,
+            tool,
             input: req.get("input").cloned().unwrap_or(Value::Null),
             suggestions: req
                 .get("permission_suggestions")
@@ -270,15 +289,21 @@ fn control_response(v: &Value) -> Option<CcEvent> {
     })
 }
 
+/// Serialise to one stdin line. U+2028/U+2029 are escaped so no line splitter can break it.
+fn line(v: Value) -> String {
+    v.to_string()
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 /// One stdin line carrying a user message.
 pub fn user_message(text: &str) -> String {
-    json!({
+    line(json!({
         "type": "user",
         "session_id": "",
         "message": {"role": "user", "content": text},
         "parent_tool_use_id": null,
-    })
-    .to_string()
+    }))
 }
 
 fn control_request_line(request_id: &str, subtype: &str) -> String {
@@ -286,7 +311,7 @@ fn control_request_line(request_id: &str, subtype: &str) -> String {
     if subtype == "initialize" {
         request["hooks"] = Value::Null;
     }
-    json!({"type": "control_request", "request_id": request_id, "request": request}).to_string()
+    line(json!({"type": "control_request", "request_id": request_id, "request": request}))
 }
 
 pub fn initialize_request(request_id: &str) -> String {
@@ -298,9 +323,8 @@ pub fn interrupt_request(request_id: &str) -> String {
 }
 
 fn success(request_id: &str, response: Value) -> String {
-    json!({"type": "control_response", "response": {
-        "subtype": "success", "request_id": request_id, "response": response}})
-    .to_string()
+    line(json!({"type": "control_response", "response": {
+        "subtype": "success", "request_id": request_id, "response": response}}))
 }
 
 /// Allow a tool call. `input` is echoed as `updatedInput`; `updated_permissions` is the
@@ -326,15 +350,19 @@ pub fn control_response_deny(request_id: &str, message: &str, interrupt: bool) -
 }
 
 pub fn control_response_error(request_id: &str, msg: &str) -> String {
-    json!({"type": "control_response", "response": {
-        "subtype": "error", "request_id": request_id, "error": msg}})
-    .to_string()
+    line(json!({"type": "control_response", "response": {
+        "subtype": "error", "request_id": request_id, "error": msg}}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// First event of a line, or `Other` when it carries none.
+    fn parse_line(l: &str) -> CcEvent {
+        parse_events(l).into_iter().next().unwrap_or(CcEvent::Other)
+    }
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -351,9 +379,21 @@ mod tests {
             }
         );
         let td = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}},"parent_tool_use_id":null}"#;
-        assert_eq!(parse_line(td), CcEvent::TextDelta("hi".into()));
+        assert_eq!(
+            parse_line(td),
+            CcEvent::TextDelta {
+                text: "hi".into(),
+                parent: None
+            }
+        );
         let th = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
-        assert_eq!(parse_line(th), CcEvent::ThinkingDelta("hmm".into()));
+        assert_eq!(
+            parse_line(th),
+            CcEvent::ThinkingDelta {
+                text: "hmm".into(),
+                parent: None
+            }
+        );
         let ij = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\""}}}"#;
         assert_eq!(parse_line(ij), CcEvent::Other);
         let ms = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
@@ -361,7 +401,7 @@ mod tests {
 
         let asst = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"t"},{"type":"text","text":"ok"},{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]}}"#;
         match parse_line(asst) {
-            CcEvent::Assistant { parts, parent } => {
+            CcEvent::Assistant { parts, parent, .. } => {
                 assert_eq!(parent, None);
                 assert_eq!(parts.len(), 3);
                 assert_eq!(parts[0], Part::Reasoning("t".into()));
@@ -572,7 +612,7 @@ mod tests {
         );
         match ev {
             CcEvent::ToolResult { content, .. } => {
-                assert!(content.len() <= crate::sandbox::OUTPUT_CAP);
+                assert!(content.len() <= crate::sandbox::OUTPUT_CAP + 64);
                 assert!(!content.is_empty());
             }
             e => panic!("{:?}", std::mem::discriminant(&e)),
@@ -628,5 +668,137 @@ mod tests {
             e["response"]["error"],
             "Unsupported control request subtype: x"
         );
+    }
+
+    #[test]
+    fn assistant_error_and_per_call_usage() {
+        let l = r#"{"type":"assistant","error":"authentication_failed","message":{"content":[{"type":"text","text":"Not signed in"}],"usage":{"input_tokens":4,"output_tokens":9,"cache_read_input_tokens":10,"cache_creation_input_tokens":1}}}"#;
+        match parse_line(l) {
+            CcEvent::Assistant { error, usage, .. } => {
+                assert_eq!(error.as_deref(), Some("authentication_failed"));
+                assert_eq!(
+                    usage,
+                    Some(Usage {
+                        prompt_tokens: 15,
+                        completion_tokens: 9
+                    })
+                );
+            }
+            e => panic!("{e:?}"),
+        }
+        let l = r#"{"type":"assistant","message":{"content":[]}}"#;
+        match parse_line(l) {
+            CcEvent::Assistant { error, usage, .. } => {
+                assert_eq!((error, usage), (None, None));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn error_result_without_text_falls_back_to_subtype() {
+        let l = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
+        match parse_line(l) {
+            CcEvent::Result { message, .. } => {
+                assert_eq!(message.as_deref(), Some("error_during_execution"))
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_control_requests_become_unsupported() {
+        let cases = [
+            (
+                r#"{"type":"control_request","request_id":"m1","request":{"subtype":"can_use_tool","input":{}}}"#,
+                "can_use_tool",
+            ),
+            (r#"{"type":"control_request","request_id":"m2"}"#, ""),
+            (
+                r#"{"type":"control_request","request_id":"m3","request":"x"}"#,
+                "",
+            ),
+        ];
+        for (l, sub) in cases {
+            match parse_line(l) {
+                CcEvent::UnsupportedControl {
+                    request_id,
+                    subtype,
+                } => {
+                    assert!(request_id.starts_with('m'));
+                    assert_eq!(subtype, sub, "{l}");
+                }
+                e => panic!("{l}: {e:?}"),
+            }
+        }
+        // No request_id at all: nothing we can answer.
+        assert_eq!(
+            parse_line(r#"{"type":"control_request","request":{}}"#),
+            CcEvent::Other
+        );
+    }
+
+    #[test]
+    fn deltas_carry_subagent_parent() {
+        let td = r#"{"type":"stream_event","parent_tool_use_id":"task7","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"a"}}}"#;
+        assert_eq!(
+            parse_line(td),
+            CcEvent::TextDelta {
+                text: "a".into(),
+                parent: Some("task7".into())
+            }
+        );
+        let th = r#"{"type":"stream_event","parent_tool_use_id":"task7","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"b"}}}"#;
+        assert_eq!(
+            parse_line(th),
+            CcEvent::ThinkingDelta {
+                text: "b".into(),
+                parent: Some("task7".into())
+            }
+        );
+    }
+
+    #[test]
+    fn user_frame_with_several_tool_results_yields_all() {
+        let l = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1"},{"type":"tool_result","tool_use_id":"b","content":"2","is_error":true}]}}"#;
+        let evs = parse_events(l);
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(&evs[0], CcEvent::ToolResult { call_id, .. } if call_id == "a"));
+        assert!(
+            matches!(&evs[1], CcEvent::ToolResult { call_id, is_error: true, .. } if call_id == "b")
+        );
+    }
+
+    #[test]
+    fn capped_result_keeps_tail_and_has_marker() {
+        let body = format!("{}{}", "H".repeat(40_000), "TAIL");
+        let l = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":body}]}}).to_string();
+        match parse_line(&l) {
+            CcEvent::ToolResult { content, .. } => {
+                assert!(
+                    content.starts_with("[… 10004 bytes omitted]\n"),
+                    "{}",
+                    &content[..40]
+                );
+                assert!(content.ends_with("TAIL"));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn outgoing_lines_escape_line_separators() {
+        let u = user_message("a\u{2028}b\u{2029}c");
+        assert!(!u.contains('\u{2028}') && !u.contains('\u{2029}'));
+        assert!(u.contains("\\u2028") && u.contains("\\u2029"));
+        assert_eq!(v(&u)["message"]["content"], "a\u{2028}b\u{2029}c");
+        let a = control_response_allow("r", &json!({"c":"x\u{2028}"}), None);
+        assert!(!a.contains('\u{2028}'));
+        let d = control_response_deny("r", "n\u{2029}", false);
+        assert!(!d.contains('\u{2029}'));
+        let e = control_response_error("r", "n\u{2028}");
+        assert!(!e.contains('\u{2028}'));
+        assert!(!initialize_request("r\u{2028}").contains('\u{2028}'));
+        assert!(!interrupt_request("r\u{2029}").contains('\u{2029}'));
     }
 }

@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use void_core::claude_code::{
-    CcEvent, control_response_allow, initialize_request, parse_line, user_message,
+    CcEvent, control_response_allow, initialize_request, parse_events, user_message,
 };
 
 fn root() -> PathBuf {
@@ -37,12 +37,18 @@ fn text_turn_replays_and_records_args() {
         .lines()
         .map(|l| l.unwrap())
         .collect();
-    let evs: Vec<CcEvent> = lines.iter().map(|l| parse_line(l)).collect();
+    let evs: Vec<CcEvent> = lines.iter().flat_map(|l| parse_events(l)).collect();
     assert!(
         matches!(&evs[0], CcEvent::ControlResponse { request_id, ok: true, .. } if request_id == "req_1")
     );
     assert!(matches!(&evs[1], CcEvent::Init { session, .. } if session == "sess-1"));
-    assert_eq!(evs[2], CcEvent::TextDelta("Hello".into()));
+    assert_eq!(
+        evs[2],
+        CcEvent::TextDelta {
+            text: "Hello".into(),
+            parent: None
+        }
+    );
     assert!(matches!(
         evs.last().unwrap(),
         CcEvent::Result {
@@ -68,7 +74,7 @@ fn permission_scenario_waits_for_answer() {
     for l in out.by_ref() {
         if let CcEvent::PermissionRequest {
             request_id, input, ..
-        } = parse_line(&l.unwrap())
+        } = parse_events(&l.unwrap()).remove(0)
         {
             req = Some((request_id, input));
             break;
@@ -76,7 +82,7 @@ fn permission_scenario_waits_for_answer() {
     }
     let (id, input) = req.expect("permission request");
     writeln!(stdin, "{}", control_response_allow(&id, &input, None)).unwrap();
-    let rest: Vec<CcEvent> = out.map(|l| parse_line(&l.unwrap())).collect();
+    let rest: Vec<CcEvent> = out.flat_map(|l| parse_events(&l.unwrap())).collect();
     assert!(matches!(rest[0], CcEvent::ToolResult { .. }));
     assert!(matches!(rest.last().unwrap(), CcEvent::Result { .. }));
     assert!(c.wait().unwrap().success());
@@ -90,11 +96,32 @@ fn tool_use_scenario_parses() {
     writeln!(stdin, "{}", user_message("ls")).unwrap();
     let evs: Vec<CcEvent> = BufReader::new(c.stdout.take().unwrap())
         .lines()
-        .map(|l| parse_line(&l.unwrap()))
+        .flat_map(|l| parse_events(&l.unwrap()))
         .collect();
     assert!(
         evs.iter()
             .any(|e| matches!(e, CcEvent::ToolResult { call_id, .. } if call_id == "tu_1"))
     );
+    c.wait().unwrap();
+}
+
+#[test]
+fn parallel_tool_results_in_one_frame_are_all_parsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = spawn("parallel-tools.ndjson", dir.path());
+    let mut stdin = c.stdin.take().unwrap();
+    writeln!(stdin, "{}", user_message("go")).unwrap();
+    let evs: Vec<CcEvent> = BufReader::new(c.stdout.take().unwrap())
+        .lines()
+        .flat_map(|l| parse_events(&l.unwrap()))
+        .collect();
+    let ids: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            CcEvent::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["p1", "p2"]);
     c.wait().unwrap();
 }
