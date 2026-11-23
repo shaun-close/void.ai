@@ -12,8 +12,12 @@ fn root() -> PathBuf {
 }
 
 fn spawn(scenario: &str, dir: &std::path::Path) -> std::process::Child {
+    spawn_with(scenario, dir, &["-p", "--verbose"])
+}
+
+fn spawn_with(scenario: &str, dir: &std::path::Path, args: &[&str]) -> std::process::Child {
     Command::new(root().join("fake-claude"))
-        .args(["-p", "--verbose"])
+        .args(args)
         .env(
             "FAKE_CLAUDE_SCENARIO",
             root().join("fake-claude-scenarios").join(scenario),
@@ -66,7 +70,8 @@ fn text_turn_replays_and_records_args() {
 #[test]
 fn permission_scenario_waits_for_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let mut c = spawn("permission.ndjson", dir.path());
+    let args = ["-p", "--permission-prompt-tool", "stdio"];
+    let mut c = spawn_with("permission.ndjson", dir.path(), &args);
     let mut stdin = c.stdin.take().unwrap();
     let mut out = BufReader::new(c.stdout.take().unwrap()).lines();
     writeln!(stdin, "{}", user_message("go")).unwrap();
@@ -85,6 +90,31 @@ fn permission_scenario_waits_for_answer() {
     let rest: Vec<CcEvent> = out.flat_map(|l| parse_events(&l.unwrap())).collect();
     assert!(matches!(rest[0], CcEvent::ToolResult { .. }));
     assert!(matches!(rest.last().unwrap(), CcEvent::Result { .. }));
+    assert!(c.wait().unwrap().success());
+}
+
+/// Like the real CLI: without `--permission-prompt-tool stdio` nobody is asked; the request
+/// becomes a `system/permission_denied` frame and the turn goes on.
+#[test]
+fn permission_denied_without_stdio_prompt_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = spawn("permission.ndjson", dir.path());
+    let mut stdin = c.stdin.take().unwrap();
+    writeln!(stdin, "{}", user_message("go")).unwrap();
+    let lines: Vec<String> = BufReader::new(c.stdout.take().unwrap())
+        .lines()
+        .map(|l| l.unwrap())
+        .collect();
+    assert!(
+        !lines.iter().any(|l| l.contains("can_use_tool")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(r#""subtype": "permission_denied""#)),
+        "{lines:?}"
+    );
     assert!(c.wait().unwrap().success());
 }
 

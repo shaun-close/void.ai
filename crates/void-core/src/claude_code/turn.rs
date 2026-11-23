@@ -32,7 +32,15 @@ pub const VOID_NOTE: &str = "Your file changes are staged for the user's review 
 /// Prepended to a retried user message (the CLI can't resume from before the retried turn).
 pub const RETRY_NOTE: &str = "The previous attempt was undone; its file changes were reverted.";
 pub const NOT_SIGNED_IN: &str =
-    "Claude Code isn't signed in — run `claude` in a terminal to sign in";
+    "Claude Code isn't signed in — run `claude auth login` in a terminal";
+
+/// The not-signed-in error, in Claude Code's own words when it gave some (they name the fix).
+pub fn not_signed_in(said: &str) -> String {
+    match said.trim() {
+        "" => NOT_SIGNED_IN.to_string(),
+        said => format!("Claude Code isn't signed in: {said}"),
+    }
+}
 /// Review actions and chat-view saves while a turn has the overlay mounted.
 pub const BUSY: &str = "A Claude Code turn is running — try again when it finishes";
 
@@ -780,7 +788,7 @@ async fn attempt(
             if !restart {
                 let error = is_error.then(|| {
                     if auth || auth_failure(&message) {
-                        NOT_SIGNED_IN.to_string()
+                        not_signed_in(&message)
                     } else if message.is_empty() {
                         "Claude Code reported an error".to_string()
                     } else {
@@ -903,6 +911,16 @@ mod tests {
         let mut c = Conversation::new(Workspace::scratch().id);
         c.messages = msgs;
         c
+    }
+
+    #[test]
+    fn not_signed_in_names_the_fix() {
+        assert_eq!(not_signed_in("  "), NOT_SIGNED_IN);
+        assert!(NOT_SIGNED_IN.contains("`claude auth login`"));
+        assert_eq!(
+            not_signed_in("Not logged in · Please run /login\n"),
+            "Claude Code isn't signed in: Not logged in · Please run /login"
+        );
     }
 
     #[test]

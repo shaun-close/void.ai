@@ -21,7 +21,6 @@ use void_core::sandbox::{Availability, SandboxSettings};
 use void_core::store::Store;
 use void_core::tools::ToolOutput;
 
-const NOT_SIGNED_IN: &str = "Claude Code isn't signed in — run `claude` in a terminal to sign in";
 const BUSY: &str = "A Claude Code turn is running — try again when it finishes";
 const RETRY_NOTE: &str = "The previous attempt was undone; its file changes were reverted.";
 
@@ -448,6 +447,11 @@ fn claude_turn_streams_and_stores_parts() {
         args.windows(2)
             .any(|w| w == ["--permission-prompts", "host"])
     );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--permission-prompt-tool", "stdio"]),
+        "permission prompts come to void over stdio: {args:?}"
+    );
     assert_eq!(r.user_inputs(1), ["list them"]);
     assert_eq!(r.fake("cwd-1").trim(), r.ws.display().to_string());
     assert_eq!(r.fake("key-1"), "", "no API key without a key source");
@@ -680,10 +684,42 @@ fn auth_error_message() {
     let c = r.new_conversation();
     r.send(c, "hello");
     match r.until(|e| matches!(e, Event::StreamFailed { .. })) {
-        Event::StreamFailed { error, .. } => assert_eq!(error, NOT_SIGNED_IN),
+        Event::StreamFailed { error, .. } => assert_eq!(
+            error,
+            "Claude Code isn't signed in: Not logged in · Please run /login"
+        ),
         _ => unreachable!(),
     }
     r.turn_over(c);
+}
+
+/// The real shape when the terminal login has expired: Claude Code's own wording, which names
+/// the fix, is what the user sees.
+#[test]
+fn auth_expired_shows_claude_codes_reason() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=auth-expired".into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "hello");
+    let error = match r.until(|e| matches!(e, Event::StreamFailed { .. })) {
+        Event::StreamFailed { error, .. } => error,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        error,
+        "Claude Code isn't signed in: Failed to authenticate: this login reached its time \
+         limit and cannot be renewed. Run `claude auth login` to sign in again."
+    );
+    r.turn_over(c);
+    let saved = r.saved(c, true);
+    assert_eq!(
+        saved.messages.last().unwrap().error.as_deref(),
+        Some(&*error)
+    );
 }
 
 #[test]

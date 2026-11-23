@@ -18,6 +18,11 @@ Scenario lines: JSON is written to stdout verbatim; directives start with `#`:
   #ignore-sigterm    ignore SIGTERM from here on (only SIGKILL stops it)
   # anything else    comment (also blank lines are skipped)
 Ends with exit 0 when the scenario is exhausted.
+
+Like the real CLI (2.1.330), permission prompts reach the host only with
+`--permission-prompt-tool stdio`: without it, a scenario's `can_use_tool`
+request is replaced by the `system/permission_denied` frame the CLI emits when
+it denies on its own, and the scenario's next `#wait-stdin-line` is skipped.
 """
 import json
 import os
@@ -67,6 +72,11 @@ def main():
         if m and m.get("type") == "user":
             break
 
+    argv = sys.argv[1:]
+    stdio_prompts = "--permission-prompt-tool=stdio" in argv or any(
+        a == "--permission-prompt-tool" and b == "stdio" for a, b in zip(argv, argv[1:]))
+    skip_wait = False
+
     path = os.environ.get("FAKE_CLAUDE_SCENARIO")
     lines = open(path).read().splitlines() if path else []
     for raw in lines:
@@ -74,6 +84,9 @@ def main():
         if not raw:
             continue
         if raw.startswith("#wait-stdin-line"):
+            if skip_wait:
+                skip_wait = False
+                continue
             line = read_line()
             if line is None:
                 return 0
@@ -100,6 +113,22 @@ def main():
         elif raw.startswith("#"):
             continue
         else:
+            req = None
+            try:
+                m = json.loads(raw)
+                if m.get("type") == "control_request":
+                    req = m.get("request") or {}
+            except ValueError:
+                pass
+            if req and req.get("subtype") == "can_use_tool" and not stdio_prompts:
+                out(json.dumps({"type": "system", "subtype": "permission_denied",
+                                "tool_name": req.get("tool_name"),
+                                "tool_use_id": req.get("tool_use_id"),
+                                "message": "Claude requested permissions to use "
+                                           + str(req.get("tool_name"))
+                                           + ", but you haven't granted it yet."}))
+                skip_wait = True
+                continue
             out(raw)
     return 0
 

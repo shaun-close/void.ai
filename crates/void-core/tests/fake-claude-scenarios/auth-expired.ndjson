@@ -1,0 +1,6 @@
+# The real shape (2.1.330) when the terminal login has expired: an API-error assistant frame, then a
+# "success" result with is_error and Claude Code's own wording.
+{"type":"system","subtype":"init","session_id":"sess-x","model":"claude-fake"}
+{"type":"system","subtype":"status","status":"requesting","session_id":"sess-x"}
+{"type":"assistant","parent_tool_use_id":null,"error":"authentication_failed","is_api_error_message":true,"message":{"role":"assistant","content":[{"type":"text","text":"Failed to authenticate: this login reached its time limit and cannot be renewed. Run `claude auth login` to sign in again."}]}}
+{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","num_turns":1,"session_id":"sess-x","result":"Failed to authenticate: this login reached its time limit and cannot be renewed. Run `claude auth login` to sign in again.","usage":{"input_tokens":0,"output_tokens":0}}

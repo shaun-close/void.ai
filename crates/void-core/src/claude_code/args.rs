@@ -32,6 +32,9 @@ pub fn build_args(t: &TurnArgs) -> Vec<String> {
         "--include-partial-messages",
         "--permission-prompts",
         "host",
+        // Without it the CLI denies on its own instead of sending `can_use_tool` (2.1.330).
+        "--permission-prompt-tool",
+        "stdio",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -80,6 +83,8 @@ mod tests {
             "--include-partial-messages",
             "--permission-prompts",
             "host",
+            "--permission-prompt-tool",
+            "stdio",
             &format!("--session-id={id}"),
             "--append-system-prompt",
             "NOTE",
