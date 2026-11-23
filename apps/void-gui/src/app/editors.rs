@@ -143,6 +143,11 @@ impl VoidApp {
                 };
                 let n = self.editor_tab_counts().get(&key).copied().unwrap_or(0);
                 if !force && self.editors.needs_confirm(&key, n) {
+                    // `:wq` in a chat view: the save is on its way; close when it lands.
+                    if let Some(request) = self.editors.saving(&key) {
+                        self.closing.push((tab, request));
+                        return;
+                    }
                     self.editor_message(&key, Msg::error(E37));
                     return;
                 }
@@ -269,14 +274,41 @@ impl VoidApp {
             .collect()
     }
 
-    /// Engine news for chat views: saves that landed or failed, chats whose changes moved.
+    /// Engine news for chat views: saves that landed or failed (tabs waiting to close close,
+    /// or stay with the error), chats whose changes moved.
     pub(super) fn chat_view_events(&mut self) {
-        for (conv, path) in self.state.take_overlay_saved() {
-            self.editors.overlay_saved(conv, &path);
+        for r in self.state.take_overlay_saves() {
+            match &r.error {
+                None => self
+                    .editors
+                    .overlay_saved(r.request, r.conversation, &r.path),
+                Some(e) => self
+                    .editors
+                    .overlay_save_failed(r.request, r.conversation, &r.path, e),
+            }
+            self.chat_results.insert(r.request, r.error);
         }
-        if let Some(e) = self.state.take_errors().pop() {
-            self.editors.overlay_save_failed(&e);
+        for (tab, request) in std::mem::take(&mut self.closing) {
+            match self.chat_results.get(&request) {
+                None => self.closing.push((tab, request)),
+                Some(Some(_)) => {}
+                Some(None) => {
+                    let Some(key) = self.editor_key(tab) else {
+                        continue;
+                    };
+                    if self.editors.is_dirty(&key) {
+                        continue;
+                    }
+                    let n = self.editor_tab_counts().get(&key).copied().unwrap_or(0);
+                    self.remove_editor_tab(tab);
+                    if n <= 1 {
+                        self.editors.discard(&key);
+                    }
+                }
+            }
         }
+        let waiting: Vec<u64> = self.quit_saving.clone();
+        self.chat_results.retain(|r, _| waiting.contains(r));
         let changed = self.state.take_changed_chats();
         if !changed.is_empty() {
             self.editors.check_overlays(&changed);
@@ -287,6 +319,7 @@ impl VoidApp {
     pub(super) fn send_overlay_saves(&mut self) {
         for s in std::mem::take(&mut self.editors.overlay_saves) {
             self.engine.send(void_core::engine::Command::SaveToOverlay {
+                request: s.request,
                 conversation: s.conversation,
                 path: s.path,
                 content: s.content,
@@ -306,6 +339,8 @@ impl VoidApp {
     }
 
     /// Quitting with unsaved buffers asks first: Save all / Quit without saving / Cancel.
+    /// Chat-view saves go through the engine: the dialog waits for them ("Saving…") and quits
+    /// only when every save landed; otherwise it stays up with the errors.
     pub(super) fn quit_dialog(&mut self, ctx: &egui::Context) {
         let dirty: Vec<DocKey> = self
             .editors
@@ -320,23 +355,57 @@ impl VoidApp {
         if !self.quit_dialog {
             return;
         }
+        let mut quit = false;
+        if !self.quit_saving.is_empty() {
+            let answers: Vec<Option<String>> = self
+                .quit_saving
+                .iter()
+                .filter_map(|r| self.chat_results.get(r).cloned())
+                .collect();
+            if answers.len() == self.quit_saving.len() {
+                self.quit_saving.clear();
+                self.quit_errors = answers.into_iter().flatten().collect();
+                quit = self.quit_errors.is_empty();
+            }
+        }
+        let saving = !self.quit_saving.is_empty();
         let names: Vec<String> = dirty.iter().map(|k| file_name(&k.0)).collect();
+        let errors = self.quit_errors.clone();
         let mut choice = None;
         let modal = egui::Modal::new(egui::Id::unique("editor-quit")).show(ctx, |ui| {
+            let pal = theme::palette_of(ui);
             ui.set_max_width(420.0);
             theme::heading(ui, icon::FLOPPY, "Save changes before quitting?");
             ui.label(format!("Unsaved: {}", names.join(", ")));
+            for e in &errors {
+                ui.label(theme::itext_styled(
+                    icon::WARNING,
+                    e,
+                    theme::small_size(),
+                    pal.err,
+                ));
+            }
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Enter saves all, Esc cancels")
-                    .small()
-                    .color(theme::palette_of(ui).text_faint),
-            );
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                choice = Some("save");
+            if saving {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Saving to void's pending changes…");
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new("Enter saves all, Esc cancels")
+                        .small()
+                        .color(pal.text_faint),
+                );
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                    choice = Some("save");
+                }
             }
             ui.horizontal(|ui| {
-                if ui.button("Save all").clicked() {
+                if ui
+                    .add_enabled(!saving, egui::Button::new("Save all"))
+                    .clicked()
+                {
                     choice = Some("save");
                 }
                 if ui.button("Quit without saving").clicked() {
@@ -350,22 +419,34 @@ impl VoidApp {
         if modal.should_close() && choice.is_none() {
             choice = Some("cancel");
         }
-        let quit = match choice {
-            Some("save") => dirty.iter().all(|k| self.editors.save(k).is_ok()),
-            Some("quit") => true,
+        match choice {
+            Some("save") => {
+                self.quit_errors.clear();
+                let mut pending = Vec::new();
+                for k in &dirty {
+                    match self.editors.save(k) {
+                        Ok(_) => pending.extend(self.editors.saving(k)),
+                        Err(e) => self.quit_errors.push(e),
+                    }
+                }
+                if self.quit_errors.is_empty() {
+                    // Disk saves are done; chat-view saves answer in a later frame.
+                    quit = pending.is_empty();
+                    self.quit_saving = pending;
+                }
+            }
+            Some("quit") => quit = true,
             Some(_) => {
                 self.quit_dialog = false;
-                false
+                self.quit_saving.clear();
+                self.quit_errors.clear();
             }
-            None => false,
-        };
+            None => {}
+        }
         if quit {
             self.quit_dialog = false;
             self.quit_anyway = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if choice == Some("save") {
-            // A save failed: the buffer says why; stay open.
-            self.quit_dialog = false;
         }
     }
 
@@ -414,7 +495,11 @@ impl VoidApp {
             Some("save") => {
                 self.editors.confirm = None;
                 if self.editors.save(&req.key).is_ok() {
-                    self.remove_editor_tab(req.tab);
+                    // A chat view's save answers later: close when it lands.
+                    match self.editors.saving(&req.key) {
+                        Some(request) => self.closing.push((req.tab, request)),
+                        None => self.remove_editor_tab(req.tab),
+                    }
                 }
             }
             Some("discard") => {

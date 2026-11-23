@@ -296,8 +296,17 @@ pub struct Doc {
     /// Each tab's own scroll position (tabs on one buffer share the text and the cursor). The
     /// tab being drawn swaps its view into `core.view`.
     pub views: std::collections::HashMap<u32, View>,
-    /// A chat-view save sent to the engine: the buffer version and the text's fingerprint.
-    pub chat_save: Option<(u64, Fingerprint)>,
+    /// Chat-view saves sent to the engine and not answered yet, oldest first.
+    pub chat_saves: Vec<ChatSave>,
+}
+
+/// A chat-view save in flight: its request id, the buffer version it holds, and the
+/// fingerprint of the text sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatSave {
+    pub request: u64,
+    pub version: u64,
+    pub fp: Fingerprint,
 }
 
 pub fn has_grammar(lang: &Lang) -> bool {
@@ -347,7 +356,7 @@ impl Doc {
             hl_cache: None,
             typing: false,
             views: Default::default(),
-            chat_save: None,
+            chat_saves: Vec::new(),
         }
     }
 

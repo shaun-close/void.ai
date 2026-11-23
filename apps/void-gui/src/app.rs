@@ -45,7 +45,14 @@ pub struct VoidApp {
     pending_start: Option<(u32, String)>,
     /// Quitting with unsaved editor buffers: the dialog is up / the user said quit anyway.
     quit_dialog: bool,
-    quit_anyway: bool,
+    pub(crate) quit_anyway: bool,
+    /// Chat-view saves the quit dialog waits for, and what went wrong with the last try.
+    quit_saving: Vec<u64>,
+    quit_errors: Vec<String>,
+    /// Editor tabs to close once their chat-view save lands: `(tab, request)`.
+    closing: Vec<(u32, u64)>,
+    /// Answers to chat-view saves someone waits for (None: it landed).
+    chat_results: HashMap<u64, Option<String>>,
     /// The Files panel's tree and inline edits.
     pub(crate) files: crate::panels::files::FilesUi,
     /// Watches the workspace (and files open from elsewhere) for outside changes.
@@ -108,6 +115,10 @@ impl VoidApp {
             pending_start: None,
             quit_dialog: false,
             quit_anyway: false,
+            quit_saving: Vec::new(),
+            quit_errors: Vec::new(),
+            closing: Vec::new(),
+            chat_results: HashMap::new(),
             files: Default::default(),
             disk: Default::default(),
             last_editor: None,

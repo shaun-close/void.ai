@@ -136,6 +136,8 @@ pub struct EditorStore {
     pub busy_chats: std::collections::HashSet<void_core::model::ConversationId>,
     /// Chat-view saves for the app to send to the engine.
     pub overlay_saves: Vec<OverlaySave>,
+    /// The id the next chat-view save gets.
+    next_request: u64,
 }
 
 impl EditorStore {
@@ -156,6 +158,7 @@ impl EditorStore {
             overlays: None,
             busy_chats: Default::default(),
             overlay_saves: Vec::new(),
+            next_request: 1,
         }
     }
 

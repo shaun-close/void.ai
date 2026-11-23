@@ -11,7 +11,7 @@ use void_core::overlay::Overlay;
 use void_core::store::Store;
 use void_editor::{Buffer, Fingerprint};
 
-use super::state::{DiskState, Doc, Msg};
+use super::state::{ChatSave, DiskState, Doc, Msg};
 use super::{DocKey, EditorStore, file_name};
 use crate::layout::EditorView;
 
@@ -56,6 +56,7 @@ impl ChatOverlays {
 /// A chat-view save for the app to send to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlaySave {
+    pub request: u64,
     pub conversation: ConversationId,
     pub path: PathBuf,
     pub content: String,
@@ -126,11 +127,15 @@ impl EditorStore {
         } else {
             // A file gone from void's version is written back, as a Disk save recreates one.
             let content = doc.core.buffer.file_text();
-            doc.chat_save = Some((
-                doc.core.buffer.version(),
-                Fingerprint::of_bytes(content.as_bytes()),
-            ));
+            let request = self.next_request;
+            self.next_request += 1;
+            doc.chat_saves.push(ChatSave {
+                request,
+                version: doc.core.buffer.version(),
+                fp: Fingerprint::of_bytes(content.as_bytes()),
+            });
             self.overlay_saves.push(OverlaySave {
+                request,
                 conversation: conv,
                 path: key.0.clone(),
                 content,
@@ -144,33 +149,55 @@ impl EditorStore {
         r
     }
 
-    /// The engine wrote a chat-view save: the text as sent is now the chat's version.
-    pub fn overlay_saved(&mut self, conv: ConversationId, path: &Path) {
+    /// The save in flight that holds the buffer's current text, if any (closing waits for it).
+    pub fn saving(&self, key: &DocKey) -> Option<u64> {
+        let doc = self.docs.get(key)?;
+        doc.chat_saves
+            .last()
+            .filter(|s| s.version == doc.core.buffer.version())
+            .map(|s| s.request)
+    }
+
+    /// The engine wrote chat-view save `request`: the text it held is now the chat's version
+    /// (later edits, or a later save still in flight, keep the buffer dirty).
+    pub fn overlay_saved(&mut self, request: u64, conv: ConversationId, path: &Path) {
         let key: DocKey = (path.to_path_buf(), EditorView::Chat(conv));
         let Some(doc) = self.docs.get_mut(&key) else {
             return;
         };
-        let Some((version, fp)) = doc.chat_save.take() else {
+        let Some(i) = doc.chat_saves.iter().position(|s| s.request == request) else {
             return;
         };
-        doc.core.buffer.mark_saved_at(version);
-        doc.core.buffer.disk = Some(fp);
+        // The engine answers in order: anything older was answered already.
+        let save = doc.chat_saves[i];
+        doc.chat_saves.drain(..=i);
+        doc.core.buffer.mark_saved_at(save.version);
+        doc.core.buffer.disk = Some(save.fp);
         doc.core.disk = DiskState::InSync;
         doc.core.kept = None;
         doc.core.message = Some(Msg::info(format!(
-            "\"{}\" {}L written to void's pending changes",
-            file_name(path),
-            doc.core.buffer.line_count()
+            "\"{}\" written to void's pending changes",
+            file_name(path)
         )));
     }
 
-    /// The engine reported an error while chat-view saves were in flight: they failed (the
-    /// buffers stay dirty and say why).
-    pub fn overlay_save_failed(&mut self, error: &str) {
-        for doc in self.docs.values_mut() {
-            if doc.chat_save.take().is_some() {
-                doc.core.message = Some(Msg::error(error.to_string()));
-            }
+    /// The engine refused or failed chat-view save `request`: nothing was written, the
+    /// buffer stays dirty and says why.
+    pub fn overlay_save_failed(
+        &mut self,
+        request: u64,
+        conv: ConversationId,
+        path: &Path,
+        error: &str,
+    ) {
+        let key: DocKey = (path.to_path_buf(), EditorView::Chat(conv));
+        let Some(doc) = self.docs.get_mut(&key) else {
+            return;
+        };
+        let before = doc.chat_saves.len();
+        doc.chat_saves.retain(|s| s.request != request);
+        if doc.chat_saves.len() != before {
+            doc.core.message = Some(Msg::error(error.to_string()));
         }
     }
 
@@ -188,7 +215,7 @@ impl EditorStore {
             let Some(doc) = self.docs.get_mut(&key) else {
                 continue;
             };
-            if doc.chat_save.is_some() {
+            if !doc.chat_saves.is_empty() {
                 continue;
             }
             match read {

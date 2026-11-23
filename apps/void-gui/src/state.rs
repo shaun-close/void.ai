@@ -72,11 +72,18 @@ pub struct UiState {
     /// Chats whose pending changes were reported since the app last looked (chat views
     /// re-read their files).
     changed_chats: Vec<ConversationId>,
-    /// Chat-view saves that landed (`OverlaySaved`), for the editors.
-    overlay_saved: Vec<(ConversationId, std::path::PathBuf)>,
-    /// Errors since the app last looked (a chat-view save waiting on the engine may have been
-    /// refused).
-    errors: Vec<String>,
+    /// Answers to chat-view saves, for the editors: `(request, chat, path, error)` with no
+    /// error for a save that landed.
+    overlay_saves: Vec<OverlaySaveResult>,
+}
+
+/// The engine's answer to one `SaveToOverlay`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlaySaveResult {
+    pub request: u64,
+    pub conversation: ConversationId,
+    pub path: std::path::PathBuf,
+    pub error: Option<String>,
 }
 
 impl Default for UiState {
@@ -108,8 +115,7 @@ impl Default for UiState {
             deleted: Vec::new(),
             quiet: Default::default(),
             changed_chats: Vec::new(),
-            overlay_saved: Vec::new(),
-            errors: Vec::new(),
+            overlay_saves: Vec::new(),
         }
     }
 }
@@ -197,10 +203,7 @@ impl UiState {
                 self.tests.insert(profile_id, result);
             }
             Event::ConfigSaved => self.info("Settings saved."),
-            Event::Error(e) => {
-                self.errors.push(e.clone());
-                self.error(e)
-            }
+            Event::Error(e) => self.error(e),
             Event::Info(m) => self.info(m),
             Event::SandboxStatus(a) => self.sandbox = Some(a),
             Event::ToolStarted {
@@ -289,8 +292,29 @@ impl UiState {
                 }
             }
             Event::ReviewError { error, .. } => self.error(error),
-            Event::OverlaySaved { conversation, path } => {
-                self.overlay_saved.push((conversation, path));
+            Event::OverlaySaved {
+                request,
+                conversation,
+                path,
+            } => self.overlay_saves.push(OverlaySaveResult {
+                request,
+                conversation,
+                path,
+                error: None,
+            }),
+            Event::OverlaySaveFailed {
+                request,
+                conversation,
+                path,
+                error,
+            } => {
+                self.error(error.clone());
+                self.overlay_saves.push(OverlaySaveResult {
+                    request,
+                    conversation,
+                    path,
+                    error: Some(error),
+                });
             }
             Event::Compacted(_) => self.info("Earlier messages summarised to save context."),
         }
@@ -339,12 +363,8 @@ impl UiState {
         std::mem::take(&mut self.changed_chats)
     }
 
-    pub fn take_overlay_saved(&mut self) -> Vec<(ConversationId, std::path::PathBuf)> {
-        std::mem::take(&mut self.overlay_saved)
-    }
-
-    pub fn take_errors(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.errors)
+    pub fn take_overlay_saves(&mut self) -> Vec<OverlaySaveResult> {
+        std::mem::take(&mut self.overlay_saves)
     }
 
     /// Chats with pending changes to `rel` (workspace-relative), oldest chat first.

@@ -935,6 +935,69 @@ impl Overlay {
         self.note(text)
     }
 
+    /// Make the user's own save of `rel` part of the last checkpoint, so
+    /// `restore_checkpoint` (Retry) undoes the agent's turn but keeps the user's save.
+    pub fn keep_in_checkpoint(&self, rel: &Path) -> io::Result<()> {
+        let cp = self.dir.join("checkpoint");
+        if !cp.join("upper").exists() {
+            return Ok(());
+        }
+        // The file as saved, with its folders (opaque where the layer's are).
+        let comps = components(rel);
+        let (mut up, mut cur) = (self.upper(), cp.join("upper"));
+        for c in &comps[..comps.len().saturating_sub(1)] {
+            up.push(c);
+            cur.push(c);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    fs::remove_file(&cur)?;
+                    fs::create_dir(&cur)?;
+                }
+                Err(_) => fs::create_dir(&cur)?,
+            }
+            if is_opaque(&up) {
+                xattr::set(&cur, OPAQUE, b"y")?;
+            }
+        }
+        let dst = cp.join("upper").join(rel);
+        match fs::symlink_metadata(&dst) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&dst)?,
+            Ok(_) => fs::remove_file(&dst)?,
+            Err(_) => {}
+        }
+        fs::copy(self.upper().join(rel), &dst)?;
+        // Whiteouts the checkpoint recorded on the path or its folders no longer apply.
+        let list_path = cp.join("whiteouts.json");
+        let list: Vec<String> = fs::read(&list_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let kept: Vec<String> = list.into_iter().filter(|w| !rel.starts_with(w)).collect();
+        fs::write(
+            &list_path,
+            serde_json::to_vec(&kept).map_err(io::Error::other)?,
+        )?;
+        // Its base, as recorded now.
+        let base = self.dir.join("base");
+        for from in [self.base(rel), self.absent(rel), self.manifest_path(rel)] {
+            let Ok(sub) = from.strip_prefix(&base) else {
+                continue;
+            };
+            let to = cp.join("base").join(sub);
+            if fs::symlink_metadata(&to).is_ok_and(|m| !m.is_dir()) {
+                fs::remove_file(&to)?;
+            }
+            if fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+                if let Some(p) = to.parent() {
+                    fs::create_dir_all(p)?;
+                }
+                fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Rejection notes not yet passed to the agent (and forget them).
     pub fn take_rejections(&self) -> Vec<String> {
         let m = self.meta();
@@ -1439,6 +1502,39 @@ mod tests {
         assert_eq!(rd(&t, "a"), "2");
         assert!(matches!(t.ov.resolve(Path::new("b")), Entry::Missing));
         assert_eq!(t.ov.changes().len(), 1);
+    }
+
+    #[test]
+    fn user_save_survives_restore_checkpoint() {
+        let t = setup();
+        fs::write(t.ws.join("a"), "1").unwrap();
+        t.ov.write(Path::new("keep"), b"agent before").unwrap();
+        t.ov.checkpoint().unwrap();
+        t.ov.write(Path::new("a"), b"agent").unwrap();
+        t.ov.write(Path::new("dir/new"), b"agent").unwrap();
+        t.ov.write(Path::new("a"), b"user").unwrap();
+        t.ov.write(Path::new("sub/u"), b"user new").unwrap();
+        t.ov.keep_in_checkpoint(Path::new("a")).unwrap();
+        t.ov.keep_in_checkpoint(Path::new("sub/u")).unwrap();
+        assert!(t.ov.restore_checkpoint().unwrap());
+        assert_eq!(rd(&t, "a"), "user");
+        assert_eq!(rd(&t, "sub/u"), "user new");
+        assert_eq!(rd(&t, "keep"), "agent before");
+        assert!(matches!(t.ov.resolve(Path::new("dir/new")), Entry::Missing));
+        let mut kinds: Vec<_> =
+            t.ov.changes()
+                .into_iter()
+                .map(|c| (c.path, c.kind))
+                .collect();
+        kinds.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kinds,
+            [
+                (PathBuf::from("a"), ChangeKind::Modified),
+                (PathBuf::from("keep"), ChangeKind::Added),
+                (PathBuf::from("sub/u"), ChangeKind::Added),
+            ]
+        );
     }
 
     #[test]

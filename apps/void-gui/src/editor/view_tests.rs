@@ -6,7 +6,7 @@ use egui::Key;
 use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use void_core::engine::Command;
+use void_core::engine::{Command, Event};
 use void_core::model::{Conversation, ConversationId};
 use void_core::overlay::Overlay;
 use void_core::store::Store;
@@ -259,4 +259,169 @@ fn several_chats_collapse_into_a_menu() {
     views[0].click();
     steps(&mut r.h, 3);
     assert_eq!(editor_view(r.h.state()), Some(EditorView::Chat(r.conv)));
+}
+
+/// Make the chat's layer unwritable (the engine's write fails), or writable again.
+fn lock_overlay(r: &Rig, locked: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if locked { 0o555 } else { 0o755 };
+    std::fs::set_permissions(r.overlay.upper(), std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn message(app: &VoidApp, key: &crate::editor::DocKey) -> String {
+    app.editors
+        .doc(key)
+        .and_then(|d| d.core.message.clone())
+        .map(|m| m.text)
+        .unwrap_or_default()
+}
+
+#[test]
+fn chat_view_wq_closes_after_save() {
+    let mut r = rig();
+    let key = (r.file.clone(), EditorView::Chat(r.conv));
+    r.h.state_mut()
+        .open_editor(r.file.clone(), EditorView::Chat(r.conv), None);
+    steps(&mut r.h, 2);
+    text(&mut r.h, "imine ");
+    r.h.key_press(Key::Escape);
+    r.h.step();
+    text(&mut r.h, ":");
+    text(&mut r.h, "wq");
+    r.h.key_press(Key::Enter);
+    r.h.step();
+    assert!(
+        !message(r.h.state(), &key).contains("E37"),
+        "{}",
+        message(r.h.state(), &key)
+    );
+    until(&mut r.h, "tab closed after the save", |a| {
+        editor_view(a).is_none()
+    });
+    assert_eq!(
+        r.overlay.read(Path::new("a.txt")).unwrap(),
+        b"mine void's text\n"
+    );
+
+    // When the engine can't write, the tab stays open, dirty, and says why.
+    r.h.state_mut()
+        .open_editor(r.file.clone(), EditorView::Chat(r.conv), None);
+    steps(&mut r.h, 2);
+    text(&mut r.h, "ix");
+    r.h.key_press(Key::Escape);
+    r.h.step();
+    lock_overlay(&r, true);
+    text(&mut r.h, ":");
+    text(&mut r.h, "wq");
+    r.h.key_press(Key::Enter);
+    until(&mut r.h, "save failed", |a| {
+        message(a, &key).contains("Couldn't save")
+    });
+    steps(&mut r.h, 3);
+    lock_overlay(&r, false);
+    assert_eq!(editor_view(r.h.state()), Some(EditorView::Chat(r.conv)));
+    assert!(r.h.state().editors.is_dirty(&key));
+}
+
+#[test]
+fn second_chat_save_refused_keeps_doc_dirty() {
+    let mut r = rig();
+    let key = (r.file.clone(), EditorView::Chat(r.conv));
+    r.h.state_mut()
+        .open_editor(r.file.clone(), EditorView::Chat(r.conv), None);
+    steps(&mut r.h, 2);
+    let app = r.h.state_mut();
+    app.editors.doc_mut(&key).unwrap().core.replace(0..0, "a");
+    app.editors.save(&key).unwrap();
+    app.editors.doc_mut(&key).unwrap().core.replace(0..0, "b");
+    app.editors.save(&key).unwrap();
+    // Both in flight; the engine writes the first and refuses the second.
+    let sent = std::mem::take(&mut app.editors.overlay_saves);
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[0].request, sent[1].request);
+    app.state.apply(Event::OverlaySaved {
+        request: sent[0].request,
+        conversation: r.conv,
+        path: r.file.clone(),
+    });
+    app.state.apply(Event::OverlaySaveFailed {
+        request: sent[1].request,
+        conversation: r.conv,
+        path: r.file.clone(),
+        error: "refused for the test".into(),
+    });
+    steps(&mut r.h, 2);
+    assert!(
+        r.h.state().editors.is_dirty(&key),
+        "the second version never landed"
+    );
+    assert!(message(r.h.state(), &key).contains("refused for the test"));
+    // An error for some other request leaves a later save alone. (Forced: the synthetic
+    // answers above never wrote the layer, so it looks moved.)
+    let app = r.h.state_mut();
+    app.editors.save_chat(&key, true).unwrap();
+    let sent = std::mem::take(&mut app.editors.overlay_saves);
+    app.state.apply(Event::OverlaySaveFailed {
+        request: sent[0].request + 100,
+        conversation: r.conv,
+        path: r.file.clone(),
+        error: "not yours".into(),
+    });
+    app.state.apply(Event::OverlaySaved {
+        request: sent[0].request,
+        conversation: r.conv,
+        path: r.file.clone(),
+    });
+    steps(&mut r.h, 2);
+    assert!(!r.h.state().editors.is_dirty(&key));
+}
+
+#[test]
+fn quit_waits_for_chat_saves() {
+    let mut r = rig();
+    let key = (r.file.clone(), EditorView::Chat(r.conv));
+    r.h.state_mut()
+        .open_editor(r.file.clone(), EditorView::Chat(r.conv), None);
+    steps(&mut r.h, 2);
+    text(&mut r.h, "ix");
+    r.h.key_press(Key::Escape);
+    r.h.step();
+    lock_overlay(&r, true);
+    let close = |h: &mut Harness<'_, VoidApp>| {
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        h.step();
+        h.step();
+    };
+    close(&mut r.h);
+    assert!(
+        r.h.query_by_label_contains("Save changes before quitting")
+            .is_some()
+    );
+    r.h.get_by_label("Save all").click();
+    until(&mut r.h, "save failed", |a| {
+        message(a, &key).contains("Couldn't save")
+    });
+    steps(&mut r.h, 3);
+    assert!(
+        !r.h.state().quit_anyway,
+        "a refused save keeps the app open"
+    );
+    assert!(r.h.state().editors.is_dirty(&key));
+    assert!(
+        r.h.query_by_label_contains("Save changes before quitting")
+            .is_some(),
+        "the dialog stays up with the error"
+    );
+    lock_overlay(&r, false);
+    r.h.get_by_label("Save all").click();
+    until(&mut r.h, "quit after the save", |a| a.quit_anyway);
+    assert_eq!(
+        r.overlay.read(Path::new("a.txt")).unwrap(),
+        b"xvoid's text\n"
+    );
 }

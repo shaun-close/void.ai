@@ -98,6 +98,8 @@ pub enum Command {
     /// The user saved a chat view: write `content` into the conversation's pending changes
     /// (refused while its turn is active). `path` is workspace-relative or absolute inside it.
     SaveToOverlay {
+        /// Chosen by the UI; echoed in `OverlaySaved` / `OverlaySaveFailed`.
+        request: u64,
         conversation: ConversationId,
         path: PathBuf,
         content: String,
@@ -201,8 +203,16 @@ pub enum Event {
     },
     /// A `SaveToOverlay` landed; `path` is as the command gave it.
     OverlaySaved {
+        request: u64,
         conversation: ConversationId,
         path: PathBuf,
+    },
+    /// A `SaveToOverlay` was refused or failed; nothing was written.
+    OverlaySaveFailed {
+        request: u64,
+        conversation: ConversationId,
+        path: PathBuf,
+        error: String,
     },
 }
 
@@ -539,8 +549,28 @@ impl State {
         self.config.agent(c.agent.as_deref()).cloned()
     }
 
-    fn begin_turn(&mut self, c: &Conversation) {
+    /// Start an agent turn on `c` (its last message is the user's). Notes for the agent
+    /// (the user's rejections and chat-view edits) go with the turn's input: appended to that
+    /// message and kept in the history. Returns the conversation as it now is.
+    fn begin_turn(&mut self, c: &Conversation) -> Conversation {
         let ws = self.workspace.clone();
+        let notes = self
+            .existing_overlay(&ws, c.id)
+            .map(|ov| ov.take_rejections())
+            .unwrap_or_default();
+        let mut c = c.clone();
+        if !notes.is_empty()
+            && let Some(m) = c.messages.last_mut().filter(|m| m.role == Role::User)
+        {
+            m.parts.push(Part::Text(format!(
+                "\n\n[Notes from void]\n{}",
+                notes.join("\n")
+            )));
+            self.convs.insert(c.id, c.clone());
+            self.save(&c);
+            self.emit(Event::Conversation(c.clone()));
+        }
+        let c = &c;
         let tools = ws.root.is_some() && self.agent_for(c).is_some_and(|a| !a.tools.is_empty());
         if tools
             && let Some(ov) = self.overlay_for(&ws, c.id)
@@ -564,6 +594,7 @@ impl State {
             conversation: c.id,
             active: true,
         });
+        c.clone()
     }
 
     fn busy(&self, id: ConversationId) -> bool {
@@ -714,11 +745,6 @@ impl State {
             let send = |m: ToolMsg| {
                 let _ = tx.send(Msg::Tool(id, m));
             };
-            let notes = overlay
-                .as_ref()
-                .map(Overlay::take_rejections)
-                .unwrap_or_default();
-            let mut first = true;
             for (call_id, name, arguments) in calls {
                 if cancel.is_cancelled() {
                     break;
@@ -740,7 +766,7 @@ impl State {
                     name: name.clone(),
                     summary: summary.clone(),
                 });
-                let mut output = 'out: {
+                let output = 'out: {
                     let Some(t) = tool else {
                         break 'out ToolOutput::err(format!("there is no tool called `{name}`"));
                     };
@@ -820,10 +846,6 @@ impl State {
                     let _ = fwd.await;
                     out
                 };
-                if first && !notes.is_empty() {
-                    output.content = format!("{}\n\n{}", notes.join("\n"), output.content);
-                }
-                first = false;
                 send(ToolMsg::Finished { call_id, output });
             }
             send(ToolMsg::RoundDone);
@@ -956,7 +978,7 @@ impl State {
                 self.save(&c);
                 self.emit(Event::Conversation(c.clone()));
                 self.emit_changes(&ws, id);
-                self.begin_turn(&c);
+                let c = self.begin_turn(&c);
                 self.start_stream(c, StreamMode::Reply);
             }
             Command::Stop(id) => {
@@ -1091,10 +1113,11 @@ impl State {
                 }
             }
             Command::SaveToOverlay {
+                request,
                 conversation,
                 path,
                 content,
-            } => self.save_to_overlay(conversation, path, content),
+            } => self.save_to_overlay(request, conversation, path, content),
             Command::ListWorkspaceChanges => {
                 let ws = self.workspace.clone();
                 for meta in self.store.list(&ws.id).0 {
@@ -1136,27 +1159,41 @@ impl State {
 
     /// A chat-view save: into the conversation's pending changes, never the real file, and
     /// never while its turn runs (the agent's layer may be mounted, and Retry would undo it).
-    fn save_to_overlay(&mut self, id: ConversationId, path: PathBuf, content: String) {
+    fn save_to_overlay(
+        &mut self,
+        request: u64,
+        id: ConversationId,
+        path: PathBuf,
+        content: String,
+    ) {
         let ws = self.workspace.clone();
+        let fail = |this: &Self, path: PathBuf, error: String| {
+            this.emit(Event::OverlaySaveFailed {
+                request,
+                conversation: id,
+                path,
+                error,
+            });
+        };
         let Some(root) = ws.root.clone() else {
-            self.emit(Event::Error(
-                "Chat views need a folder workspace (File › Open Folder)".into(),
-            ));
+            let error = "Chat views need a folder workspace (File › Open Folder)".into();
+            fail(self, path, error);
             return;
         };
         if self.busy(id) {
-            self.emit(Event::Error(
-                "void is working in this chat — save to Disk, or wait".into(),
-            ));
+            let error = "void is working in this chat — save to Disk, or wait".into();
+            fail(self, path, error);
             return;
         }
         if self
             .conversation(id)
             .is_none_or(|c| c.workspace_id != ws.id)
         {
-            self.emit(Event::Error(
+            fail(
+                self,
+                path,
                 "That chat isn't in this workspace any more".into(),
-            ));
+            );
             return;
         }
         let rel = match path.strip_prefix(&root) {
@@ -1168,34 +1205,43 @@ impl State {
                 .components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)));
         if !inside {
-            self.emit(Event::Error(format!(
-                "{} is outside the workspace",
-                path.display()
-            )));
+            let error = format!("{} is outside the workspace", path.display());
+            fail(self, path, error);
             return;
         }
         let Some(ov) = self.overlay_for(&ws, id) else {
-            self.emit(Event::Error(
+            fail(
+                self,
+                path,
                 "Couldn't open the chat's pending changes".into(),
-            ));
+            );
             return;
         };
         let name = rel.display().to_string();
         match ov.write(&rel, content.as_bytes()) {
             Ok(()) => {
+                // Retry undoes the agent's last turn, not this save; and the agent hears
+                // about it with its next turn's input.
+                if let Err(e) = ov.keep_in_checkpoint(&rel) {
+                    self.emit(Event::Error(format!(
+                        "Saved {name}, but a Retry may undo it: {e}"
+                    )));
+                }
                 if let Err(e) = ov.note_user_edit(&rel) {
                     self.emit(Event::Error(format!(
                         "Saved {name}, but couldn't tell the agent: {e}"
                     )));
                 }
                 self.emit(Event::OverlaySaved {
+                    request,
                     conversation: id,
                     path,
                 });
             }
-            Err(e) => self.emit(Event::Error(format!(
-                "Couldn't save {name} to the chat's pending changes: {e}"
-            ))),
+            Err(e) => {
+                let error = format!("Couldn't save {name} to the chat's pending changes: {e}");
+                fail(self, path, error);
+            }
         }
         self.emit(Event::Changes {
             conversation: id,
@@ -1286,7 +1332,7 @@ impl State {
         self.save(&c);
         self.emit(Event::Conversation(c.clone()));
         self.emit_list();
-        self.begin_turn(&c);
+        let c = self.begin_turn(&c);
         self.start_stream(c, StreamMode::Reply);
     }
 
@@ -2828,13 +2874,14 @@ mod tests {
         a.finish_with("edited");
         a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
         a.r.handle.send(Command::SaveToOverlay {
+            request: 1,
             conversation: a.conv,
             path: "a.txt".into(),
             content: "mango and kiwi\n".into(),
         });
         let conv = a.conv;
         a.r.until(|e| {
-            matches!(e, Event::OverlaySaved { conversation, path }
+            matches!(e, Event::OverlaySaved { request: 1, conversation, path }
                 if *conversation == conv && path == std::path::Path::new("a.txt"))
         });
         a.r.until(|e| matches!(e, Event::Changes { conversation, .. } if *conversation == conv));
@@ -2849,30 +2896,128 @@ mod tests {
         );
         // A path outside the workspace is refused.
         a.r.handle.send(Command::SaveToOverlay {
+            request: 2,
             conversation: a.conv,
             path: "../escape.txt".into(),
             content: "x".into(),
         });
-        match a.r.until(|e| matches!(e, Event::Error(_))) {
-            Event::Error(m) => assert!(m.contains("outside"), "{m}"),
+        match a.r.until(|e| matches!(e, Event::OverlaySaveFailed { .. })) {
+            Event::OverlaySaveFailed { request, error, .. } => {
+                assert_eq!(request, 2);
+                assert!(error.contains("outside"), "{error}");
+            }
             _ => unreachable!(),
         }
-        // The agent hears about the edit at its next turn, once.
+        // The note reaches the agent with its next turn's input, not in a tool result.
         a.r.send(a.conv, "look again");
         match a.r.until(|e| matches!(e, Event::ToolFinished { .. })) {
             Event::ToolFinished { output, .. } => {
-                assert!(
-                    output
-                        .content
-                        .starts_with("The user edited a.txt in your pending changes"),
-                    "{output:?}"
-                );
+                assert!(!output.content.contains("The user edited"), "{output:?}");
                 assert!(output.content.contains("mango and kiwi"), "{output:?}");
             }
             _ => unreachable!(),
         }
         a.finish_with("read");
         assert!(a.overlay().take_rejections().is_empty());
+    }
+
+    /// The text of the last message in a request.
+    fn last_text(req: &ChatRequest) -> String {
+        req.messages.last().map(Message::text).unwrap_or_default()
+    }
+
+    #[test]
+    fn user_edit_note_arrives_with_next_turn_input() {
+        let mut a = agent_rig(
+            vec![say("first"), say("second"), say("third")],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "hi");
+        a.finish_with("first");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        a.r.handle.send(Command::SaveToOverlay {
+            request: 1,
+            conversation: a.conv,
+            path: "a.txt".into(),
+            content: "user text\n".into(),
+        });
+        a.r.until(|e| matches!(e, Event::OverlaySaved { .. }));
+        // A turn without tools still hears about it, in its very first request.
+        a.r.send(a.conv, "look again");
+        a.finish_with("second");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        {
+            let reqs = a.requests.lock().unwrap();
+            let t = last_text(&reqs[1]);
+            assert!(t.starts_with("look again"), "{t}");
+            assert!(
+                t.contains("The user edited a.txt in your pending changes"),
+                "{t}"
+            );
+        }
+        // Rejections travel the same way, once each.
+        a.r.handle.send(Command::RejectFile {
+            conversation: a.conv,
+            path: "a.txt".into(),
+        });
+        a.r.until(|e| matches!(e, Event::Changes { changes, .. } if changes.is_empty()));
+        a.r.send(a.conv, "and now");
+        a.finish_with("third");
+        let reqs = a.requests.lock().unwrap();
+        let t = last_text(&reqs[2]);
+        assert!(t.contains("The user rejected your changes to a.txt"), "{t}");
+        assert!(!t.contains("The user edited"), "delivered once: {t}");
+        assert!(
+            a.saved().messages[2].text().contains("The user edited"),
+            "the note stays in the history"
+        );
+    }
+
+    #[test]
+    fn retry_keeps_user_chat_view_save() {
+        let mut a = agent_rig(
+            vec![
+                call(
+                    "c1",
+                    "edit",
+                    serde_json::json!({"path": "a.txt", "old_string": "pineapple", "new_string": "mango"}),
+                ),
+                say("edited"),
+                say("retried"),
+            ],
+            50,
+            None,
+            1000,
+        );
+        a.r.send(a.conv, "change it");
+        a.finish_with("edited");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        a.r.handle.send(Command::SaveToOverlay {
+            request: 1,
+            conversation: a.conv,
+            path: "a.txt".into(),
+            content: "user version\n".into(),
+        });
+        a.r.until(|e| matches!(e, Event::OverlaySaved { .. }));
+        // Retry undoes the agent's turn, not the user's save.
+        a.r.handle.send(Command::Retry(a.conv));
+        a.finish_with("retried");
+        a.r.until(|e| matches!(e, Event::TurnState { active: false, .. }));
+        let ov = a.overlay();
+        assert_eq!(
+            ov.read(std::path::Path::new("a.txt")).unwrap(),
+            b"user version\n"
+        );
+        let changes = ov.changes();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].kind, ChangeKind::Modified);
+        let reqs = a.requests.lock().unwrap();
+        assert!(
+            last_text(reqs.last().unwrap()).contains("The user edited a.txt"),
+            "the note matches what's in the layer"
+        );
     }
 
     #[test]
@@ -2901,6 +3046,7 @@ mod tests {
             _ => unreachable!(),
         };
         a.r.handle.send(Command::SaveToOverlay {
+            request: 7,
             conversation: a.conv,
             path: "a.txt".into(),
             content: "hijack\n".into(),
@@ -2910,9 +3056,12 @@ mod tests {
                 !matches!(e, Event::OverlaySaved { .. }),
                 "saved during a turn"
             );
-            matches!(e, Event::Error(_))
+            matches!(e, Event::OverlaySaveFailed { .. })
         }) {
-            Event::Error(m) => assert!(m.contains("void is working in this chat"), "{m}"),
+            Event::OverlaySaveFailed { request, error, .. } => {
+                assert_eq!(request, 7);
+                assert!(error.contains("void is working in this chat"), "{error}");
+            }
             _ => unreachable!(),
         }
         let ov = a.overlay();
