@@ -499,6 +499,7 @@ mod tests {
             stream: None,
             sandbox: None,
             target_dir: t.tmp.path().join("target"),
+            on_wait: None,
         }
     }
 

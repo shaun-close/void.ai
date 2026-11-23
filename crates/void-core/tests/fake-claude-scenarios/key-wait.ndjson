@@ -1,0 +1,6 @@
+# Holds the sandbox for a moment with its key in the environment, echoes it, then dies.
+{"type":"system","subtype":"init","session_id":"sess-k","model":"claude-fake"}
+#sleep 1500
+#echo-env ANTHROPIC_API_KEY
+#stderr fatal: the fake crashed
+#exit 2

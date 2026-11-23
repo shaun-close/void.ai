@@ -431,6 +431,8 @@ enum ToolMsg {
         call_id: String,
         output: ToolOutput,
     },
+    /// bash is waiting for the sandbox (another chat's sandbox holds the cache lock).
+    Waiting,
     /// Every call of the round has a result.
     RoundDone,
 }
@@ -578,12 +580,18 @@ impl State {
         }
     }
 
+    /// A sandbox for the current settings. A replacement keeps the old one's cache lock, so it
+    /// still waits for whatever the old one has mounted.
     fn make_sandbox(&self) -> Sandbox {
-        Sandbox::new(
+        let sb = Sandbox::new(
             self.store.data_dir().to_path_buf(),
             self.home.clone(),
             self.config.sandbox.clone(),
-        )
+        );
+        match &self.sandbox {
+            Some(old) => sb.sharing_lock_with(old),
+            None => sb,
+        }
     }
 
     /// The conversation's overlay in `ws` (created when missing); None outside a folder.
@@ -757,6 +765,17 @@ impl State {
                     summary,
                 });
             }
+            ToolMsg::Waiting => {
+                let status = if self.claude.is_empty() {
+                    "Waiting for the sandbox — another chat's command is using it…"
+                } else {
+                    "Waiting for the sandbox — a Claude Code turn is using it…"
+                };
+                self.emit(Event::TurnStatus {
+                    conversation: id,
+                    status: status.into(),
+                });
+            }
             ToolMsg::Output { call_id, text } => {
                 self.emit(Event::ToolOutput {
                     conversation: id,
@@ -919,6 +938,12 @@ impl State {
                         stream: Some(stx),
                         sandbox: sandbox.clone(),
                         target_dir: target_dir.clone(),
+                        on_wait: Some(Arc::new({
+                            let tx = tx.clone();
+                            move || {
+                                let _ = tx.send(Msg::Tool(id, ToolMsg::Waiting));
+                            }
+                        })),
                     };
                     let out = t.run(a, ctx).await;
                     let _ = fwd.await;
@@ -1217,16 +1242,20 @@ impl State {
                 }
             }
             Command::ClearSandboxCaches => {
-                if let Some(sb) = &self.sandbox {
-                    let dir = sb.cache_layer_dir();
-                    match crate::fsutil::remove_tree(&dir) {
-                        Ok(()) => self.emit(Event::Info("Sandbox caches cleared.".into())),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A Claude Code turn may have the layers mounted (or be about to).
+                if !self.claude.is_empty() {
+                    self.emit(Event::Error(
+                        "Can't clear the sandbox caches while a Claude Code turn is running — \
+                         try again when it finishes."
+                            .into(),
+                    ));
+                } else if let Some(sb) = &self.sandbox {
+                    match sb.clear_cache_layers() {
+                        Ok(true) => self.emit(Event::Info("Sandbox caches cleared.".into())),
+                        Ok(false) => {
                             self.emit(Event::Info("Sandbox caches were already empty.".into()))
                         }
-                        Err(e) => self.emit(Event::Error(format!(
-                            "Couldn't clear the sandbox caches: {e}"
-                        ))),
+                        Err(e) => self.emit(Event::Error(e)),
                     }
                 }
             }

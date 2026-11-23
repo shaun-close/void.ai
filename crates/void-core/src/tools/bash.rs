@@ -59,8 +59,13 @@ impl Tool for Bash {
                 .timeout_secs
                 .unwrap_or(sandbox.settings().timeout_secs)
                 .clamp(1, 600);
+            let on_wait = ctx.on_wait.clone();
             let res = sandbox
-                .run(plan, ctx.cancel.clone(), ctx.stream.clone())
+                .run(plan, ctx.cancel.clone(), ctx.stream.clone(), move || {
+                    if let Some(f) = on_wait {
+                        f()
+                    }
+                })
                 .await;
             let ov = ctx.overlay.clone();
             let _ = tokio::task::spawn_blocking(move || ov.snapshot_bases()).await;
@@ -133,6 +138,7 @@ mod tests {
             stream: None,
             sandbox,
             target_dir: tmp.path().join("target"),
+            on_wait: None,
         };
         Some(T {
             _tmp: tmp,

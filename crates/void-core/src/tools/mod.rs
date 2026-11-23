@@ -61,6 +61,8 @@ pub struct ToolCtx {
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     /// The workspace's read-write CARGO_TARGET_DIR for sandboxed builds.
     pub target_dir: PathBuf,
+    /// Called when bash has to wait for the sandbox (another sandbox holds the cache lock).
+    pub on_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub trait Tool: Send + Sync {

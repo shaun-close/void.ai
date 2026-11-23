@@ -93,6 +93,67 @@ exec "{fake}" "$@"
     path
 }
 
+/// void's own model for the "local" profile (no network): answers "void reply", or for a user
+/// message `run bash: CMD` calls bash with CMD, then answers "void done".
+struct FakeVoid;
+
+impl void_core::backend::Backend for FakeVoid {
+    fn stream(&self, req: void_core::backend::ChatRequest) -> void_core::backend::EventStream {
+        use futures_util::StreamExt;
+        use void_core::backend::{StopReason, StreamEvent};
+        let last = req.messages.last();
+        let after_tool = last.is_some_and(|m| m.role == Role::Tool);
+        let text = last.map(Message::text).unwrap_or_default();
+        let events = match text.split_once("run bash: ") {
+            Some((_, cmd)) if !after_tool => vec![
+                StreamEvent::ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "command": cmd.trim() }).to_string(),
+                },
+                StreamEvent::Done(StopReason::ToolUse),
+            ],
+            _ => vec![
+                StreamEvent::TextDelta(
+                    if after_tool {
+                        "void done"
+                    } else {
+                        "void reply"
+                    }
+                    .into(),
+                ),
+                StreamEvent::Done(StopReason::EndTurn),
+            ],
+        };
+        futures_util::stream::iter(events.into_iter().map(Ok)).boxed()
+    }
+
+    fn list_models(
+        &self,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<Vec<String>, void_core::backend::BackendError>,
+    > {
+        Box::pin(async { Ok(vec!["fake".to_string()]) })
+    }
+}
+
+/// A profile served by [`FakeVoid`] (void's own agent loop and tools).
+fn local_profile() -> Profile {
+    Profile {
+        id: "local".into(),
+        name: "Local".into(),
+        kind: BackendKind::OpenAi,
+        base_url: "http://fake-void".into(),
+        api_key: ApiKeySource::None,
+        model: "fake".into(),
+        context_limit: 100_000,
+        max_output: 100,
+        extra_body: Default::default(),
+        command: None,
+    }
+}
+
 fn cc_profile(command: &str, api_key: ApiKeySource) -> Profile {
     Profile {
         id: "cc".into(),
@@ -140,7 +201,7 @@ fn rig_with(setup: Setup, workspace: bool) -> Option<Rig> {
     }
     let cfg = Config {
         active_profile: "cc".into(),
-        profiles: vec![cc_profile(&command, setup.api_key.clone())],
+        profiles: vec![cc_profile(&command, setup.api_key.clone()), local_profile()],
         sandbox,
         ..Config::default()
     };
@@ -165,7 +226,13 @@ fn rig_with(setup: Setup, workspace: bool) -> Option<Rig> {
         cfg_path,
         store.clone(),
         Arc::new(|| {}),
-        Arc::new(void_core::backend::make_backend),
+        Arc::new(|p: &Profile, key: Option<String>| {
+            if p.id == "local" {
+                Arc::new(FakeVoid) as Arc<dyn void_core::backend::Backend>
+            } else {
+                void_core::backend::make_backend(p, key)
+            }
+        }),
         EngineOptions {
             home: Some(home.clone()),
             claude_bridge: setup.bridge.clone(),
@@ -1518,4 +1585,155 @@ fn crash_finishes_running_tool() {
     assert_eq!(finished.len(), 1, "{finished:?}");
     assert_eq!(finished[0].0, "tu_8");
     assert!(finished[0].1.is_error);
+}
+
+/// Processes whose command line (world-readable) contains `needle`.
+fn cmdlines_with(needle: &str) -> Vec<String> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter(|e| {
+            fs::read(e.path().join("cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(needle))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The profile's key reaches `claude`'s environment but never a command line (bwrap's or
+/// anyone's), and never the chat (the fake echoes it on stdout and stderr, then crashes).
+#[test]
+fn api_key_never_on_a_command_line() {
+    let key = format!("sk-argv-canary-{}", std::process::id());
+    let Some(mut r) = rig(Setup {
+        pick: "sc=key-wait".into(),
+        api_key: ApiKeySource::Literal(key.clone()),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let c = r.new_conversation();
+    r.send(c, "go");
+    r.until(|e| matches!(e, Event::ClaudeInit { conversation, .. } if *conversation == c));
+    let seen = cmdlines_with(&key);
+    let error = match r.until(|e| matches!(e, Event::StreamFailed { .. })) {
+        Event::StreamFailed { error, .. } => error,
+        _ => unreachable!(),
+    };
+    r.turn_over(c);
+    assert_eq!(seen, Vec::<String>::new(), "the key is on a command line");
+    assert_eq!(r.fake("key-1"), key, "the key reaches claude's environment");
+    assert!(error.contains("fatal: the fake crashed"), "{error}");
+    assert!(!error.contains(&key), "{error}");
+    assert!(error.contains("[API key]"), "{error}");
+}
+
+fn allow(tool: &str) -> Rule {
+    Rule {
+        tool: tool.into(),
+        prefix: None,
+        action: Action::Allow,
+    }
+}
+
+/// void's own bash queued behind another chat's Claude Code turn (which holds the sandbox's
+/// cache lock) says why it waits, and Stop ends the wait: the command never runs.
+#[test]
+fn void_bash_waits_for_a_claude_turn_and_stops() {
+    let Some(mut r) = rig(Setup {
+        pick: "sc=slow".into(),
+        rules: Some(vec![allow("bash")]),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let a = r.new_conversation();
+    r.send(a, "hold the sandbox");
+    r.until(|e| matches!(e, Event::ClaudeInit { conversation, .. } if *conversation == a));
+    let b = r.new_conversation();
+    r.handle
+        .send(Command::SetConversationProfile(b, Some("local".into())));
+    r.send(b, "run bash: echo ran > ran.txt");
+    match r.until(|e| matches!(e, Event::TurnStatus { conversation, .. } if *conversation == b)) {
+        Event::TurnStatus { status, .. } => assert_eq!(
+            status,
+            "Waiting for the sandbox — a Claude Code turn is using it…"
+        ),
+        _ => unreachable!(),
+    }
+    let t = Instant::now();
+    r.handle.send(Command::Stop(b));
+    let output = match r
+        .until(|e| matches!(e, Event::ToolFinished { conversation, .. } if *conversation == b))
+    {
+        Event::ToolFinished { output, .. } => output,
+        _ => unreachable!(),
+    };
+    r.turn_over(b);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert!(output.is_error, "{output:?}");
+    assert!(output.content.starts_with("stopped"), "{output:?}");
+    let w = r.store.workspace_for(&r.ws).unwrap();
+    assert!(
+        !r.store
+            .overlay_dir(&w.id, &b)
+            .join("upper/ran.txt")
+            .exists(),
+        "the command never ran"
+    );
+    r.handle.send(Command::Stop(a));
+    r.turn_over(a);
+}
+
+/// While a Claude Code turn has the sandbox (its cache layers mounted), clearing the caches is
+/// refused, and saving new sandbox settings keeps the same lock: another chat's turn still
+/// waits for the running one.
+#[test]
+fn sandbox_caches_stay_while_claude_runs() {
+    let Some(mut r) = rig(Setup {
+        pick: r#"if [ "$n" = 1 ]; then sc=slow; else sc=text-turn; fi"#.into(),
+        ..Setup::default()
+    }) else {
+        return;
+    };
+    let a = r.new_conversation();
+    r.send(a, "hold the sandbox");
+    r.until(|e| matches!(e, Event::ClaudeInit { conversation, .. } if *conversation == a));
+    let layers = r.store.data_dir().join("cache-overlay");
+    assert!(layers.is_dir());
+    r.handle.send(Command::ClearSandboxCaches);
+    match r.until(|e| matches!(e, Event::Error(_) | Event::Info(_))) {
+        Event::Error(e) => assert!(e.contains("Claude Code turn"), "{e}"),
+        other => panic!("cleared while mounted: {other:?}"),
+    }
+    assert!(layers.is_dir(), "the mounted layers are still there");
+    let path = r.tmp.path().join("config/config.toml");
+    let (mut cfg, _) = void_core::config::load_config(&path);
+    cfg.sandbox.timeout_secs += 1;
+    r.handle.send(Command::SaveConfig(cfg));
+    r.until(|e| matches!(e, Event::ConfigSaved));
+    let b = r.new_conversation();
+    r.send(b, "second");
+    match r.until(|e| matches!(e, Event::TurnStatus { conversation, .. } if *conversation == b)) {
+        Event::TurnStatus { status, .. } => {
+            assert!(status.to_lowercase().contains("waiting"), "{status}")
+        }
+        _ => unreachable!(),
+    }
+    r.handle.send(Command::Stop(a));
+    r.turn_over(a);
+    r.until(|e| matches!(e, Event::StreamFinished { conversation, .. } if *conversation == b));
+    r.turn_over(b);
+    r.handle.send(Command::ClearSandboxCaches);
+    match r.until(|e| matches!(e, Event::Error(_) | Event::Info(_))) {
+        Event::Info(i) => assert!(i.contains("cleared"), "{i}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(!layers.exists());
 }

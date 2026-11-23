@@ -60,7 +60,9 @@ impl Rig {
         };
         fs::create_dir_all(&plan.upper).unwrap();
         fs::create_dir_all(&plan.work).unwrap();
-        self.sb.run(plan, CancellationToken::new(), None).await
+        self.sb
+            .run(plan, CancellationToken::new(), None, || {})
+            .await
     }
 }
 
@@ -571,7 +573,8 @@ async fn spawn_holds_cache_lock() {
         command: "echo ran".into(),
         timeout_secs: None,
     };
-    let run = tokio::spawn(async move { sb.run(plan, CancellationToken::new(), None).await });
+    let run =
+        tokio::spawn(async move { sb.run(plan, CancellationToken::new(), None, || {}).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let waited = std::sync::Arc::new(AtomicBool::new(false));
     let (sb, plan, w) = (r.sb.clone(), r.plan(&["true"], true), waited.clone());
@@ -599,6 +602,159 @@ async fn spawn_holds_cache_lock() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// Host processes whose command line contains `needle` anywhere (pids).
+fn cmdlines_with(needle: &str) -> Vec<String> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter(|e| {
+            fs::read(e.path().join("cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(needle))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The environment a spawn sets (the API key) never appears on a command line (bwrap's or
+/// anyone's: /proc/<pid>/cmdline is world-readable), yet reaches the process.
+#[tokio::test]
+async fn spawn_env_never_on_a_command_line() {
+    let Some(r) = home_rig(&[]).await else { return };
+    let canary = format!("sk-canary-{}-argv", std::process::id());
+    let out = r.home.join(".claude/key");
+    let mut plan = r.plan(
+        &[
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            r#"printf %s "$ANTHROPIC_API_KEY" > "$HOME/.claude/key"; exec sleep 5"#,
+        ],
+        true,
+    );
+    plan.env = vec![("ANTHROPIC_API_KEY".into(), canary.clone().into())];
+    let mut s = r.sb.spawn(plan, || {}).await.unwrap();
+    let t = Instant::now();
+    while fs::read_to_string(&out).unwrap_or_default().is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(10), "never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = cmdlines_with(&canary);
+    s.kill().await.unwrap();
+    assert_eq!(seen, Vec::<String>::new(), "the key is on a command line");
+    assert_eq!(fs::read_to_string(&out).unwrap(), canary);
+}
+
+/// A `run`'s RunPlan in the HomeRig layout (target dir under void.ai's hidden data dir).
+fn run_plan(r: &HomeRig, chat: &str, command: &str) -> RunPlan {
+    RunPlan {
+        workspace: r.ws.clone(),
+        upper: r.data.join(format!("chats/{chat}/upper")),
+        work: r.data.join(format!("chats/{chat}/work")),
+        target_dir: r.data.join("ws/sandbox-target"),
+        command: command.into(),
+        timeout_secs: None,
+    }
+}
+
+/// void's own agent builds into its CARGO_TARGET_DIR, which lives under void.ai's data dir
+/// (hidden): the bind must sit on top of the hiding.
+#[tokio::test]
+async fn run_can_write_its_target_dir() {
+    let Some(r) = home_rig(&[]).await else { return };
+    let res =
+        r.sb.run(
+            run_plan(
+                &r,
+                "c1",
+                r#"echo built > "$CARGO_TARGET_DIR/out" && echo ok"#,
+            ),
+            CancellationToken::new(),
+            None,
+            || {},
+        )
+        .await;
+    assert_eq!(res.exit, Some(0), "{}", res.output);
+    assert_eq!(
+        fs::read_to_string(r.data.join("ws/sandbox-target/out")).unwrap(),
+        "built\n"
+    );
+}
+
+/// Back-to-back commands mount the same cache layer: each waits until the previous sandbox is
+/// really gone (no EBUSY), and so does a spawn right after a command.
+#[tokio::test]
+async fn back_to_back_runs_share_the_cache_layer() {
+    let Some(r) = home_rig(&["~/.cache/pip"]).await else {
+        return;
+    };
+    for i in 0..30 {
+        let res =
+            r.sb.run(
+                run_plan(&r, "c1", "(sleep 0.05 &); echo ran"),
+                CancellationToken::new(),
+                None,
+                || {},
+            )
+            .await;
+        assert_eq!(res.exit, Some(0), "run {i}: {}", res.output);
+        assert!(res.output.contains("ran"), "run {i}: {}", res.output);
+    }
+    let res =
+        r.sb.run(
+            run_plan(&r, "c1", "echo ran"),
+            CancellationToken::new(),
+            None,
+            || {},
+        )
+        .await;
+    assert_eq!(res.exit, Some(0), "{}", res.output);
+    let (code, out) = r.script("echo spawned", true).await;
+    assert_eq!(code, Some(0), "{out}");
+}
+
+/// A command queued behind a long-lived sandbox says so (`on_wait`) and Stop ends the wait:
+/// it never starts, and the lock holder is untouched.
+#[tokio::test]
+async fn run_waiting_for_the_lock_reports_and_cancels() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(r) = home_rig(&["~/.cache/pip"]).await else {
+        return;
+    };
+    let mut first = r.sb.spawn(r.plan(&["cat"], true), || {}).await.unwrap();
+    let waited = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel = CancellationToken::new();
+    let (sb, plan, w, c) = (
+        r.sb.clone(),
+        run_plan(&r, "c2", "echo ran > started"),
+        waited.clone(),
+        cancel.clone(),
+    );
+    let run = tokio::spawn(async move {
+        sb.run(plan, c, None, move || w.store(true, Ordering::SeqCst))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waited.load(Ordering::SeqCst), "a waiting run says so");
+    assert!(!run.is_finished());
+    cancel.cancel();
+    let res = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("Stop ends the wait")
+        .unwrap();
+    assert!(res.cancelled, "{res:?}");
+    assert_eq!(res.exit, None);
+    assert!(!r.data.join("chats/c2/upper/started").exists());
+    drop(first.child.stdin.take());
+    assert!(first.wait().await.unwrap().success());
 }
 
 /// `procs_with` counts the process running a command, not the sandbox whose script merely

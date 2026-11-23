@@ -169,7 +169,8 @@ pub struct SpawnPlan {
     /// `None` for Scratch: a read-only view, plus `rw_binds` and `cwd` bound writable.
     pub overlay: Option<OverlayMounts>,
     pub argv: Vec<OsString>,
-    /// Set on top of the scrubbed environment.
+    /// Set on top of the scrubbed environment (passed to bwrap through a memfd, never on a
+    /// command line, so it may carry secrets such as an API key).
     pub env: Vec<(OsString, OsString)>,
     pub rw_binds: Vec<RwBind>,
     /// Paths dropped from the effective hidden list for this process only.
@@ -272,11 +273,23 @@ fn current_uid() -> u32 {
         .unwrap_or(0)
 }
 
-/// A bwrap argument list under construction.
+/// A bwrap argument list under construction: bwrap's options, then `--` and the command
+/// (from index `.1`, set by `command_follows`).
 #[derive(Default)]
-struct Args(Vec<OsString>);
+struct Args(Vec<OsString>, usize);
 
 impl Args {
+    /// `--`: everything pushed after it is the command.
+    fn command_follows(&mut self) {
+        self.0.push("--".into());
+        self.1 = self.0.len();
+    }
+
+    /// (bwrap's options, the command).
+    fn split(&self) -> (&[OsString], &[OsString]) {
+        (&self.0[..self.1.saturating_sub(1)], &self.0[self.1..])
+    }
+
     fn push(&mut self, xs: &[&std::ffi::OsStr]) {
         self.0.extend(xs.iter().map(|x| x.to_os_string()));
     }
@@ -384,6 +397,30 @@ impl Sandbox {
     /// Where cache layers live (for "Clear sandbox caches").
     pub fn cache_layer_dir(&self) -> PathBuf {
         self.data_dir.join("cache-overlay")
+    }
+
+    /// This sandbox, taking turns with `other` (its replacement after a settings change): a
+    /// command or process `other` started keeps its cache layers to itself until it's gone.
+    pub fn sharing_lock_with(mut self, other: &Sandbox) -> Sandbox {
+        self.lock = other.lock.clone();
+        self
+    }
+
+    /// Delete the cache layers, holding the cache lock so nothing mounts them meanwhile.
+    /// `Ok(false)` when there were none; an error (nothing deleted) while a sandbox uses them.
+    pub fn clear_cache_layers(&self) -> Result<bool, String> {
+        let Ok(_turn) = self.lock.try_lock() else {
+            return Err(
+                "Can't clear the sandbox caches while a command is using them — try \
+                        again when it finishes."
+                    .into(),
+            );
+        };
+        match crate::fsutil::remove_tree(&self.cache_layer_dir()) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("Couldn't clear the sandbox caches: {e}")),
+        }
     }
 
     /// Whether bwrap works here and Landlock can be applied (checked once, then remembered).
@@ -539,18 +576,24 @@ impl Sandbox {
 
     /// The full bwrap argument list for one command.
     pub fn bwrap_args(&self, plan: &RunPlan) -> Vec<OsString> {
+        self.run_args(plan).0
+    }
+
+    fn run_args(&self, plan: &RunPlan) -> Args {
         let mut a = Args::default();
         self.args_base(&mut a);
         let caches = self.caches();
         self.args_caches(&mut a, &caches);
         self.args_overlay(&mut a, &plan.workspace, &plan.upper, &plan.work);
+        // Hidden paths next, so they also cover anything inside the workspace or caches.
+        self.args_hidden(&mut a, &[]);
+        // Then void.ai's own writable target dir, which lives under its hidden data dir.
         let target = plan.target_dir.as_os_str();
         a.push(&["--bind".as_ref(), target, target]);
-        // Hidden paths last, so they also cover anything inside the workspace or caches.
-        self.args_hidden(&mut a, &[]);
         self.args_env(&mut a, Some(target));
         let ws = plan.workspace.as_os_str();
-        a.push(&["--chdir".as_ref(), ws, "--".as_ref()]);
+        a.push(&["--chdir".as_ref(), ws]);
+        a.command_follows();
         let mut writes: Vec<&std::ffi::OsStr> = vec![ws, "/tmp".as_ref(), "/dev".as_ref(), target];
         writes.extend(caches.iter().map(|(c, _)| c.as_os_str()));
         self.args_helper(&mut a, &writes);
@@ -562,7 +605,7 @@ impl Sandbox {
             "-c".as_ref(),
             plan.command.as_ref(),
         ]);
-        a.0
+        a
     }
 
     /// The bwrap argument list for a long-lived process (see [`SpawnPlan`]). Mount order, from
@@ -573,6 +616,10 @@ impl Sandbox {
     /// Fails (instead of quietly dropping a mount) when the home layer or an `rw_binds` target
     /// can't be resolved, or when the workspace or Scratch cwd lies inside an `rw_binds` path.
     pub fn spawn_args(&self, plan: &SpawnPlan) -> Result<Vec<OsString>, String> {
+        self.spawn_parts(plan).map(|a| a.0)
+    }
+
+    fn spawn_parts(&self, plan: &SpawnPlan) -> Result<Args, String> {
         let home = self.check_spawn(plan)?;
         let binds = plan
             .rw_binds
@@ -611,7 +658,8 @@ impl Sandbox {
         for (k, v) in &plan.env {
             a.push(&["--setenv".as_ref(), k.as_os_str(), v.as_os_str()]);
         }
-        a.push(&["--chdir".as_ref(), cwd, "--".as_ref()]);
+        a.push(&["--chdir".as_ref(), cwd]);
+        a.command_follows();
         let mut writes: Vec<&std::ffi::OsStr> = vec!["/tmp".as_ref(), "/dev".as_ref()];
         match &plan.overlay {
             Some(o) => writes.extend([o.workspace.as_os_str(), o.target_dir.as_os_str()]),
@@ -622,7 +670,7 @@ impl Sandbox {
         writes.extend(binds.iter().map(|b| b.as_os_str()));
         self.args_helper(&mut a, &writes);
         a.extend(&plan.argv);
-        Ok(a.0)
+        Ok(a)
     }
 
     /// The checks `spawn` makes before touching anything; returns the canonical home.
@@ -707,25 +755,14 @@ impl Sandbox {
         prepare_rw_binds(&plan.rw_binds)?;
         let (info_r, info_w) =
             cloexec_pipe().map_err(|e| format!("can't start bubblewrap: {e}"))?;
-        let w = info_w.as_raw_fd();
-        let mut cmd = tokio::process::Command::new(bwrap);
-        cmd.arg("--info-fd")
-            .arg(w.to_string())
-            .args(self.spawn_args(&plan)?)
-            .stdin(Stdio::piped())
+        let args = self.spawn_parts(&plan)?;
+        let (mut cmd, _args_fd) = bwrap_command(bwrap, &args, info_w.as_raw_fd())
+            .map_err(|e| format!("can't start bubblewrap: {e}"))?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        // SAFETY: only fcntl(2) between fork and exec, so bwrap inherits the info fd.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::fcntl(w, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         let child = cmd
             .spawn()
             .map_err(|e| format!("can't start bubblewrap: {e}"))?;
@@ -735,12 +772,16 @@ impl Sandbox {
         Ok(Spawned { child, gone })
     }
 
-    /// Run one command; output streams to `stream` as it arrives.
+    /// Run one command; output streams to `stream` as it arrives. Like [`Sandbox::spawn`], it
+    /// holds the cache lock (when there are caches) until the sandbox is really gone; when the
+    /// lock is taken, `on_wait` is called once before waiting for it, and `cancel` ends the
+    /// wait (the command never starts).
     pub async fn run(
         &self,
         plan: RunPlan,
         cancel: CancellationToken,
         stream: Option<UnboundedSender<String>>,
+        on_wait: impl FnOnce() + Send,
     ) -> ExecResult {
         let fail = |msg: String| ExecResult {
             exit: None,
@@ -753,10 +794,25 @@ impl Sandbox {
             return fail("bubblewrap (bwrap) isn't installed".into());
         };
         let caches = self.caches();
-        let _turn = if caches.is_empty() {
+        let lock = if caches.is_empty() {
             None
         } else {
-            Some(self.lock.lock().await)
+            Some(match self.lock.clone().try_lock_owned() {
+                Ok(g) => g,
+                Err(_) => {
+                    on_wait();
+                    tokio::select! {
+                        g = self.lock.clone().lock_owned() => g,
+                        _ = cancel.cancelled() => return ExecResult {
+                            exit: None,
+                            output: "it never started: it was waiting for the sandbox".into(),
+                            timed_out: false,
+                            cancelled: true,
+                            cut_bytes: 0,
+                        },
+                    }
+                }
+            })
         };
         for dir in [&plan.target_dir, &plan.upper, &plan.work] {
             if let Err(e) = std::fs::create_dir_all(dir) {
@@ -767,18 +823,30 @@ impl Sandbox {
             let _ = std::fs::create_dir_all(layer.join("upper"));
             let _ = std::fs::create_dir_all(layer.join("work"));
         }
-        let mut child = match tokio::process::Command::new(bwrap)
-            .args(self.bwrap_args(&plan))
+        let (info_r, info_w) = match cloexec_pipe() {
+            Ok(p) => p,
+            Err(e) => return fail(format!("can't start bubblewrap: {e}")),
+        };
+        let (mut cmd, _args_fd) =
+            match bwrap_command(bwrap, &self.run_args(&plan), info_w.as_raw_fd()) {
+                Ok(c) => c,
+                Err(e) => return fail(format!("can't start bubblewrap: {e}")),
+            };
+        let spawned = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
-            .spawn()
-        {
+            .spawn();
+        drop(info_w);
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => return fail(format!("can't start bubblewrap: {e}")),
         };
+        // The lock goes once the sandbox is torn down (see [`Spawned`]), not at bwrap's exit.
+        let (gone_tx, mut gone) = tokio::sync::watch::channel(false);
+        watch_teardown(info_r, lock, gone_tx);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         if let Some(out) = child.stdout.take() {
             pump(out, tx.clone());
@@ -827,6 +895,7 @@ impl Sandbox {
             }
         }
         let status = child.wait().await.ok();
+        let _ = gone.wait_for(|g| *g).await;
         while let Ok(c) = rx.try_recv() {
             collect(c, &mut out, &mut dropped);
         }
@@ -866,6 +935,64 @@ pub fn prepare_rw_binds(binds: &[RwBind]) -> Result<(), String> {
         res.map_err(|e| format!("can't prepare {}: {e}", b.path().display()))?;
     }
     Ok(())
+}
+
+/// A bwrap command whose options (`--info-fd info` first, then those in `args`) are read from a
+/// memfd (`--args FD`, NUL-separated) instead of its command line, which is world-readable
+/// (/proc/<pid>/cmdline) while the options carry `--setenv` values such as an API key (and, for
+/// a big home layer, could outgrow ARG_MAX). Only `--` and the command (which bwrap requires on
+/// its real command line) follow. Keep the returned fd until the command has spawned.
+fn bwrap_command(
+    bwrap: &Path,
+    args: &Args,
+    info: std::os::fd::RawFd,
+) -> std::io::Result<(tokio::process::Command, OwnedFd)> {
+    use std::io::{Seek, Write};
+    let (options, command) = args.split();
+    let info_s = info.to_string();
+    let mut data = Vec::new();
+    let all = ["--info-fd".as_ref(), info_s.as_ref()]
+        .into_iter()
+        .chain(options.iter().map(OsString::as_os_str));
+    for a in all {
+        let b = a.as_encoded_bytes();
+        if b.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an argument contains a NUL byte",
+            ));
+        }
+        data.extend_from_slice(b);
+        data.push(0);
+    }
+    // SAFETY: memfd_create(2) with a static name; the fd is owned exactly once below.
+    let fd = unsafe { libc::memfd_create(c"void-bwrap-args".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fresh fd from memfd_create.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    file.write_all(&data)?;
+    file.rewind()?;
+    let fd = OwnedFd::from(file);
+    let raw = fd.as_raw_fd();
+    let mut cmd = tokio::process::Command::new(bwrap);
+    cmd.arg("--args")
+        .arg(raw.to_string())
+        .arg("--")
+        .args(command);
+    // SAFETY: only fcntl(2) between fork and exec, so bwrap inherits both fds.
+    unsafe {
+        cmd.pre_exec(move || {
+            for f in [raw, info] {
+                if libc::fcntl(f, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok((cmd, fd))
 }
 
 fn cloexec_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
@@ -1380,7 +1507,12 @@ mod tests {
         .unwrap();
         assert!(git > ovl);
         assert!(pos(&a, &["--overlay-src", &p(&home.join(".cargo/registry"))]).is_some());
-        assert!(pos(&a, &["--bind", &p(&plan.target_dir), &p(&plan.target_dir)]).is_some());
+        let target = pos(&a, &["--bind", &p(&plan.target_dir), &p(&plan.target_dir)]).unwrap();
+        let hidden = pos(&a, &["--tmpfs", &p(&home.join(".ssh"))]).unwrap();
+        assert!(
+            target > hidden,
+            "the target dir (under void's hidden data dir) is bound over the hiding"
+        );
         assert!(!a.iter().any(|x| x == "--unshare-net"));
         assert!(a.iter().any(|x| x == "--clearenv"));
         assert!(!a.iter().any(|x| x.contains("sk-void-test-secret")));
