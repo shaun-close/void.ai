@@ -942,22 +942,33 @@ impl Overlay {
         if !cp.join("upper").exists() {
             return Ok(());
         }
-        // The file as saved, with its folders (opaque where the layer's are).
+        let list_path = cp.join("whiteouts.json");
+        let list: Vec<String> = fs::read(&list_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        // The file as saved, with its folders as the checkpoint had them: a folder the
+        // checkpoint had deleted (whiteout) or replaced (a file in its place) comes back
+        // opaque, so the workspace's contents stay hidden there; any other stays as it was.
+        // Never opaque because the current layer's is: that's the turn's own replacement.
         let comps = components(rel);
-        let (mut up, mut cur) = (self.upper(), cp.join("upper"));
+        let (mut cur, mut sub) = (cp.join("upper"), PathBuf::new());
         for c in &comps[..comps.len().saturating_sub(1)] {
-            up.push(c);
             cur.push(c);
+            sub.push(c);
             match fs::symlink_metadata(&cur) {
                 Ok(m) if m.is_dir() => {}
                 Ok(_) => {
                     fs::remove_file(&cur)?;
                     fs::create_dir(&cur)?;
+                    xattr::set(&cur, OPAQUE, b"y")?;
                 }
-                Err(_) => fs::create_dir(&cur)?,
-            }
-            if is_opaque(&up) {
-                xattr::set(&cur, OPAQUE, b"y")?;
+                Err(_) => {
+                    fs::create_dir(&cur)?;
+                    if list.iter().any(|w| Path::new(w) == sub) {
+                        xattr::set(&cur, OPAQUE, b"y")?;
+                    }
+                }
             }
         }
         let dst = cp.join("upper").join(rel);
@@ -968,11 +979,6 @@ impl Overlay {
         }
         fs::copy(self.upper().join(rel), &dst)?;
         // Whiteouts the checkpoint recorded on the path or its folders no longer apply.
-        let list_path = cp.join("whiteouts.json");
-        let list: Vec<String> = fs::read(&list_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
         let kept: Vec<String> = list.into_iter().filter(|w| !rel.starts_with(w)).collect();
         fs::write(
             &list_path,
@@ -1535,6 +1541,47 @@ mod tests {
                 (PathBuf::from("sub/u"), ChangeKind::Added),
             ]
         );
+    }
+
+    /// The agent replaced a folder during its turn (opaque in the upper layer), and the user
+    /// saved a file in it: the checkpoint gets the user's file, not the replacement, so a
+    /// Retry brings the folder's other files back.
+    #[test]
+    fn user_save_in_a_replaced_folder_keeps_the_folder() {
+        let t = setup();
+        fs::create_dir_all(t.ws.join("dir")).unwrap();
+        fs::write(t.ws.join("dir/x"), "lower").unwrap();
+        t.ov.checkpoint().unwrap();
+        // What `rm -rf dir; mkdir dir; echo > dir/new` leaves in a real upper layer.
+        let up = t.ov.upper().join("dir");
+        fs::create_dir_all(&up).unwrap();
+        xattr::set(&up, OPAQUE, b"y").unwrap();
+        fs::write(up.join("new"), "agent").unwrap();
+        assert!(matches!(t.ov.resolve(Path::new("dir/x")), Entry::Missing));
+        t.ov.write(Path::new("dir/u"), b"user").unwrap();
+        t.ov.keep_in_checkpoint(Path::new("dir/u")).unwrap();
+        assert!(t.ov.restore_checkpoint().unwrap());
+        assert_eq!(rd(&t, "dir/x"), "lower");
+        assert_eq!(rd(&t, "dir/u"), "user");
+        assert!(matches!(t.ov.resolve(Path::new("dir/new")), Entry::Missing));
+    }
+
+    /// A folder the checkpoint had deleted stays deleted around the user's save in it.
+    #[test]
+    fn user_save_in_a_deleted_folder_keeps_it_deleted() {
+        if !have_bwrap() {
+            return;
+        }
+        let t = setup();
+        fs::create_dir_all(t.ws.join("dir")).unwrap();
+        fs::write(t.ws.join("dir/x"), "lower").unwrap();
+        bwrap_exec(&t, "rm -rf dir");
+        t.ov.checkpoint().unwrap();
+        t.ov.write(Path::new("dir/u"), b"user").unwrap();
+        t.ov.keep_in_checkpoint(Path::new("dir/u")).unwrap();
+        assert!(t.ov.restore_checkpoint().unwrap());
+        assert!(matches!(t.ov.resolve(Path::new("dir/x")), Entry::Missing));
+        assert_eq!(rd(&t, "dir/u"), "user");
     }
 
     #[test]
