@@ -20,6 +20,7 @@ impl VoidApp {
     /// gets them all, Shift+letter included). It reads them here rather than in
     /// `raw_input_hook` so the headless tests, which don't run that hook, go the same way.
     pub(super) fn palette_keys(&mut self, ctx: &egui::Context) {
+        // egui's RawInput has no per-event time: every event in a frame shares this `Instant`.
         let now = Instant::now();
         let shift = &mut self.shift;
         let tapped = ctx.input(|i| {

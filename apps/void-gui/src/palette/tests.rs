@@ -619,3 +619,48 @@ fn palette_files_follow_the_watcher() {
     h.step();
     assert_eq!(editor_paths(h.state()), vec![new]);
 }
+
+/// Recent files are files on disk: a chat-view tab is listed as that open tab (picking it
+/// focuses it), never as a recent file that would reopen as the Disk view.
+#[test]
+fn palette_recent_skips_chat_views() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut h = harness(tmp.path());
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "// a\n").unwrap();
+    std::fs::write(&b, "// b\n").unwrap();
+    h.state_mut().open_editor(a.clone(), EditorView::Disk, None);
+    h.step();
+    h.step();
+    let chat = EditorView::Chat(void_core::model::ConversationId::new());
+    h.state_mut().open_editor(b.clone(), chat.clone(), None);
+    h.step();
+    h.step();
+    let tabs = |app: &VoidApp| -> Vec<(PathBuf, EditorView)> {
+        app.dock
+            .iter_all_tabs()
+            .filter_map(|(_, t)| match t {
+                Tab::Editor { path, view, .. } => Some((path.clone(), view.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let before = tabs(h.state());
+    assert_eq!(before.len(), 2);
+    assert_eq!(h.state().palette.recent.paths(), std::slice::from_ref(&a));
+    shift_shift(&mut h);
+    assert!(
+        h.query_by_label("b.rs").is_none(),
+        "no recent entry for b.rs"
+    );
+    assert!(
+        h.query_by_label("b.rs · chat").is_some(),
+        "the chat tab is listed"
+    );
+    // The first row (the newest recent file, a.rs) opens nothing new.
+    h.key_press(Key::Enter);
+    h.step();
+    h.step();
+    assert_eq!(tabs(h.state()), before);
+}

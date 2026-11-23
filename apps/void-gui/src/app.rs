@@ -892,8 +892,11 @@ impl VoidApp {
             _ => None,
         };
         if focused_editor.is_some() {
+            // Recent files are files on disk: a chat's version stays an open tab in the
+            // palette (reopening it from a path would land on the Disk view).
             if focused_editor != self.last_editor
-                && let Some((path, _)) = focused_editor.and_then(|id| self.editor_key(id))
+                && let Some((path, EditorView::Disk)) =
+                    focused_editor.and_then(|id| self.editor_key(id))
             {
                 self.palette.recent.touch(&path);
             }

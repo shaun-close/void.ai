@@ -13,8 +13,8 @@ pub const WINDOW: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Default)]
 pub struct DoubleShift {
-    /// Shift is down (as the last modifier report said).
-    shift: bool,
+    /// The modifiers the last report said were down.
+    mods: egui::Modifiers,
     /// When this Shift press started, while it is still a clean tap (nothing else pressed).
     press: Option<Instant>,
     /// When the last clean tap ended.
@@ -23,29 +23,37 @@ pub struct DoubleShift {
 
 impl DoubleShift {
     /// Feed one input event that happened at `now`. True on the second Shift release of a
-    /// double tap with no other key, button or modifier in between.
+    /// double tap with no other key, button, scroll or modifier in between.
     pub fn feed(&mut self, event: &Event, now: Instant) -> bool {
         match event {
             Event::ModifiersChanged(m) => {
+                let was = std::mem::replace(&mut self.mods, *m);
                 let others = m.alt || m.ctrl || m.command || m.mac_cmd;
-                let was = std::mem::replace(&mut self.shift, m.shift);
-                if others {
+                if others || *m == was {
+                    // A report that changes nothing egui shows means a modifier egui doesn't
+                    // show changed: on Linux egui-winit drops Super, but winit still reports
+                    // it (X11 when its full modifier state changes, Wayland on each compositor
+                    // modifiers event). That brackets a window manager's Super+Shift+<key>,
+                    // whose key the compositor keeps, so without this two such chords would
+                    // look like Shift, Shift. A plain Shift tap only ever changes Shift.
                     self.spoil();
-                } else if m.shift && !was {
+                } else if m.shift && !was.shift {
                     self.press = Some(now);
-                } else if !m.shift && was {
+                } else if !m.shift && was.shift {
                     return self.released(now);
                 }
                 false
             }
-            // Typing (Shift+letter included), shortcuts, clicks and losing the window all end
-            // a double tap.
+            // Typing (Shift+letter included), input-method composing, shortcuts, clicks,
+            // scrolling (Shift+wheel scrolls sideways) and losing the window all end a tap.
             Event::Key { .. }
             | Event::Text(_)
+            | Event::Ime(_)
             | Event::Copy
             | Event::Cut
             | Event::Paste(_)
             | Event::PointerButton { pressed: true, .. }
+            | Event::MouseWheel { .. }
             | Event::WindowFocused(_) => {
                 self.spoil();
                 false
@@ -205,15 +213,78 @@ mod tests {
         ];
         assert_eq!(run(&many), vec![120, 280]);
 
-        // A repeated "still Shift" report doesn't count as a press.
-        let repeated = [
+        // Shift+wheel (horizontal scroll) twice is scrolling, not a double tap.
+        let wheel = || Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::SHIFT,
+            source: egui::MouseWheelSource::Wheel,
+        };
+        let shift_scroll = [
             (0, shift(true)),
-            (20, shift(true)),
+            (40, wheel()),
+            (80, shift(false)),
+            (150, shift(true)),
+            (190, wheel()),
+            (230, shift(false)),
+        ];
+        assert_eq!(run(&shift_scroll), Vec::<u64>::new());
+
+        // Composing text (an input method) between taps spoils them too.
+        let ime = [
+            (0, shift(true)),
             (60, shift(false)),
-            (70, shift(false)),
+            (
+                100,
+                Event::Ime(egui::ImeEvent::Preedit {
+                    text: "a".into(),
+                    active_range_chars: None,
+                }),
+            ),
             (150, shift(true)),
             (210, shift(false)),
         ];
-        assert_eq!(run(&repeated), vec![210]);
+        assert_eq!(run(&ime), Vec::<u64>::new());
+    }
+
+    /// Super+Shift+<key> chords (a tiling window manager's): egui drops Super on Linux and the
+    /// compositor keeps the key, so void sees only Shift going down and up, bracketed by
+    /// modifier reports that change nothing egui shows (Super going down / up). Those reports
+    /// end a tap, so two chords in a row don't open the palette.
+    #[test]
+    fn super_shift_chords_are_not_taps() {
+        let none = || Event::ModifiersChanged(Modifiers::NONE);
+        let chord = |t: u64| {
+            vec![
+                (t, none()),            // Super down: nothing egui shows changes
+                (t + 30, shift(true)),  // Shift down; the key goes to the compositor
+                (t + 90, shift(false)), // Shift up
+                (t + 120, none()),      // Super up
+            ]
+        };
+        let two: Vec<_> = chord(0).into_iter().chain(chord(200)).collect();
+        assert_eq!(run(&two), Vec::<u64>::new());
+
+        // Released in the other order (Super first, while Shift is still down).
+        let other_order = |t: u64| {
+            vec![
+                (t, none()),
+                (t + 30, shift(true)),
+                (t + 60, shift(true)), // Super up while Shift is held
+                (t + 90, shift(false)),
+            ]
+        };
+        let two: Vec<_> = other_order(0).into_iter().chain(other_order(200)).collect();
+        assert_eq!(run(&two), Vec::<u64>::new());
+
+        // Plain taps still fire.
+        let tap_tap = [
+            (0, shift(true)),
+            (60, shift(false)),
+            (150, shift(true)),
+            (210, shift(false)),
+        ];
+        assert_eq!(run(&tap_tap), vec![210]);
     }
 }
