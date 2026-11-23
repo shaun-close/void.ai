@@ -177,6 +177,12 @@ impl Store {
         self.workspace_dir(ws).join("permissions.json")
     }
 
+    /// The workspace's run configs and environment profiles: `(runs.toml, env.toml)`.
+    pub fn runner_paths(&self, ws: &WorkspaceId) -> (PathBuf, PathBuf) {
+        let dir = self.workspace_dir(ws);
+        (dir.join("runs.toml"), dir.join("env.toml"))
+    }
+
     /// Where a conversation's overlay lives.
     pub fn overlay_dir(&self, ws: &WorkspaceId, id: &ConversationId) -> PathBuf {
         self.workspace_dir(ws).join("overlays").join(id.to_string())

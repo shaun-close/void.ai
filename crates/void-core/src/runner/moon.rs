@@ -59,7 +59,7 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STDERR_CAP: usize = 500;
 
 /// PATH, then `~/.proto/shims/moon`, then `~/.proto/bin/moon`.
-fn resolve_moon() -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_moon() -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let home = directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())

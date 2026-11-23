@@ -29,12 +29,15 @@ use crate::model::{
 };
 use crate::overlay::{Change, Hunk, Overlay};
 use crate::permissions::{Action, ApprovalRequest, Decision, Permissions};
+use crate::runner::run::RunUpdate;
+use crate::runner::{Envs, MoonTask, RunId, Runs};
 use crate::sandbox::{Availability, Sandbox};
 use crate::store::{Store, WorkspaceEntry};
 use crate::tools::{Registry, ToolCtx, ToolOutput};
 
 mod claude;
 use claude::ClaudeRun;
+mod runs;
 
 /// Called after every event, so a UI can wake up (the GUI requests a repaint).
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -111,6 +114,27 @@ pub enum Command {
     },
     /// A `Changes` event for every conversation in this workspace that has pending changes.
     ListWorkspaceChanges,
+    /// Run a saved config (by `RunConfig::id`) of the current workspace.
+    RunConfig {
+        config_id: String,
+    },
+    /// Run one moon task (`project:task`) with the active environment profile.
+    RunTask {
+        target: String,
+        args: Vec<String>,
+    },
+    /// Stop a run: SIGTERM to its current step's process group, SIGKILL after 3 s.
+    StopRun(RunId),
+    /// Run the last `RunConfig` / `RunTask` again (with the environment active now).
+    RerunLast,
+    /// Ask moon for the workspace's tasks again (`Tasks`, or an `Error` if that fails).
+    RefreshTasks,
+    /// Replace and save the workspace's run configs (`runs.toml`).
+    SaveRuns(Runs),
+    /// Replace and save the workspace's environment profiles (`env.toml`, 0600).
+    SaveEnvs(Envs),
+    /// Switch the active environment profile (None: no profile) and save it.
+    SetActiveEnv(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +255,48 @@ pub enum Event {
         conversation: ConversationId,
         status: String,
     },
+    /// moon's tasks in the current workspace (empty outside a moon workspace).
+    Tasks(Vec<MoonTask>),
+    /// The current workspace's run configs and environment profiles: on opening it and after
+    /// every `SaveRuns` / `SaveEnvs` / `SetActiveEnv`. `envs` holds literal values for the
+    /// editor (its `Debug` hides them); resolved values never appear in any event.
+    RunsLoaded {
+        runs: Runs,
+        envs: Envs,
+        /// A file was corrupt and set aside.
+        warning: Option<String>,
+    },
+    RunStarted {
+        run: RunId,
+        name: String,
+        steps: usize,
+    },
+    /// Step `index` (0-based) started; `label` is its command line.
+    RunStep {
+        run: RunId,
+        index: usize,
+        label: String,
+    },
+    /// Output of the run's current step (stdout and stderr merged, as written; may hold
+    /// ANSI escapes and `\r`, and end mid-line).
+    RunOutput {
+        run: RunId,
+        text: String,
+    },
+    RunFinished {
+        run: RunId,
+        /// Every step succeeded.
+        ok: bool,
+        /// The first step that failed (or was stopped, or couldn't start).
+        failed_step: Option<usize>,
+        /// That step's exit code (None when it was killed by a signal or never ran).
+        exit_code: Option<i32>,
+        /// Ended by `StopRun`.
+        stopped: bool,
+        /// The run couldn't start (e.g. its environment profile didn't resolve); no step ran.
+        error: Option<String>,
+        duration_ms: u64,
+    },
 }
 
 /// Knobs for embedding the engine (tests lower the step limit and skip the sandbox).
@@ -340,6 +406,7 @@ impl Engine {
             home,
             claude: HashMap::new(),
             claude_bridge,
+            runs: runs::RunsState::default(),
         };
         runtime.spawn(state.run(rx));
         EngineHandle {
@@ -415,6 +482,16 @@ enum Msg {
     },
     /// Claude Code asks for (or withdraws) a permission prompt.
     ClaudePermission(HostMsg),
+    /// From a run's task.
+    Run {
+        run: RunId,
+        update: RunUpdate,
+    },
+    /// moon task discovery finished.
+    Tasks {
+        generation: u64,
+        result: Result<Vec<MoonTask>, String>,
+    },
 }
 
 enum ToolMsg {
@@ -498,6 +575,7 @@ struct State {
     home: PathBuf,
     claude: HashMap<ConversationId, ClaudeRun>,
     claude_bridge: Arc<dyn PermissionBridge>,
+    runs: runs::RunsState,
 }
 
 const TITLE_CHARS: usize = 40;
@@ -521,6 +599,7 @@ impl State {
             match msg {
                 Msg::Cmd(cmd) => self.command(cmd),
                 Msg::Shutdown(ack) => {
+                    self.shutdown_runs();
                     let runs: Vec<_> = self.claude.keys().copied().collect();
                     for id in runs {
                         self.stop_claude(id);
@@ -556,6 +635,8 @@ impl State {
                     self.request_approval(req, reply);
                 }
                 Msg::ClaudePermission(m) => self.claude_permission(m),
+                Msg::Run { run, update } => self.run_update(run, update),
+                Msg::Tasks { generation, result } => self.tasks_found(generation, result),
                 Msg::Claude {
                     conversation,
                     generation,
@@ -1269,6 +1350,14 @@ impl State {
                 path,
                 content,
             } => self.save_to_overlay(request, conversation, path, content),
+            cmd @ (Command::RunConfig { .. }
+            | Command::RunTask { .. }
+            | Command::StopRun(_)
+            | Command::RerunLast
+            | Command::RefreshTasks
+            | Command::SaveRuns(_)
+            | Command::SaveEnvs(_)
+            | Command::SetActiveEnv(_)) => self.run_command(cmd),
             Command::ListWorkspaceChanges => {
                 let ws = self.workspace.clone();
                 for meta in self.store.list(&ws.id).0 {
@@ -1432,6 +1521,7 @@ impl State {
             layout,
             warnings,
         });
+        self.load_runs();
     }
 
     fn emit_list(&self) {

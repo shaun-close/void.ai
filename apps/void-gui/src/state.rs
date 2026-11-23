@@ -381,6 +381,13 @@ impl UiState {
             } => {
                 self.turn_status.insert(conversation, status);
             }
+            // The runner's UI arrives in M3b task 3.
+            Event::Tasks(_)
+            | Event::RunsLoaded { .. }
+            | Event::RunStarted { .. }
+            | Event::RunStep { .. }
+            | Event::RunOutput { .. }
+            | Event::RunFinished { .. } => {}
         }
     }
 
