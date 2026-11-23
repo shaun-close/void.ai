@@ -348,6 +348,25 @@ impl Sandbox {
             .collect()
     }
 
+    /// Where the hidden paths (minus `unhide`) really are: what `args_hidden` mounts over.
+    fn hidden_targets(&self, unhide: &[PathBuf]) -> Vec<PathBuf> {
+        let unhide: Vec<PathBuf> = unhide
+            .iter()
+            .flat_map(|u| {
+                [
+                    u.clone(),
+                    std::fs::canonicalize(u).unwrap_or_else(|_| u.clone()),
+                ]
+            })
+            .collect();
+        self.hidden_paths()
+            .into_iter()
+            .filter(|h| !unhide.contains(h))
+            .filter_map(|h| std::fs::canonicalize(h).ok())
+            .filter(|real| !unhide.contains(real))
+            .collect()
+    }
+
     fn caches(&self) -> Vec<(PathBuf, PathBuf)> {
         self.settings
             .caches
@@ -567,12 +586,10 @@ impl Sandbox {
         self.args_base(&mut a);
         // Throwaway writable home: writes land in an invisible tmpfs, gone with the process.
         let h = home.as_os_str();
-        let mounts = std::fs::read_to_string("/proc/self/mountinfo")
-            .map(|m| mount_points(&m))
-            .unwrap_or_default();
-        a.extend(&home_layer_args(&home, &mounts, &mut |d| {
-            list_dir(d, &mounts)
-        }));
+        let mut opaque = binds.clone();
+        opaque.extend(self.hidden_targets(&plan.unhide));
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo");
+        a.extend(&home_layer(&home, mountinfo, &opaque)?);
         let caches = self.caches();
         self.args_caches(&mut a, &caches);
         if let Some(o) = &plan.overlay {
@@ -957,28 +974,23 @@ fn mount_points(mountinfo: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A directory's entries, sorted, without following anything. Mount points are reported as
-/// directories without being looked at (an autofs mount must not be triggered, and a dead
-/// NFS server must not hang the spawn); the home layer skips them anyway.
-fn list_dir(dir: &Path, mounts: &[PathBuf]) -> Vec<(OsString, HomeEntry)> {
+/// A directory's entries, sorted, typed from the listing itself (`DirEntry::file_type`: the
+/// entry's type as the parent directory records it, or an `lstat`, which never follows a
+/// symlink or triggers an automount), so a mount point is never opened by path.
+fn list_dir(dir: &Path) -> Vec<(OsString, HomeEntry)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut v: Vec<(OsString, HomeEntry)> = rd
         .flatten()
         .map(|e| {
-            let path = e.path();
-            let kind = if mounts.contains(&path) {
-                HomeEntry::Dir
-            } else {
-                match e.file_type() {
-                    Ok(t) if t.is_symlink() => std::fs::read_link(&path)
-                        .map(HomeEntry::Symlink)
-                        .unwrap_or(HomeEntry::Other),
-                    Ok(t) if t.is_dir() => HomeEntry::Dir,
-                    Ok(t) if t.is_file() => HomeEntry::File,
-                    _ => HomeEntry::Other,
-                }
+            let kind = match e.file_type() {
+                Ok(t) if t.is_symlink() => std::fs::read_link(e.path())
+                    .map(HomeEntry::Symlink)
+                    .unwrap_or(HomeEntry::Other),
+                Ok(t) if t.is_dir() => HomeEntry::Dir,
+                Ok(t) if t.is_file() => HomeEntry::File,
+                _ => HomeEntry::Other,
             };
             (e.file_name(), kind)
         })
@@ -991,42 +1003,63 @@ fn list_dir(dir: &Path, mounts: &[PathBuf]) -> Vec<(OsString, HomeEntry)> {
 /// refuses a lower directory with any mount beneath it (EINVAL, "failed to clone lowerpath"):
 /// a tmpfs on `home`; each directory without mounts at or below it gets its own throwaway
 /// overlay; directories holding mounts are recreated and walked the same way; mount points
-/// stay empty directories (never listed or looked at); files are read-only binds; symlinks are
-/// recreated; anything else is left out. `list` gives a directory's entries.
+/// that are directories stay empty (never listed or opened), other mount points are left out;
+/// files are read-only binds (`-try`: a temp file may be gone by the time bwrap runs);
+/// symlinks are recreated; anything else is left out. `opaque` paths (what the read-write
+/// binds and hidden paths mount over) are never listed or overlaid: a directory among them
+/// becomes an empty directory, anything else is left out, and the mount on top supplies it.
+/// `list` gives a directory's entries.
+/// The home layer for `home`, from `/proc/self/mountinfo`'s contents. `opaque` paths (the
+/// read-write binds and hidden paths that go on top) are never listed.
+fn home_layer(
+    home: &Path,
+    mountinfo: std::io::Result<String>,
+    opaque: &[PathBuf],
+) -> Result<Vec<OsString>, String> {
+    let mounts = mount_points(&mountinfo.map_err(|e| {
+        format!("can't read /proc/self/mountinfo to set up the throwaway home layer: {e}")
+    })?);
+    Ok(home_layer_args(home, &mounts, opaque, &mut list_dir))
+}
+
 fn home_layer_args(
     home: &Path,
     mounts: &[PathBuf],
+    opaque: &[PathBuf],
     list: &mut dyn FnMut(&Path) -> Vec<(OsString, HomeEntry)>,
 ) -> Vec<OsString> {
     fn walk(
         dir: &Path,
         mounts: &[PathBuf],
+        opaque: &[PathBuf],
         list: &mut dyn FnMut(&Path) -> Vec<(OsString, HomeEntry)>,
         out: &mut Vec<OsString>,
     ) {
         for (name, kind) in list(dir) {
             let p = dir.join(name);
             let o = p.clone().into_os_string();
-            if mounts.contains(&p) {
-                out.extend(["--dir".into(), o]);
+            if mounts.contains(&p) || opaque.contains(&p) {
+                if kind == HomeEntry::Dir {
+                    out.extend(["--dir".into(), o]);
+                }
                 continue;
             }
             match kind {
                 HomeEntry::Dir if mounts.iter().any(|m| m.starts_with(&p)) => {
                     out.extend(["--dir".into(), o]);
-                    walk(&p, mounts, list, out);
+                    walk(&p, mounts, opaque, list, out);
                 }
                 HomeEntry::Dir => {
                     out.extend(["--overlay-src".into(), o.clone(), "--tmp-overlay".into(), o])
                 }
-                HomeEntry::File => out.extend(["--ro-bind".into(), o.clone(), o]),
+                HomeEntry::File => out.extend(["--ro-bind-try".into(), o.clone(), o]),
                 HomeEntry::Symlink(t) => out.extend(["--symlink".into(), t.into_os_string(), o]),
                 HomeEntry::Other => {}
             }
         }
     }
     let mut out = vec!["--tmpfs".into(), home.as_os_str().to_os_string()];
-    walk(home, mounts, list, &mut out);
+    walk(home, mounts, opaque, list, &mut out);
     out
 }
 
@@ -1143,11 +1176,11 @@ mod tests {
                 other => panic!("listed {other}"),
             }
         };
-        let a = strs(&home_layer_args(home, &mounts, &mut list));
+        let a = strs(&home_layer_args(home, &mounts, &[], &mut list));
         let want: Vec<&str> = vec![
             "--tmpfs",
             "/home/u",
-            "--ro-bind",
+            "--ro-bind-try",
             "/home/u/.bashrc",
             "/home/u/.bashrc",
             "--overlay-src",
@@ -1163,7 +1196,7 @@ mod tests {
             "/home/u/shares",
             "--dir",
             "/home/u/shares/nas",
-            "--ro-bind",
+            "--ro-bind-try",
             "/home/u/shares/notes.txt",
             "/home/u/shares/notes.txt",
             "--overlay-src",
@@ -1176,6 +1209,84 @@ mod tests {
             seen,
             [home.to_path_buf(), home.join("shares")],
             "mounts never listed"
+        );
+    }
+
+    /// A file can be a mount point too (a single-file bind): it's left out, not made a
+    /// directory, so a later file mount on it (a hidden path, `~/.claude.json`) still works.
+    #[test]
+    fn home_layer_leaves_out_file_mount_points() {
+        let home = Path::new("/home/u");
+        let mounts = vec![
+            PathBuf::from("/home/u/.netrc"),
+            PathBuf::from("/home/u/sh/f"),
+        ];
+        let mut list = |d: &Path| {
+            let e = |n: &str, k: HomeEntry| (OsString::from(n), k);
+            match d.to_str().unwrap() {
+                "/home/u" => vec![e(".netrc", HomeEntry::File), e("sh", HomeEntry::Dir)],
+                "/home/u/sh" => vec![e("f", HomeEntry::File)],
+                other => panic!("listed {other}"),
+            }
+        };
+        let a = strs(&home_layer_args(home, &mounts, &[], &mut list));
+        assert_eq!(a, ["--tmpfs", "/home/u", "--dir", "/home/u/sh"]);
+    }
+
+    /// The read-write binds and hidden paths go on top of the layer: void never lists what's
+    /// in them, even with a mount below, and emits only a directory to mount on.
+    #[test]
+    fn home_layer_never_lists_opaque_paths() {
+        let home = Path::new("/home/u");
+        let mounts = vec![
+            PathBuf::from("/home/u/.claude/m"),
+            PathBuf::from("/home/u/.ssh/agent"),
+        ];
+        let opaque = [
+            PathBuf::from("/home/u/.claude"),
+            PathBuf::from("/home/u/.claude.json"),
+            PathBuf::from("/home/u/.ssh"),
+            PathBuf::from("/home/u/.netrc"),
+        ];
+        let mut list = |d: &Path| {
+            let e = |n: &str, k: HomeEntry| (OsString::from(n), k);
+            match d.to_str().unwrap() {
+                "/home/u" => vec![
+                    e(".claude", HomeEntry::Dir),
+                    e(".claude.json", HomeEntry::File),
+                    e(".netrc", HomeEntry::File),
+                    e(".ssh", HomeEntry::Dir),
+                ],
+                other => panic!("listed {other}"),
+            }
+        };
+        let a = strs(&home_layer_args(home, &mounts, &opaque, &mut list));
+        assert_eq!(
+            a,
+            [
+                "--tmpfs",
+                "/home/u",
+                "--dir",
+                "/home/u/.claude",
+                "--dir",
+                "/home/u/.ssh"
+            ]
+        );
+    }
+
+    /// Without the mount list, every mount under HOME would get an overlay opened by path
+    /// (an automount trigger, then EINVAL): refuse the spawn instead.
+    #[test]
+    fn home_layer_needs_mountinfo() {
+        let err = home_layer(
+            Path::new("/home/u"),
+            Err(std::io::Error::other("denied")),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("/proc/self/mountinfo") && err.contains("denied"),
+            "{err}"
         );
     }
 
@@ -1519,8 +1630,15 @@ mod tests {
         );
         let layer = pos(&a, &["--tmpfs", &h]).expect("home layer");
         let proj = p(&home.join("proj"));
-        let state = pos(&a, &["--overlay-src", &claude, "--tmp-overlay", &claude]).unwrap();
-        let state_file = pos(&a, &["--ro-bind", &cj, &cj]).unwrap();
+        // Claude Code's state and the hidden paths are never listed or overlaid: the binds and
+        // hiding mounts on top supply them.
+        let state = pos(&a, &["--dir", &claude]).expect("a dir to bind ~/.claude on");
+        assert!(pos(&a, &["--overlay-src", &claude]).is_none());
+        assert!(pos(&a, &["--ro-bind-try", &cj, &cj]).is_none());
+        assert!(pos(&a, &["--ro-bind", &cj, &cj]).is_none());
+        let ssh_home = p(&home.join(".ssh"));
+        assert!(pos(&a, &["--overlay-src", &ssh_home]).is_none());
+        let ssh_dir = pos(&a, &["--dir", &ssh_home]).unwrap();
         let cache = pos(
             &a,
             &[
@@ -1533,7 +1651,7 @@ mod tests {
         let ovl = pos(&a, &["--overlay-src", &proj, "--overlay"]).unwrap();
         let proj_layer = pos(&a, &["--overlay-src", &proj, "--tmp-overlay", &proj]).unwrap();
         assert!(
-            layer < state && state < state_file && state_file < proj_layer && proj_layer < cache,
+            layer < state && state < ssh_dir && ssh_dir < proj_layer && proj_layer < cache,
             "the home layer, per entry, before everything else"
         );
         let b1 = pos(&a, &["--bind", &claude, &claude]).expect("~/.claude rw");

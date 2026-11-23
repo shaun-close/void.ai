@@ -684,9 +684,11 @@ fn auth_error_message() {
     let c = r.new_conversation();
     r.send(c, "hello");
     match r.until(|e| matches!(e, Event::StreamFailed { .. })) {
+        // Claude Code's "/login" is for its own terminal UI: void leads with its own hint.
         Event::StreamFailed { error, .. } => assert_eq!(
             error,
-            "Claude Code isn't signed in: Not logged in · Please run /login"
+            "Claude Code isn't signed in — run `claude auth login` in a terminal \
+             (Claude Code said: Not logged in · Please run /login)"
         ),
         _ => unreachable!(),
     }
@@ -711,8 +713,9 @@ fn auth_expired_shows_claude_codes_reason() {
     };
     assert_eq!(
         error,
-        "Claude Code isn't signed in: Failed to authenticate: this login reached its time \
-         limit and cannot be renewed. Run `claude auth login` to sign in again."
+        "Claude Code isn't signed in — run `claude auth login` in a terminal (Claude Code \
+         said: Failed to authenticate: this login reached its time limit and cannot be \
+         renewed. Run `claude auth login` to sign in again.)"
     );
     r.turn_over(c);
     let saved = r.saved(c, true);

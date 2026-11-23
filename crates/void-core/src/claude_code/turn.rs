@@ -34,11 +34,15 @@ pub const RETRY_NOTE: &str = "The previous attempt was undone; its file changes 
 pub const NOT_SIGNED_IN: &str =
     "Claude Code isn't signed in — run `claude auth login` in a terminal";
 
-/// The not-signed-in error, in Claude Code's own words when it gave some (they name the fix).
+/// The not-signed-in error: void's hint first (Claude Code's own advice can be for its terminal
+/// UI, e.g. "/login"), then what Claude Code said, if anything (already redacted), capped.
 pub fn not_signed_in(said: &str) -> String {
     match said.trim() {
         "" => NOT_SIGNED_IN.to_string(),
-        said => format!("Claude Code isn't signed in: {said}"),
+        said => {
+            let said: String = said.chars().take(STDERR_LINE_CAP).collect();
+            format!("{NOT_SIGNED_IN} (Claude Code said: {})", said.trim_end())
+        }
     }
 }
 /// Review actions and chat-view saves while a turn has the overlay mounted.
@@ -919,7 +923,14 @@ mod tests {
         assert!(NOT_SIGNED_IN.contains("`claude auth login`"));
         assert_eq!(
             not_signed_in("Not logged in · Please run /login\n"),
-            "Claude Code isn't signed in: Not logged in · Please run /login"
+            "Claude Code isn't signed in — run `claude auth login` in a terminal \
+             (Claude Code said: Not logged in · Please run /login)"
+        );
+        let long = not_signed_in(&"x".repeat(5000));
+        assert!(
+            long.len() < NOT_SIGNED_IN.len() + STDERR_LINE_CAP + 40,
+            "{}",
+            long.len()
         );
     }
 
