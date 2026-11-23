@@ -82,6 +82,35 @@ pub fn make_backend(profile: &Profile, api_key: Option<String>) -> Arc<dyn Backe
     match profile.kind {
         BackendKind::OpenAi => Arc::new(openai::OpenAiBackend::new(profile, api_key)),
         BackendKind::Anthropic => Arc::new(anthropic::AnthropicBackend::new(profile, api_key)),
+        BackendKind::ClaudeCode => Arc::new(ClaudeCodeStub {
+            model: profile.model.clone(),
+        }),
+    }
+}
+
+/// Placeholder for a Claude Code profile: its chats run through the Claude Code turn path,
+/// never an HTTP stream, so streaming only ever reports that.
+struct ClaudeCodeStub {
+    model: String,
+}
+
+impl Backend for ClaudeCodeStub {
+    fn stream(&self, _req: ChatRequest) -> EventStream {
+        stream::once(async {
+            Err(BackendError::Protocol(
+                "Claude Code chats run through the Claude Code turn path".into(),
+            ))
+        })
+        .boxed()
+    }
+
+    fn list_models(&self) -> BoxFuture<'static, Result<Vec<String>, BackendError>> {
+        let models = if self.model.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.model.clone()]
+        };
+        Box::pin(async move { Ok(models) })
     }
 }
 

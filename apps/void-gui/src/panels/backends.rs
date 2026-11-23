@@ -108,6 +108,7 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
                     context_limit: 32768,
                     max_output: 8192,
                     extra_body: Map::new(),
+                    command: None,
                 },
             );
         }
@@ -149,18 +150,27 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
                     let (name, color) = match prof.kind {
                         BackendKind::OpenAi => ("OpenAI API", pal.accent2),
                         BackendKind::Anthropic => ("Anthropic API", pal.accent3),
+                        BackendKind::ClaudeCode => ("Claude Code", pal.accent),
                     };
                     theme::pill(ui, icon::CPU, name, color);
                 });
-                let host = prof
-                    .base_url
-                    .split("//")
-                    .nth(1)
-                    .unwrap_or(&prof.base_url)
-                    .trim_end_matches('/')
-                    .to_string();
+                let host = match prof.kind {
+                    BackendKind::ClaudeCode => prof.claude_command().to_string(),
+                    _ => prof
+                        .base_url
+                        .split("//")
+                        .nth(1)
+                        .unwrap_or(&prof.base_url)
+                        .trim_end_matches('/')
+                        .to_string(),
+                };
+                let model = if prof.model.is_empty() && prof.kind == BackendKind::ClaudeCode {
+                    "default model"
+                } else {
+                    prof.model.as_str()
+                };
                 ui.label(
-                    RichText::new(format!("{} · {host}", prof.model))
+                    RichText::new(format!("{model} · {host}"))
                         .small()
                         .color(pal.text_faint),
                 );
@@ -183,6 +193,7 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
         return;
     };
     let d = &mut draft;
+    let claude_code = d.kind == BackendKind::ClaudeCode;
     let mut keep = true;
     let saved = profiles.iter().any(|x| x.id == d.id);
     ui.vertical(|ui| {
@@ -201,16 +212,30 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
                     .selected_text(match d.kind {
                         BackendKind::OpenAi => "OpenAI-compatible",
                         BackendKind::Anthropic => "Anthropic",
+                        BackendKind::ClaudeCode => "Claude Code",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut d.kind, BackendKind::OpenAi, "OpenAI-compatible");
                         ui.selectable_value(&mut d.kind, BackendKind::Anthropic, "Anthropic");
+                        ui.selectable_value(&mut d.kind, BackendKind::ClaudeCode, "Claude Code");
                     });
                 ui.end_row();
 
-                ui.label("Base URL");
-                ui.add(TextEdit::singleline(&mut d.base_url).desired_width(f32::INFINITY));
-                ui.end_row();
+                if claude_code {
+                    ui.label("Command");
+                    let mut cmd = d.command.clone().unwrap_or_default();
+                    ui.add(
+                        TextEdit::singleline(&mut cmd)
+                            .hint_text("claude")
+                            .desired_width(f32::INFINITY),
+                    );
+                    d.command = Some(cmd).filter(|c| !c.trim().is_empty());
+                    ui.end_row();
+                } else {
+                    ui.label("Base URL");
+                    ui.add(TextEdit::singleline(&mut d.base_url).desired_width(f32::INFINITY));
+                    ui.end_row();
+                }
 
                 ui.label("API key");
                 ui.vertical(|ui| {
@@ -262,8 +287,13 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
 
                 ui.label("Model");
                 ui.vertical(|ui| {
-                    ui.add(TextEdit::singleline(&mut d.model).desired_width(f32::INFINITY));
-                    if let Some(Ok(models)) = p.state.tests.get(&d.id)
+                    let mut model = TextEdit::singleline(&mut d.model).desired_width(f32::INFINITY);
+                    if claude_code {
+                        model = model.hint_text("empty = Claude Code's default, e.g. opus, sonnet");
+                    }
+                    ui.add(model);
+                    if !claude_code
+                        && let Some(Ok(models)) = p.state.tests.get(&d.id)
                         && !models.is_empty()
                     {
                         egui::ComboBox::from_id_salt("profile-models")
@@ -277,36 +307,46 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
                 });
                 ui.end_row();
 
-                ui.label("Context limit");
-                ui.add(
-                    DragValue::new(&mut d.context_limit)
-                        .range(512..=10_000_000)
-                        .speed(256),
-                );
-                ui.end_row();
+                if !claude_code {
+                    ui.label("Context limit");
+                    ui.add(
+                        DragValue::new(&mut d.context_limit)
+                            .range(512..=10_000_000)
+                            .speed(256),
+                    );
+                    ui.end_row();
 
-                ui.label("Max output");
-                ui.add(
-                    DragValue::new(&mut d.max_output)
-                        .range(16..=1_000_000)
-                        .speed(64),
-                );
-                ui.end_row();
+                    ui.label("Max output");
+                    ui.add(
+                        DragValue::new(&mut d.max_output)
+                            .range(16..=1_000_000)
+                            .speed(64),
+                    );
+                    ui.end_row();
+                }
             });
 
-        ui.label("Extra request fields (JSON object, merged into every request)");
-        ui.add(
-            TextEdit::multiline(&mut p.backends.extra_text)
-                .code_editor()
-                .desired_rows(4)
-                .desired_width(f32::INFINITY),
-        );
-        let extra = parse_extra_body(&p.backends.extra_text);
-        if let Err(e) = &extra {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        }
+        let extra = if claude_code {
+            Ok(d.extra_body.clone())
+        } else {
+            ui.label("Extra request fields (JSON object, merged into every request)");
+            ui.add(
+                TextEdit::multiline(&mut p.backends.extra_text)
+                    .code_editor()
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+            let extra = parse_extra_body(&p.backends.extra_text);
+            if let Err(e) = &extra {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            extra
+        };
 
         match p.state.tests.get(&d.id) {
+            Some(Ok(v)) if claude_code => {
+                ui.label(RichText::new(format!("Found Claude Code {}", v.join(" "))).weak());
+            }
             Some(Ok(models)) => {
                 ui.label(RichText::new(format!("Connected: {} models", models.len())).weak());
             }
@@ -318,7 +358,14 @@ fn show_inner(ui: &mut Ui, p: &mut Panels) {
 
         ui.horizontal(|ui| {
             if ui
-                .button(theme::itext(icon::LIGHTNING, "Test connection"))
+                .button(theme::itext(
+                    icon::LIGHTNING,
+                    if claude_code {
+                        "Test"
+                    } else {
+                        "Test connection"
+                    },
+                ))
                 .clicked()
             {
                 let mut test = d.clone();

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent;
 use crate::backend::{Backend, BackendError, StreamEvent, make_backend};
-use crate::config::{Config, Profile, load_config, resolve_api_key, save_config};
+use crate::config::{BackendKind, Config, Profile, load_config, resolve_api_key, save_config};
 use crate::context::{build_request, estimate_tokens};
 use crate::context::{compaction_split, needs_compaction};
 use crate::model::{
@@ -1140,12 +1140,18 @@ impl State {
                 let events = self.events.clone();
                 let notify = self.notify.clone();
                 tokio::spawn(async move {
-                    let result = match resolve_api_key(&profile.api_key).await {
-                        Err(e) => Err(e.to_string()),
-                        Ok(key) => factory(&profile, key)
-                            .list_models()
+                    let result = if profile.kind == BackendKind::ClaudeCode {
+                        claude_version(profile.claude_command())
                             .await
-                            .map_err(|e| e.to_string()),
+                            .map(|v| vec![v])
+                    } else {
+                        match resolve_api_key(&profile.api_key).await {
+                            Err(e) => Err(e.to_string()),
+                            Ok(key) => factory(&profile, key)
+                                .list_models()
+                                .await
+                                .map_err(|e| e.to_string()),
+                        }
                     };
                     let _ = events.send(Event::ProfileTested {
                         profile_id: profile.id.clone(),
@@ -1637,6 +1643,28 @@ fn error_text(e: &BackendError) -> String {
     s
 }
 
+/// `<command> --version` outside the sandbox, for the Backends panel's Test. Never passes a
+/// prompt, so it costs no tokens.
+async fn claude_version(command: &str) -> Result<String, String> {
+    let missing = || format!("`{command}` not found \u{2014} install Claude Code");
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(Duration::from_secs(5), cmd.output()).await {
+        Err(_) => return Err(format!("`{command} --version` timed out after 5 s")),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return Err(missing()),
+        Ok(Err(e)) => return Err(format!("couldn't run `{command}`: {e}")),
+        Ok(Ok(o)) => o,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    match line {
+        Some(l) if out.status.success() => Ok(l.to_string()),
+        _ => Err(format!("`{command} --version` failed ({})", out.status)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1695,6 +1723,7 @@ mod tests {
             context_limit: 1000,
             max_output: 100,
             extra_body: Default::default(),
+            command: None,
         }
     }
 
@@ -2193,6 +2222,62 @@ mod tests {
             Event::ProfileTested { profile_id, result } => {
                 assert_eq!(profile_id, "fast");
                 assert_eq!(result.unwrap(), vec!["fake-model"]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_claude(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("claude");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ] && [ $# -eq 1 ]; then echo '2.1.330 (Claude Code)'; else exit 3; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn claude_profile(command: &str) -> Profile {
+        Profile {
+            kind: BackendKind::ClaudeCode,
+            command: Some(command.into()),
+            ..profile("cc", "")
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_profile_reports_version() {
+        let mut r = rig();
+        r.started();
+        let bin = fake_claude(&r.root);
+        r.handle
+            .send(Command::TestProfile(claude_profile(bin.to_str().unwrap())));
+        match r.until(|e| matches!(e, Event::ProfileTested { .. })) {
+            Event::ProfileTested { profile_id, result } => {
+                assert_eq!(profile_id, "cc");
+                assert_eq!(result.unwrap(), vec!["2.1.330 (Claude Code)"]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_profile_reports_missing_binary() {
+        let mut r = rig();
+        r.started();
+        let missing = r.root.join("no-such-claude");
+        let cmd = missing.to_str().unwrap().to_string();
+        r.handle.send(Command::TestProfile(claude_profile(&cmd)));
+        match r.until(|e| matches!(e, Event::ProfileTested { .. })) {
+            Event::ProfileTested { result, .. } => {
+                let e = result.unwrap_err();
+                assert!(e.contains("not found"), "{e}");
+                assert!(e.contains("install Claude Code"), "{e}");
+                assert!(e.contains(&cmd), "{e}");
             }
             _ => unreachable!(),
         }

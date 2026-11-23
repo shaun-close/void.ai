@@ -19,6 +19,9 @@ pub enum BackendKind {
     /// Anthropic-style `/v1/messages`.
     #[serde(rename = "anthropic")]
     Anthropic,
+    /// The user's installed `claude` binary, run inside void's sandbox.
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
 }
 
 /// Where a profile's API key comes from. Serialised as one of the optional profile fields
@@ -57,6 +60,18 @@ pub struct Profile {
     pub max_output: u32,
     /// Merged into every request body (e.g. `chat_template_kwargs.enable_thinking`).
     pub extra_body: Map<String, Value>,
+    /// Claude Code only: the binary to run (`claude` when unset).
+    pub command: Option<String>,
+}
+
+impl Profile {
+    /// The Claude Code binary to run: the configured `command`, else `claude`.
+    pub fn claude_command(&self) -> &str {
+        match self.command.as_deref().map(str::trim) {
+            Some(c) if !c.is_empty() => c,
+            _ => "claude",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +91,8 @@ struct ProfileRepr {
     max_output: u32,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     extra_body: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
 }
 
 impl TryFrom<ProfileRepr> for Profile {
@@ -103,6 +120,7 @@ impl TryFrom<ProfileRepr> for Profile {
             context_limit: r.context_limit,
             max_output: r.max_output,
             extra_body: r.extra_body,
+            command: r.command,
         })
     }
 }
@@ -127,6 +145,7 @@ impl From<Profile> for ProfileRepr {
             context_limit: p.context_limit,
             max_output: p.max_output,
             extra_body: p.extra_body,
+            command: p.command,
         }
     }
 }
@@ -191,6 +210,7 @@ impl Default for Config {
             context_limit: 32768,
             max_output: 8192,
             extra_body: Map::new(),
+            command: None,
         };
         Self {
             active_profile: "strata".into(),
@@ -211,6 +231,7 @@ impl Default for Config {
                     context_limit: 262144,
                     max_output: 32768,
                     extra_body: thinking,
+                    command: None,
                 },
                 Profile {
                     id: "strata-anthropic".into(),
@@ -222,6 +243,7 @@ impl Default for Config {
                     context_limit: 262144,
                     max_output: 32768,
                     extra_body: Map::new(),
+                    command: None,
                 },
                 local(
                     "ollama",
@@ -411,6 +433,44 @@ mod tests {
             api_key_env = "B"
         "#;
         assert!(toml::from_str::<Profile>(bad).is_err());
+    }
+
+    #[test]
+    fn claude_code_profile_round_trips() {
+        let src = r#"
+            id = "cc"
+            name = "Claude Code"
+            kind = "claude-code"
+            base_url = ""
+            command = "/opt/bin/claude"
+            model = "opus"
+            context_limit = 200000
+            max_output = 32000
+            api_key_env = "ANTHROPIC_API_KEY"
+        "#;
+        let p: Profile = toml::from_str(src).unwrap();
+        assert_eq!(p.kind, BackendKind::ClaudeCode);
+        assert_eq!(p.command.as_deref(), Some("/opt/bin/claude"));
+        assert_eq!(p.model, "opus");
+        assert_eq!(p.api_key, ApiKeySource::Env("ANTHROPIC_API_KEY".into()));
+        let out = toml::to_string(&p).unwrap();
+        assert!(out.contains("kind = \"claude-code\""));
+        assert!(out.contains("command = \"/opt/bin/claude\""));
+        assert_eq!(toml::from_str::<Profile>(&out).unwrap(), p);
+        // Older profiles have no `command` and don't gain one on save.
+        let old = Config::default().profiles[0].clone();
+        assert_eq!(old.command, None);
+        assert!(!toml::to_string(&old).unwrap().contains("command"));
+    }
+
+    #[test]
+    fn claude_command_defaults_to_claude() {
+        let mut p = Config::default().profiles[0].clone();
+        assert_eq!(p.claude_command(), "claude");
+        p.command = Some("/x/claude".into());
+        assert_eq!(p.claude_command(), "/x/claude");
+        p.command = Some("  ".into());
+        assert_eq!(p.claude_command(), "claude");
     }
 
     #[test]

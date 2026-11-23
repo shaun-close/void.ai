@@ -327,6 +327,7 @@ mod tests {
             context_limit: 1000,
             max_output: 321,
             extra_body: Default::default(),
+            command: None,
         }
     }
 

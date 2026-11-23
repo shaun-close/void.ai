@@ -488,6 +488,7 @@ impl VoidApp {
                     let color = match p.kind {
                         void_core::config::BackendKind::OpenAi => pal.accent2,
                         void_core::config::BackendKind::Anthropic => pal.accent3,
+                        void_core::config::BackendKind::ClaudeCode => pal.accent,
                     };
                     theme::pill(ui, icon::PLUGS, format!("{} · {}", p.name, p.model), color)
                         .on_hover_text(&p.base_url);
@@ -1450,6 +1451,47 @@ impl Parser {
         });
         assert_eq!(h.state().editors.doc(&dirty).unwrap().text(), "mine old");
         assert_eq!(std::fs::read_to_string(&dirty.0).unwrap(), "kiwi");
+    }
+
+    /// The Claude Code profile has no URL, limits or extra body: the editor shows only its
+    /// command and model, while an API profile still shows the URL fields.
+    #[test]
+    fn backends_panel_hides_url_fields_for_claude_code() {
+        let p = paths_tmp();
+        let mut h = harness(&p);
+        until(&mut h, 10, "workspace", |a| {
+            a.state.workspace.name == "Scratch"
+        });
+        layout::ensure_tab(&mut h.state_mut().dock, Tab::Backends);
+        let api = h.state().state.config.profiles[0].clone();
+        h.state_mut().backends.select(api.clone());
+        h.run();
+        for l in ["Base URL", "Context limit", "Max output", "Command"] {
+            assert_eq!(h.query_by_label(l).is_some(), l != "Command", "API: {l}");
+        }
+        assert!(
+            h.query_by_label_contains("Extra request fields").is_some(),
+            "API: extra body"
+        );
+
+        let cc = void_core::config::Profile {
+            id: "cc".into(),
+            name: "Claude Code".into(),
+            kind: void_core::config::BackendKind::ClaudeCode,
+            base_url: String::new(),
+            ..api
+        };
+        h.state_mut().backends.select(cc);
+        h.run();
+        for l in ["Base URL", "Context limit", "Max output"] {
+            assert!(h.query_by_label(l).is_none(), "Claude Code shows {l}");
+        }
+        assert!(
+            h.query_by_label_contains("Extra request fields").is_none(),
+            "Claude Code shows the extra body"
+        );
+        assert!(h.query_by_label("Command").is_some());
+        assert!(h.query_by_label("Model").is_some());
     }
 
     fn paths_tmp() -> Paths {
